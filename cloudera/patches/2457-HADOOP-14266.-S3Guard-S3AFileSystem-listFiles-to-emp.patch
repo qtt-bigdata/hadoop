@@ -1,0 +1,641 @@
+From 45be04d9bc5f3c061f85c1bf898c3ffc927ed56f Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Thu, 13 Apr 2017 13:35:58 -0700
+Subject: [PATCH 2457/2848] HADOOP-14266. S3Guard: S3AFileSystem::listFiles()
+ to employ MetadataStore. Contributed by Mingliang
+ Liu
+
+(cherry picked from commit 1b27f15d123564200cf9730a051055d72acb4866)
+
+Change-Id: Ifabd0f50a45a2da367c429c31fee22342378c7a4
+---
+ .../java/org/apache/hadoop/fs/s3a/Listing.java     |   86 +++++++++-----
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   55 +++++----
+ .../hadoop/fs/s3a/s3guard/DescendantsIterator.java |   35 +++---
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |    2 +-
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |    9 +-
+ .../hadoop/fs/s3a/ITestS3GuardListConsistency.java |  121 +++++++++++++++++++-
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |    2 +-
+ 7 files changed, 231 insertions(+), 79 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
+index c9366af..e91f2ec 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
+@@ -53,7 +53,6 @@
+ 
+   private final S3AFileSystem owner;
+   private static final Logger LOG = S3AFileSystem.LOG;
+-  private static final FileStatus[] EMPTY_FILE_STATUS_ARRAY = new FileStatus[0];
+ 
+   public Listing(S3AFileSystem owner) {
+     this.owner = owner;
+@@ -64,21 +63,35 @@ public Listing(S3AFileSystem owner) {
+    * a given status filter.
+    *
+    * @param fileStatuses the provided list of file status. NO remote calls.
+-   * @param filter file status filter
++   * @param filter file path filter on which paths to accept
++   * @param acceptor the file status acceptor
+    * @return the file status iterator
+    */
+-  ProvidedLocatedFileStatusIterator createProvidedLocatedFileStatusIterator(
+-      FileStatus[] fileStatuses, ProvidedFileStatusFilter filter) {
+-    return new ProvidedLocatedFileStatusIterator(fileStatuses, filter);
++  ProvidedFileStatusIterator createProvidedFileStatusIterator(
++      FileStatus[] fileStatuses, PathFilter filter,
++      FileStatusAcceptor acceptor) {
++    return new ProvidedFileStatusIterator(fileStatuses, filter, acceptor);
+   }
+ 
++  /**
++   * Create a FileStatus iterator against a path, with a given list object
++   * request.
++   *
++   * @param listPath path of the listing
++   * @param request initial request to make
++   * @param filter the filter on which paths to accept
++   * @param acceptor the class/predicate to decide which entries to accept
++   * in the listing based on the full file status.
++   * @return the iterator
++   * @throws IOException IO Problems
++   */
+   FileStatusListingIterator createFileStatusListingIterator(
+       Path listPath,
+       ListObjectsRequest request,
+       PathFilter filter,
+       Listing.FileStatusAcceptor acceptor) throws IOException {
+     return createFileStatusListingIterator(listPath, request, filter, acceptor,
+-        EMPTY_FILE_STATUS_ARRAY);
++        null);
+   }
+ 
+   /**
+@@ -99,7 +112,7 @@ FileStatusListingIterator createFileStatusListingIterator(
+       ListObjectsRequest request,
+       PathFilter filter,
+       Listing.FileStatusAcceptor acceptor,
+-      FileStatus[] providedStatus) throws IOException {
++      RemoteIterator<FileStatus> providedStatus) throws IOException {
+     return new FileStatusListingIterator(
+         new ObjectListingIterator(listPath, request),
+         filter,
+@@ -140,6 +153,13 @@ LocatedFileStatusIterator createLocatedFileStatusIterator(
+      * should be generated.)
+      */
+     boolean accept(Path keyPath, String commonPrefix);
++
++    /**
++     * Predicate to decide whether or not to accept a file status.
++     * @param status file status containing file path information
++     * @return true if the status is accepted else false
++     */
++    boolean accept(FileStatus status);
+   }
+ 
+   /**
+@@ -147,9 +167,9 @@ LocatedFileStatusIterator createLocatedFileStatusIterator(
+    * value.
+    *
+    * If the status value is null, the iterator declares that it has no data.
+-   * This iterator is used to handle {@link listStatus()} calls where the path
+-   * handed in refers to a file, not a directory: this is the iterator
+-   * returned.
++   * This iterator is used to handle {@link S3AFileSystem#listStatus} calls
++   * where the path handed in refers to a file, not a directory: this is the
++   * iterator returned.
+    */
+   static final class SingleStatusRemoteIterator
+       implements RemoteIterator<LocatedFileStatus> {
+@@ -201,13 +221,6 @@ public LocatedFileStatus next() throws IOException {
+   }
+ 
+   /**
+-   * Filter out a FileStatus object, unlike {@link PathFilter} against a path.
+-   */
+-  interface ProvidedFileStatusFilter {
+-    boolean accept(FileStatus status);
+-  }
+-
+-  /**
+    * This wraps up a provided non-null list of file status as a remote iterator.
+    *
+    * It firstly filters the provided list and later {@link #next} call will get
+@@ -216,18 +229,18 @@ public LocatedFileStatus next() throws IOException {
+    *
+    * There is no remote data to fetch.
+    */
+-  class ProvidedLocatedFileStatusIterator
+-      implements RemoteIterator<LocatedFileStatus> {
++  static class ProvidedFileStatusIterator
++      implements RemoteIterator<FileStatus> {
+     private final ArrayList<FileStatus> filteredStatusList;
+     private int index = 0;
+ 
+-    ProvidedLocatedFileStatusIterator(FileStatus[] fileStatuses,
+-        ProvidedFileStatusFilter filter) {
++    ProvidedFileStatusIterator(FileStatus[] fileStatuses, PathFilter filter,
++        FileStatusAcceptor acceptor) {
+       Preconditions.checkArgument(fileStatuses != null, "Null status list!");
+ 
+       filteredStatusList = new ArrayList<>(fileStatuses.length);
+       for (FileStatus status : fileStatuses) {
+-        if (filter.accept(status)) {
++        if (filter.accept(status.getPath()) && acceptor.accept(status)) {
+           filteredStatusList.add(status);
+         }
+       }
+@@ -240,8 +253,8 @@ public boolean hasNext() throws IOException {
+     }
+ 
+     @Override
+-    public LocatedFileStatus next() throws IOException {
+-      return owner.toLocatedFileStatus(filteredStatusList.get(index++));
++    public FileStatus next() throws IOException {
++      return filteredStatusList.get(index++);
+     }
+   }
+ 
+@@ -256,7 +269,7 @@ public LocatedFileStatus next() throws IOException {
+    * iterator can declare that there is more data available.
+    *
+    * The need to filter the results precludes the iterator from simply
+-   * declaring that if the {@link S3AFileSystem.ObjectListingIterator#hasNext()}
++   * declaring that if the {@link ObjectListingIterator#hasNext()}
+    * is true then there are more results. Instead the next batch of results must
+    * be retrieved and filtered.
+    *
+@@ -301,13 +314,14 @@ public LocatedFileStatus next() throws IOException {
+     FileStatusListingIterator(ObjectListingIterator source,
+         PathFilter filter,
+         FileStatusAcceptor acceptor,
+-        FileStatus[] providedStatus) throws IOException {
++        RemoteIterator<FileStatus> providedStatus) throws IOException {
+       this.source = source;
+       this.filter = filter;
+       this.acceptor = acceptor;
+-      this.providedStatus = new HashSet<>(providedStatus.length);
+-      for (FileStatus status : providedStatus) {
+-        if (filter.accept(status.getPath())) {
++      this.providedStatus = new HashSet<>();
++      for (; providedStatus != null && providedStatus.hasNext();) {
++        final FileStatus status = providedStatus.next();
++        if (filter.accept(status.getPath()) && acceptor.accept(status)) {
+           this.providedStatus.add(status);
+         }
+       }
+@@ -367,7 +381,7 @@ public FileStatus next() throws IOException {
+     /**
+      * Try to retrieve another batch.
+      * Note that for the initial batch,
+-     * {@link S3AFileSystem.ObjectListingIterator} does not generate a request;
++     * {@link ObjectListingIterator} does not generate a request;
+      * it simply returns the initial set.
+      *
+      * @return true if a new batch was created.
+@@ -467,7 +481,7 @@ public int getBatchSize() {
+    * instance.
+    *
+    * 2. Second and later invocations will continue the ongoing listing,
+-   * calling {@link #continueListObjects(ObjectListing)} to request the next
++   * calling {@link S3AFileSystem#continueListObjects} to request the next
+    * batch of results.
+    *
+    * 3. The {@link #hasNext()} predicate returns true for the initial call,
+@@ -619,6 +633,11 @@ public boolean accept(Path keyPath, S3ObjectSummary summary) {
+     public boolean accept(Path keyPath, String prefix) {
+       return false;
+     }
++
++    @Override
++    public boolean accept(FileStatus status) {
++      return (status != null) && status.isFile();
++    }
+   }
+ 
+   /**
+@@ -690,6 +709,11 @@ public boolean accept(Path keyPath, S3ObjectSummary summary) {
+     public boolean accept(Path keyPath, String prefix) {
+       return !keyPath.equals(qualifiedPath);
+     }
++
++    @Override
++    public boolean accept(FileStatus status) {
++      return (status != null) && !status.getPath().equals(qualifiedPath);
++    }
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 4d9f56e..1ab1eee 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -93,6 +93,7 @@
+ import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.StorageStatistics;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.fs.s3a.s3guard.DescendantsIterator;
+ import org.apache.hadoop.fs.s3a.s3guard.DirListingMetadata;
+ import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
+ import org.apache.hadoop.fs.s3a.s3guard.PathMetadata;
+@@ -2447,15 +2448,28 @@ public boolean isFile(Path f) throws IOException {
+         String delimiter = recursive ? null : "/";
+         LOG.debug("Requesting all entries under {} with delimiter '{}'",
+             key, delimiter);
++        final RemoteIterator<FileStatus> cachedFilesIterator;
++        if (recursive) {
++          final PathMetadata pm = metadataStore.get(path, true);
++          cachedFilesIterator = new DescendantsIterator(metadataStore, pm);
++        } else {
++          final DirListingMetadata meta = metadataStore.listChildren(path);
++          cachedFilesIterator = listing.createProvidedFileStatusIterator(
++              S3Guard.dirMetaToStatuses(meta), ACCEPT_ALL, acceptor);
++          if (allowAuthoritative && meta != null && meta.isAuthoritative()) {
++            return listing.createLocatedFileStatusIterator(cachedFilesIterator);
++          }
++        }
+         return listing.createLocatedFileStatusIterator(
+             listing.createFileStatusListingIterator(path,
+                 createListObjectsRequest(key, delimiter),
+-                ACCEPT_ALL, acceptor));
++                ACCEPT_ALL,
++                acceptor,
++                cachedFilesIterator));
+       }
+     } catch (AmazonClientException e) {
+       // TODO s3guard:
+       // 1. retry on file not found exception
+-      // 2. merge listing with MetadataStore's view of directory tree
+       throw translateException("listFiles", path, e);
+     }
+   }
+@@ -2500,28 +2514,21 @@ public boolean isFile(Path f) throws IOException {
+             filter.accept(path) ? toLocatedFileStatus(fileStatus) : null);
+       } else {
+         // directory: trigger a lookup
+-        final DirListingMetadata dirMeta = metadataStore.listChildren(path);
+-        if (allowAuthoritative
+-            && dirMeta != null
+-            && dirMeta.isAuthoritative()) {
+-          return listing.createProvidedLocatedFileStatusIterator(
+-              S3Guard.dirMetaToStatuses(dirMeta),
+-              new Listing.ProvidedFileStatusFilter() {
+-                @Override
+-                public boolean accept(FileStatus status) {
+-                  return filter.accept(status.getPath());
+-                }
+-              });
+-        }
+-
+-        String key = maybeAddTrailingSlash(pathToKey(path));
+-        return listing.createLocatedFileStatusIterator(
+-            listing.createFileStatusListingIterator(path,
+-                createListObjectsRequest(key, "/"),
+-                filter,
+-                new Listing.AcceptAllButSelfAndS3nDirs(path),
+-                S3Guard.dirMetaToStatuses(dirMeta)
+-            ));
++        final String key = maybeAddTrailingSlash(pathToKey(path));
++        final Listing.FileStatusAcceptor acceptor =
++            new Listing.AcceptAllButSelfAndS3nDirs(path);
++        final DirListingMetadata meta = metadataStore.listChildren(path);
++        final RemoteIterator<FileStatus> cachedFileStatusIterator =
++            listing.createProvidedFileStatusIterator(
++                S3Guard.dirMetaToStatuses(meta), filter, acceptor);
++        return (allowAuthoritative && meta != null && meta.isAuthoritative())
++            ? listing.createLocatedFileStatusIterator(cachedFileStatusIterator)
++            : listing.createLocatedFileStatusIterator(
++                listing.createFileStatusListingIterator(path,
++                    createListObjectsRequest(key, "/"),
++                    filter,
++                    acceptor,
++                    cachedFileStatusIterator));
+       }
+     } catch (AmazonClientException e) {
+       throw translateException("listLocatedStatus", path, e);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DescendantsIterator.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DescendantsIterator.java
+index afd3266..d008972 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DescendantsIterator.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DescendantsIterator.java
+@@ -27,6 +27,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.RemoteIterator;
+ 
+@@ -42,7 +43,6 @@
+  * file system structure:
+  *
+  * <pre>
+- * {@code
+  * /dir1
+  * |-- dir2
+  * |   |-- file1
+@@ -53,12 +53,10 @@
+  *     |-- dir5
+  *     |   `-- file4
+  *     `-- dir6
+- * }
+  * </pre>
+  *
+  * Consider this code sample:
+  * <pre>
+- * {@code
+  * final PathMetadata dir1 = get(new Path("/dir1"));
+  * for (DescendantsIterator descendants = new DescendantsIterator(dir1);
+  *     descendants.hasNext(); ) {
+@@ -66,12 +64,10 @@
+  *   System.out.printf("%s %s%n", status.isDirectory() ? 'D' : 'F',
+  *       status.getPath());
+  * }
+- * }
+  * </pre>
+  *
+  * The output is:
+  * <pre>
+- * {@code
+  * D /dir1
+  * D /dir1/dir2
+  * D /dir1/dir3
+@@ -82,12 +78,11 @@
+  * F /dir1/dir3/dir4/file3
+  * F /dir1/dir3/dir5/file4
+  * D /dir1/dir3/dir6
+- * }
+  * </pre>
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-class DescendantsIterator implements RemoteIterator<PathMetadata> {
++public class DescendantsIterator implements RemoteIterator<FileStatus> {
+ 
+   private final MetadataStore metadataStore;
+   private final Queue<PathMetadata> queue = new LinkedList<>();
+@@ -97,22 +92,24 @@
+    *
+    * @param ms the associated {@link MetadataStore}
+    * @param meta base path for descendants iteration, which will be the first
+-   *     path returned during iteration (except root)
++   *     returned during iteration (except root). Null makes empty iterator.
++   * @throws IOException if errors happen during metadata store listing
+    */
+-  DescendantsIterator(MetadataStore ms, PathMetadata meta)
++  public DescendantsIterator(MetadataStore ms, PathMetadata meta)
+       throws IOException {
+     Preconditions.checkNotNull(ms);
+-    Preconditions.checkNotNull(meta);
+     this.metadataStore = ms;
+ 
+-    final Path path = meta.getFileStatus().getPath();
+-    if (path.isRoot()) {
+-      final DirListingMetadata rootListing = ms.listChildren(path);
+-      if (rootListing != null) {
+-        queue.addAll(rootListing.getListing());
++    if (meta != null) {
++      final Path path = meta.getFileStatus().getPath();
++      if (path.isRoot()) {
++        final DirListingMetadata rootListing = ms.listChildren(path);
++        if (rootListing != null) {
++          queue.addAll(rootListing.getListing());
++        }
++      } else {
++        queue.add(meta);
+       }
+-    } else {
+-      queue.add(meta);
+     }
+   }
+ 
+@@ -122,7 +119,7 @@ public boolean hasNext() throws IOException {
+   }
+ 
+   @Override
+-  public PathMetadata next() throws IOException {
++  public FileStatus next() throws IOException {
+     if (!hasNext()) {
+       throw new NoSuchElementException("No more descendants.");
+     }
+@@ -132,6 +129,6 @@ public PathMetadata next() throws IOException {
+       final Path path = next.getFileStatus().getPath();
+       queue.addAll(metadataStore.listChildren(path).getListing());
+     }
+-    return next;
++    return next.getFileStatus();
+   }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index 2b28c58..71f2497 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -312,7 +312,7 @@ public void deleteSubtree(Path path) throws IOException {
+ 
+     for (DescendantsIterator desc = new DescendantsIterator(this, meta);
+          desc.hasNext();) {
+-      delete(desc.next().getFileStatus().getPath());
++      delete(desc.next().getPath());
+     }
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index 64afa93..a393bfb 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -58,6 +58,7 @@
+   static final Class<? extends DynamoDBClientFactory>
+       S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT =
+       DynamoDBClientFactory.DefaultDynamoDBClientFactory.class;
++  private static final FileStatus[] EMPTY_LISTING = new FileStatus[0];
+ 
+   // Utility class.  All static functions.
+   private S3Guard() { }
+@@ -133,9 +134,15 @@ public static S3AFileStatus putAndReturn(MetadataStore ms,
+     return status;
+   }
+ 
++  /**
++   * Convert the data of a directory listing to an array of {@link FileStatus}
++   * entries. If the listing is null an empty array is returned.
++   * @param dirMeta directory listing -may be null
++   * @return a possibly-empty array of file status entries
++   */
+   public static FileStatus[] dirMetaToStatuses(DirListingMetadata dirMeta)  {
+     if (dirMeta == null) {
+-      return new FileStatus[0];
++      return EMPTY_LISTING;
+     }
+ 
+     Collection<PathMetadata> listing = dirMeta.getListing();
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+index cb26a15..47d88073 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+@@ -33,9 +33,13 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collection;
++import java.util.HashSet;
+ import java.util.List;
+ 
++import static org.apache.hadoop.fs.contract.ContractTestUtils.writeTextFile;
+ import static org.apache.hadoop.fs.s3a.Constants.*;
++import static org.apache.hadoop.fs.s3a.InconsistentAmazonS3Client.DELAY_KEY_SUBSTRING;
+ 
+ /**
+  * Test S3Guard list consistency feature by injecting delayed listObjects()
+@@ -62,7 +66,7 @@ public void testConsistentListStatus() throws Exception {
+     // Any S3 keys that contain DELAY_KEY_SUBSTRING will be delayed
+     // in listObjects() results via InconsistentS3Client
+     Path inconsistentPath =
+-        path("a/b/dir3-" + InconsistentAmazonS3Client.DELAY_KEY_SUBSTRING);
++        path("a/b/dir3-" + DELAY_KEY_SUBSTRING);
+ 
+     Path[] testDirs = {path("a/b/dir1"),
+         path("a/b/dir2"),
+@@ -123,7 +127,7 @@ private void doTestConsistentListLocatedStatus(S3AFileSystem fs,
+       // Any S3 keys that contain DELAY_KEY_SUBSTRING will be delayed
+       // in listObjects() results via InconsistentS3Client
+       testDirs.add(path("doTestConsistentListLocatedStatus/dir-" + index
+-          + InconsistentAmazonS3Client.DELAY_KEY_SUBSTRING));
++          + DELAY_KEY_SUBSTRING));
+     }
+ 
+     for (Path path : testDirs) {
+@@ -148,6 +152,119 @@ private void doTestConsistentListLocatedStatus(S3AFileSystem fs,
+     }
+   }
+ 
++  /**
++   * Similar to {@link #testConsistentListStatus()}, this tests that the S3AFS
++   * listFiles() call will return consistent file list.
++   */
++  @Test
++  public void testConsistentListFiles() throws Exception {
++    final S3AFileSystem fs = getFileSystem();
++    // This test will fail if NullMetadataStore (the default) is configured:
++    // skip it.
++    Assume.assumeTrue(fs.hasMetadataStore());
++
++    final int[] numOfPaths = {0, 1, 2};
++    for (int dirNum : numOfPaths) {
++      for (int normalFile : numOfPaths) {
++        for (int delayedFile : numOfPaths) {
++          for (boolean recursive : new boolean[] {true, false}) {
++            doTestListFiles(fs, dirNum, normalFile, delayedFile, recursive);
++          }
++        }
++      }
++    }
++  }
++
++  /**
++   * Helper method to implement the tests of consistent listFiles().
++   *
++   * The file structure has dirNum subdirectories, and each directory (including
++   * the test base directory itself) has normalFileNum normal files and
++   * delayedFileNum delayed files.
++   *
++   * @param fs The S3 file system from contract
++   * @param dirNum number of subdirectories
++   * @param normalFileNum number files in each directory without delay to list
++   * @param delayedFileNum number files in each directory with delay to list
++   * @param recursive listFiles recursively if true
++   * @throws Exception if any unexpected error
++   */
++  private void doTestListFiles(S3AFileSystem fs, int dirNum, int normalFileNum,
++      int delayedFileNum, boolean recursive) throws Exception {
++    describe("Testing dirNum=%d, normalFile=%d, delayedFile=%d, "
++        + "recursive=%s", dirNum, normalFileNum, delayedFileNum, recursive);
++    final Path baseTestDir = path("doTestListFiles-" + dirNum + "-"
++        + normalFileNum + "-" + delayedFileNum + "-" + recursive);
++    // delete the old test path (if any) so that when we call mkdirs() later,
++    // the to delay sub directories will be tracked via putObject() request.
++    fs.delete(baseTestDir, true);
++
++    // make subdirectories (if any)
++    final List<Path> testDirs = new ArrayList<>(dirNum + 1);
++    assertTrue(fs.mkdirs(baseTestDir));
++    testDirs.add(baseTestDir);
++    for (int i = 0; i < dirNum; i++) {
++      final Path subdir = path(baseTestDir + "/dir-" + i);
++      assertTrue(fs.mkdirs(subdir));
++      testDirs.add(subdir);
++    }
++
++    final Collection<String> fileNames
++        = new ArrayList<>(normalFileNum + delayedFileNum);
++    int index = 0;
++    for (; index < normalFileNum; index++) {
++      fileNames.add("file-" + index);
++    }
++    for (; index < normalFileNum + delayedFileNum; index++) {
++      // Any S3 keys that contain DELAY_KEY_SUBSTRING will be delayed
++      // in listObjects() results via InconsistentS3Client
++      fileNames.add("file-" + index + "-" + DELAY_KEY_SUBSTRING);
++    }
++
++    // create files under each test directory
++    for (Path dir : testDirs) {
++      for (String fileName : fileNames) {
++        writeTextFile(fs, new Path(dir, fileName), "I, " + fileName, false);
++      }
++    }
++
++    // this should return the union data from S3 and MetadataStore
++    final RemoteIterator<LocatedFileStatus> statusIterator
++        = fs.listFiles(baseTestDir, recursive);
++    final Collection<Path> listedFiles = new HashSet<>();
++    for (; statusIterator.hasNext();) {
++      final FileStatus status = statusIterator.next();
++      assertTrue("FileStatus " + status + " is not a file!", status.isFile());
++      listedFiles.add(status.getPath());
++    }
++    LOG.info("S3AFileSystem::listFiles('{}', {}) -> {}",
++        baseTestDir, recursive, listedFiles);
++
++    // This should fail without S3Guard, and succeed with it because part of the
++    // files to list are delaying visibility
++    if (!recursive) {
++      // in this case only the top level files are listed
++      assertEquals("Unexpected number of files returned by listFiles() call",
++          normalFileNum + delayedFileNum, listedFiles.size());
++      verifyFileIsListed(listedFiles, baseTestDir, fileNames);
++    } else {
++      assertEquals("Unexpected number of files returned by listFiles() call",
++          testDirs.size() * (normalFileNum + delayedFileNum),
++          listedFiles.size());
++      for (Path dir : testDirs) {
++        verifyFileIsListed(listedFiles, dir, fileNames);
++      }
++    }
++  }
++
++  private static void verifyFileIsListed(Collection<Path> listedFiles,
++      Path currentDir, Collection<String> fileNames) {
++    for (String fileName : fileNames) {
++      final Path file = new Path(currentDir, fileName);
++      assertTrue(file + " should have been listed", listedFiles.contains(file));
++    }
++  }
++
+   @Test
+   public void testListStatusWriteBack() throws Exception {
+     Assume.assumeTrue(getFileSystem().hasMetadataStore());
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index 88df45e..99acf6e 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -164,7 +164,7 @@ public void testDescendantsIterator() throws IOException {
+     final PathMetadata rootMeta = new PathMetadata(makeDirStatus("/"));
+     for (DescendantsIterator desc = new DescendantsIterator(ms, rootMeta);
+          desc.hasNext();) {
+-      final Path p = desc.next().getFileStatus().getPath();
++      final Path p = desc.next().getPath();
+       actual.add(Path.getPathWithoutSchemeAndAuthority(p).toString());
+     }
+     LOG.info("We got {} by iterating DescendantsIterator", actual);
+-- 
+1.7.9.5
+

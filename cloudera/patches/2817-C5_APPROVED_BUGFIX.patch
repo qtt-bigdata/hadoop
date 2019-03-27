@@ -1,0 +1,199 @@
+From 1e9b4ad8ab180cd80bc7e331e4f6eeff3082e633 Mon Sep 17 00:00:00 2001
+From: Rushabh Shah <shahrs87@apache.org>
+Date: Mon, 4 Jun 2018 09:19:03 -0500
+Subject: [PATCH 2817/2848] ==C5_APPROVED_BUGFIX== HDFS-13281
+ Namenode#createFile should be /.reserved/raw/
+ aware.. Contributed by Rushabh S Shah
+
+(cherry picked from commit e2289c8d1496a5eff88e6bcb8776a11d45371ffc)
+(cherry picked from commit 4ecb7aaf77d3f63e2ee006b32f5e25e95fde1831)
+(cherry picked from commit 55495ed1153fe158659c60b66739b22e3fbcb7a6)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+
+ref. CDH-70522
+
+Change-Id: I91c53c0bae8aeedc77217b4f64ab9863a86dca6b
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |   12 +++--
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   43 +++++++++---------
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |   46 ++++++++++++++++++++
+ 3 files changed, 74 insertions(+), 27 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 7d7c73b..d883eff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -2691,10 +2691,12 @@ HdfsFileStatus createFileStatus(byte[] path, INode node, byte storagePolicy,
+      long size = 0;     // length is zero for directories
+      short replication = 0;
+      long blocksize = 0;
+-     final boolean isEncrypted;
++     final boolean isEncrypted = isInAnEZ(INodesInPath.fromINode(node));
+ 
+-     final FileEncryptionInfo feInfo = isRawPath ? null :
+-         getFileEncryptionInfo(node, snapshot, iip);
++     FileEncryptionInfo feInfo = null;
++     if (isEncrypted) {
++       feInfo = getFileEncryptionInfo(node, snapshot, iip);
++     }
+ 
+      boolean isLazyPersist = false;
+      if (node.isFile()) {
+@@ -2702,10 +2704,6 @@ HdfsFileStatus createFileStatus(byte[] path, INode node, byte storagePolicy,
+        size = fileNode.computeFileSize(snapshot);
+        replication = fileNode.getFileReplication(snapshot);
+        blocksize = fileNode.getPreferredBlockSize();
+-       isEncrypted = (feInfo != null) ||
+-           (isRawPath && isInAnEZ(INodesInPath.fromINode(node)));
+-     } else {
+-       isEncrypted = isInAnEZ(INodesInPath.fromINode(node));
+      }
+ 
+      int childrenNum = node.isDirectory() ? 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index f2b3791..f1a7858 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -2846,7 +2846,8 @@ private HdfsFileStatus startFileInt(final String srcArg,
+     String ezKeyName = null;
+     EncryptedKeyVersion edek = null;
+ 
+-    if (provider != null) {
++    boolean isReservedRaw = FSDirectory.isReservedRawName(srcArg);
++    if (!isReservedRaw && provider != null) {
+       readLock();
+       try {
+         src = dir.resolvePath(pc, src, pathComponents);
+@@ -2888,7 +2889,7 @@ private HdfsFileStatus startFileInt(final String srcArg,
+       src = dir.resolvePath(pc, src, pathComponents);
+       toRemoveBlocks = startFileInternal(pc, src, permissions, holder, 
+           clientMachine, create, overwrite, createParent, replication, 
+-          blockSize, isLazyPersist, suite, protocolVersion, edek, logRetryCache);
++          blockSize, isLazyPersist, suite, protocolVersion, edek, logRetryCache, isReservedRaw);
+       stat = dir.getFileInfo(src, false,
+           FSDirectory.isReservedRawName(srcArg), true);
+     } catch (StandbyException se) {
+@@ -2925,7 +2926,7 @@ private BlocksMapUpdateInfo startFileInternal(FSPermissionChecker pc,
+       String clientMachine, boolean create, boolean overwrite, 
+       boolean createParent, short replication, long blockSize, 
+       boolean isLazyPersist, CipherSuite suite, CryptoProtocolVersion version,
+-      EncryptedKeyVersion edek, boolean logRetryEntry)
++      EncryptedKeyVersion edek, boolean logRetryEntry, boolean isReservedRaw)
+       throws FileAlreadyExistsException, AccessControlException,
+       UnresolvedLinkException, FileNotFoundException,
+       ParentNotDirectoryException, RetryStartFileException, IOException {
+@@ -2940,23 +2941,25 @@ private BlocksMapUpdateInfo startFileInternal(FSPermissionChecker pc,
+ 
+     FileEncryptionInfo feInfo = null;
+ 
+-    final EncryptionZone zone = dir.getEZForPath(iip);
+-    if (zone != null) {
+-      // The path is now within an EZ, but we're missing encryption parameters
+-      if (suite == null || edek == null) {
+-        throw new RetryStartFileException();
+-      }
+-      // Path is within an EZ and we have provided encryption parameters.
+-      // Make sure that the generated EDEK matches the settings of the EZ.
+-      final String ezKeyName = zone.getKeyName();
+-      if (!ezKeyName.equals(edek.getEncryptionKeyName())) {
+-        throw new RetryStartFileException();
+-      }
+-      feInfo = new FileEncryptionInfo(suite, version,
+-          edek.getEncryptedKeyVersion().getMaterial(),
+-          edek.getEncryptedKeyIv(),
+-          ezKeyName, edek.getEncryptionKeyVersionName());
+-      Preconditions.checkNotNull(feInfo);
++    if (!isReservedRaw) {
++      final EncryptionZone zone = dir.getEZForPath(iip);
++      if (zone != null) {
++        // The path is now within an EZ, but we're missing encryption parameters
++        if (suite == null || edek == null) {
++          throw new RetryStartFileException();
++        }
++        // Path is within an EZ and we have provided encryption parameters.
++        // Make sure that the generated EDEK matches the settings of the EZ.
++        final String ezKeyName = zone.getKeyName();
++        if (!ezKeyName.equals(edek.getEncryptionKeyName())) {
++          throw new RetryStartFileException();
++        }
++        feInfo = new FileEncryptionInfo(suite, version,
++                edek.getEncryptedKeyVersion().getMaterial(),
++                edek.getEncryptedKeyIv(),
++                ezKeyName, edek.getEncryptionKeyVersionName());
++        Preconditions.checkNotNull(feInfo);
++      }
+     }
+ 
+     final INodeFile myFile = INodeFile.valueOf(inode, src, true);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index 6bdf99d..0a10cac 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -17,8 +17,12 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
++import org.apache.hadoop.io.IOUtils;
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
++import java.io.InputStream;
++import java.io.OutputStream;
+ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.io.PrintWriter;
+@@ -1708,6 +1712,48 @@ public void testProviderUriInCredentials() throws Exception {
+         client.getKeyProviderUri().toString());
+   }
+ 
++  private void verifyStreamsSame(String content, InputStream is)
++      throws IOException {
++    byte[] streamBytes;
++    try (ByteArrayOutputStream os = new ByteArrayOutputStream()) {
++      IOUtils.copyBytes(is, os, 1024, true);
++      streamBytes = os.toByteArray();
++    }
++    Assert.assertArrayEquals(content.getBytes(), streamBytes);
++  }
++
++  /**
++   * Tests that namenode doesn't generate edek if we are writing to
++   * /.reserved/raw directory.
++   * @throws Exception
++   */
++  @Test
++  public void testWriteToEZReservedRaw() throws Exception {
++    String unEncryptedBytes = "hello world";
++    // Create an Encryption Zone.
++    final Path zonePath = new Path("/zone");
++    fsWrapper.mkdir(zonePath, FsPermission.getDirDefault(), false);
++    dfsAdmin.createEncryptionZone(zonePath, TEST_KEY, NO_TRASH);
++    Path p1 = new Path(zonePath, "p1");
++    Path reservedRawPath = new Path("/.reserved/raw/" + p1.toString());
++    OutputStream os = fs.create(reservedRawPath);
++    // Write un-encrypted bytes to reserved raw stream.
++    os.write(unEncryptedBytes.getBytes());
++    os.close();
++    InputStream encryptedReservedStream = fs.open(reservedRawPath);
++    verifyStreamsSame(unEncryptedBytes, encryptedReservedStream);
++
++    InputStream nonReservedStream = fs.open(p1);
++    verifyStreamsSame(unEncryptedBytes, nonReservedStream);
++    try {
++      fs.getXAttr(reservedRawPath, HdfsServerConstants
++          .CRYPTO_XATTR_FILE_ENCRYPTION_INFO);
++      fail("getXAttr should have thrown an exception");
++    } catch (IOException ioe) {
++      assertExceptionContains("At least one of the attributes provided was " +
++          "not found.", ioe);
++    }
++  }
+ 
+  /**
+   * Testing the fallback behavior of keyProviderUri.
+-- 
+1.7.9.5
+

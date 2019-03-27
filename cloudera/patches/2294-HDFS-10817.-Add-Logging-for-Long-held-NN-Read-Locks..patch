@@ -1,0 +1,281 @@
+From ee8835d729d6facb865687c050aefe064af4fce3 Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Wed, 31 Aug 2016 15:40:01 -0700
+Subject: [PATCH 2294/2848] HDFS-10817. Add Logging for Long-held NN Read
+ Locks. Contributed by Erik Krogen.
+
+(cherry picked from commit 6f4b0d33ca339e3724623a1d23c101f8cfd3cdd5)
+(cherry picked from commit f87e2f5d05bdb54ce5028d2651c8947fa0f80539)
+(cherry picked from commit 7adbd569a6715e29205865b27c4d9bd3af56284f)
+(cherry picked from commit 6793ef0de615072429dbc360ccff3cedaaba8454)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+
+Change-Id: Id30a9d1563602ac1d7b2e063bafe500606372e5b
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    6 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   32 ++++++
+ .../src/main/resources/hdfs-default.xml            |    9 ++
+ .../hdfs/server/namenode/TestFSNamesystem.java     |  110 +++++++++++++++++++-
+ 4 files changed, 153 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 5dc08ae..e4caf22 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -412,10 +412,14 @@
+   public static final String  DFS_NAMENODE_MAX_XATTR_SIZE_KEY = "dfs.namenode.fs-limits.max-xattr-size";
+   public static final int     DFS_NAMENODE_MAX_XATTR_SIZE_DEFAULT = 16384;
+ 
+-  // Threshold for how long a write lock must be held for the event to be logged
++  // Threshold for how long namenode locks must be held for the
++  // event to be logged
+   public static final String  DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY =
+       "dfs.namenode.write-lock-reporting-threshold-ms";
+   public static final long    DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT = 1000L;
++  public static final String  DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY =
++      "dfs.namenode.read-lock-reporting-threshold-ms";
++  public static final long    DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT = 5000L;
+ 
+   //Following keys have no defaults
+   public static final String  DFS_DATANODE_DATA_DIR_KEY = "dfs.datanode.data.dir";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index ae5f811..2de451f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -73,6 +73,8 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_EXPIRYTIME_MILLIS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_EXPIRYTIME_MILLIS_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_HEAP_PERCENT_DEFAULT;
+@@ -938,6 +940,9 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+       this.writeLockReportingThreshold = conf.getLong(
+           DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY,
+           DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT);
++      this.readLockReportingThreshold = conf.getLong(
++          DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,
++          DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT);
+ 
+       // For testing purposes, allow the DT secret manager to be started regardless
+       // of whether security is enabled.
+@@ -1615,14 +1620,41 @@ private boolean shouldRetrySafeMode(SafeModeInfo safeMode) {
+   private long writeLockReportingThreshold;
+   /** Last time stamp for write lock. Keep the longest one for multi-entrance.*/
+   private long writeLockHeldTimeStamp;
++  /** Threshold (ms) for long holding read lock report. */
++  private long readLockReportingThreshold;
++  /**
++   * Last time stamp for read lock. Keep the longest one for
++   * multi-entrance. This is ThreadLocal since there could be
++   * many read locks held simultaneously.
++   */
++  private static ThreadLocal<Long> readLockHeldTimeStamp =
++      new ThreadLocal<Long>() {
++        @Override
++        public Long initialValue() {
++          return Long.MAX_VALUE;
++        }
++      };
+ 
+   @Override
+   public void readLock() {
+     this.fsLock.readLock().lock();
++    if (this.fsLock.getReadHoldCount() == 1) {
++      readLockHeldTimeStamp.set(monotonicNow());
++    }
+   }
+   @Override
+   public void readUnlock() {
++    final boolean needReport = this.fsLock.getReadHoldCount() == 1;
++    final long readLockInterval = monotonicNow() - readLockHeldTimeStamp.get();
+     this.fsLock.readLock().unlock();
++
++    if (needReport) {
++      readLockHeldTimeStamp.remove();
++      if (readLockInterval > this.readLockReportingThreshold) {
++        LOG.info("FSNamesystem read lock held for " + readLockInterval +
++            " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()));
++      }
++    }
+   }
+   @Override
+   public void writeLock() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index db9ecaa..50ebf30 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2300,6 +2300,15 @@
+ </property>
+ 
+ <property>
++  <name>dfs.namenode.read-lock-reporting-threshold-ms</name>
++  <value>5000</value>
++  <description>When a read lock is held on the namenode for a long time,
++    this will be logged as the lock is released. This sets how long the
++    lock must be held for logging to occur.
++  </description>
++</property>
++
++<property>
+   <name>dfs.namenode.startup.delay.block.deletion.sec</name>
+   <value>0</value>
+   <description>The delay in seconds at which we will pause the blocks deletion
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+index 15ab536..7dd0f72 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+@@ -25,8 +25,11 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.ArrayList;
+ import java.util.Collection;
+ 
++import com.google.common.base.Supplier;
++import java.util.List;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -49,6 +52,8 @@
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ public class TestFSNamesystem {
+ 
+@@ -247,10 +252,11 @@ public void run() {
+   }
+ 
+   /**
+-   * Test when FSNamesystem lock is held for a long time, logger will report it.
++   * Test when FSNamesystem write lock is held for a long time,
++   * logger will report it.
+    */
+   @Test(timeout=45000)
+-  public void testFSLockLongHoldingReport() throws Exception {
++  public void testFSWriteLockLongHoldingReport() throws Exception {
+     final long writeLockReportingThreshold = 100L;
+     Configuration conf = new Configuration();
+     conf.setLong(DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY,
+@@ -258,7 +264,7 @@ public void testFSLockLongHoldingReport() throws Exception {
+     FSImage fsImage = Mockito.mock(FSImage.class);
+     FSEditLog fsEditLog = Mockito.mock(FSEditLog.class);
+     Mockito.when(fsImage.getEditLog()).thenReturn(fsEditLog);
+-    FSNamesystem fsn = new FSNamesystem(conf, fsImage);
++    final FSNamesystem fsn = new FSNamesystem(conf, fsImage);
+ 
+     LogCapturer logs = LogCapturer.captureLogs(FSNamesystem.LOG);
+     GenericTestUtils.setLogLevel(FSNamesystem.LOG, Level.INFO);
+@@ -301,4 +307,102 @@ public void testFSLockLongHoldingReport() throws Exception {
+     fsn.writeUnlock();
+     assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+   }
++
++  /**
++   * Test when FSNamesystem read lock is held for a long time,
++   * logger will report it.
++   */
++  @Test(timeout=45000)
++  public void testFSReadLockLongHoldingReport() throws Exception {
++    final long readLockReportingThreshold = 100L;
++    final String readLockLogStmt = "FSNamesystem read lock held for ";
++    Configuration conf = new Configuration();
++    conf.setLong(
++        DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,
++        readLockReportingThreshold);
++    FSImage fsImage = Mockito.mock(FSImage.class);
++    FSEditLog fsEditLog = Mockito.mock(FSEditLog.class);
++    Mockito.when(fsImage.getEditLog()).thenReturn(fsEditLog);
++    final FSNamesystem fsn = new FSNamesystem(conf, fsImage);
++
++    LogCapturer logs = LogCapturer.captureLogs(FSNamesystem.LOG);
++    GenericTestUtils.setLogLevel(FSNamesystem.LOG, Level.INFO);
++
++    // Don't report if the read lock is held for a short time
++    fsn.readLock();
++    Thread.sleep(readLockReportingThreshold / 2);
++    fsn.readUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) &&
++        logs.getOutput().contains(readLockLogStmt));
++
++    // Report if the read lock is held for a long time
++    fsn.readLock();
++    Thread.sleep(readLockReportingThreshold + 10);
++    logs.clearOutput();
++    fsn.readUnlock();
++    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName())
++        && logs.getOutput().contains(readLockLogStmt));
++
++    // Report if it's held for a long time when re-entering read lock
++    fsn.readLock();
++    Thread.sleep(readLockReportingThreshold / 2 + 1);
++    fsn.readLock();
++    Thread.sleep(readLockReportingThreshold / 2 + 1);
++    logs.clearOutput();
++    fsn.readUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) ||
++        logs.getOutput().contains(readLockLogStmt));
++    logs.clearOutput();
++    fsn.readUnlock();
++    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()) &&
++        logs.getOutput().contains(readLockLogStmt));
++
++    // Report if it's held for a long time while another thread also has the
++    // read lock. Let one thread hold the lock long enough to activate an
++    // alert, then have another thread grab the read lock to ensure that this
++    // doesn't reset the timing.
++    logs.clearOutput();
++    final CountDownLatch barrier = new CountDownLatch(1);
++    final CountDownLatch barrier2 = new CountDownLatch(1);
++    Thread t1 = new Thread() {
++      @Override
++      public void run() {
++        try {
++          fsn.readLock();
++          Thread.sleep(readLockReportingThreshold + 1);
++          barrier.countDown(); // Allow for t2 to acquire the read lock
++          barrier2.await(); // Wait until t2 has the read lock
++          fsn.readUnlock();
++        } catch (InterruptedException e) {
++          fail("Interrupted during testing");
++        }
++      }
++    };
++    Thread t2 = new Thread() {
++      @Override
++      public void run() {
++        try {
++          barrier.await(); // Wait until t1 finishes sleeping
++          fsn.readLock();
++          barrier2.countDown(); // Allow for t1 to unlock
++          fsn.readUnlock();
++        } catch (InterruptedException e) {
++          fail("Interrupted during testing");
++        }
++      }
++    };
++    t1.start();
++    t2.start();
++    t1.join();
++    t2.join();
++    // Look for the differentiating class names in the stack trace
++    String stackTracePatternString =
++        String.format("INFO.+%s(.+\n){4}\\Q%%s\\E\\.run", readLockLogStmt);
++    Pattern t1Pattern = Pattern.compile(
++        String.format(stackTracePatternString, t1.getClass().getName()));
++    assertTrue(t1Pattern.matcher(logs.getOutput()).find());
++    Pattern t2Pattern = Pattern.compile(
++        String.format(stackTracePatternString, t2.getClass().getName()));
++    assertFalse(t2Pattern.matcher(logs.getOutput()).find());
++  }
+ }
+-- 
+1.7.9.5
+

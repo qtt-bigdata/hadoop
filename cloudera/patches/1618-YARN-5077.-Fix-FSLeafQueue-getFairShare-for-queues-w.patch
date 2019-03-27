@@ -1,0 +1,279 @@
+From b5d9da6386b9fe4130edb77f783f0a24d2228342 Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@apache.org>
+Date: Fri, 17 Jun 2016 22:24:42 -0700
+Subject: [PATCH 1618/2848] YARN-5077. Fix FSLeafQueue#getFairShare() for
+ queues with zero fairshare. (Yufei Gu via kasha)
+
+(cherry picked from commit 20f2799938c5cad59f59617cdb0f86e137c3c2c0)
+(cherry picked from commit 25be8105cd048201f19e573f130b96cada0e9ede)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FifoPolicy.java
+    hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+
+Change-Id: I9e8f1dff335916d055a24a5764865172fce12632
+---
+ .../scheduler/fair/FSLeafQueue.java                |   33 ++++-----
+ .../resourcemanager/scheduler/fair/FSQueue.java    |   19 -----
+ .../scheduler/fair/SchedulingPolicy.java           |   11 ---
+ .../policies/DominantResourceFairnessPolicy.java   |    5 --
+ .../scheduler/fair/policies/FairSharePolicy.java   |    5 --
+ .../scheduler/fair/policies/FifoPolicy.java        |    5 --
+ .../scheduler/fair/TestFairScheduler.java          |   78 ++++++++++++++++++++
+ 7 files changed, 94 insertions(+), 62 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+index 49e5829..5d73143 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+@@ -41,7 +41,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.DominantResourceFairnessPolicy;
+ import org.apache.hadoop.yarn.util.resource.Resources;
+ 
+ @Private
+@@ -482,8 +481,7 @@ public ActiveUsersManager getActiveUsersManager() {
+ 
+   /**
+    * Check whether this queue can run this application master under the
+-   * maxAMShare limit. For FIFO and FAIR policies, check if the VCore usage
+-   * takes up the entire cluster or maxResources for the queue.
++   * maxAMShare limit.
+    * @param amResource
+    * @return true if this queue can run
+    */
+@@ -493,24 +491,25 @@ public boolean canRunAppAM(Resource amResource) {
+     if (Math.abs(maxAMShare - -1.0f) < 0.0001) {
+       return true;
+     }
+-    Resource maxAMResource = Resources.multiply(getFairShare(), maxAMShare);
+-    Resource ifRunAMResource = Resources.add(amResourceUsage, amResource);
+ 
+-    boolean overMaxAMShareLimit = policy
+-            .checkIfAMResourceUsageOverLimit(ifRunAMResource, maxAMResource);
++    // If FairShare is zero, use min(maxShare, available resource) to compute
++    // maxAMResource
++    Resource maxResource = Resources.clone(getFairShare());
++    if (maxResource.getMemory() == 0) {
++      maxResource.setMemory(
++          Math.min(scheduler.getRootQueueMetrics().getAvailableMB(),
++                   getMaxShare().getMemory()));
++    }
+ 
+-    // For fair policy and fifo policy which doesn't check VCore usages,
+-    // additionally check if the AM takes all available VCores or
+-    // over maxResource to avoid deadlock.
+-    if (!overMaxAMShareLimit && !policy.equals(
+-        SchedulingPolicy.getInstance(DominantResourceFairnessPolicy.class))) {
+-      overMaxAMShareLimit =
+-         isVCoresOverMaxResource(ifRunAMResource.getVirtualCores()) ||
+-         ifRunAMResource.getVirtualCores() >=
+-         scheduler.getRootQueueMetrics().getAvailableVirtualCores();
++    if (maxResource.getVirtualCores() == 0) {
++      maxResource.setVirtualCores(Math.min(
++          scheduler.getRootQueueMetrics().getAvailableVirtualCores(),
++          getMaxShare().getVirtualCores()));
+     }
+ 
+-    return !overMaxAMShareLimit;
++    Resource maxAMResource = Resources.multiply(maxResource, maxAMShare);
++    Resource ifRunAMResource = Resources.add(amResourceUsage, amResource);
++    return Resources.fitsIn(ifRunAMResource, maxAMResource);
+   }
+ 
+   public void addAMResourceUsage(Resource amResource) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+index ef6a52f..84df808 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+@@ -311,25 +311,6 @@ protected boolean assignContainerPreCheck(FSSchedulerNode node) {
+   }
+ 
+   /**
+-   * Helper method to check if requested VCores are over maxResource.
+-   * @param requestedVCores the number of VCores requested
+-   * @return true if the number of VCores requested is over the maxResource;
+-   *         false otherwise
+-   */
+-  protected boolean isVCoresOverMaxResource(int requestedVCores) {
+-    if (requestedVCores >= scheduler.getAllocationConfiguration().
+-        getMaxResources(getName()).getVirtualCores()) {
+-      return true;
+-    }
+-
+-    if (getParent() == null) {
+-      return false;
+-    }
+-
+-    return getParent().isVCoresOverMaxResource(requestedVCores);
+-  }
+-
+-  /**
+    * Returns true if queue has at least one app running.
+    */
+   public boolean isActive() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/SchedulingPolicy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/SchedulingPolicy.java
+index 7840ba1..a243eff 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/SchedulingPolicy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/SchedulingPolicy.java
+@@ -177,17 +177,6 @@ public abstract boolean checkIfUsageOverFairShare(
+       Resource usage, Resource fairShare);
+ 
+   /**
+-   * Check if a leaf queue's AM resource usage over its limit under this policy
+-   *
+-   * @param usage {@link Resource} the resource used by application masters
+-   * @param maxAMResource {@link Resource} the maximum allowed resource for
+-   *                                      application masters
+-   * @return true if AM resource usage is over the limit
+-   */
+-  public abstract boolean checkIfAMResourceUsageOverLimit(
+-      Resource usage, Resource maxAMResource);
+-
+-  /**
+    * Get headroom by calculating the min of <code>clusterAvailable</code> and
+    * (<code>queueFairShare</code> - <code>queueUsage</code>) resources that are
+    * applicable to this policy. For eg if only memory then leave other
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/DominantResourceFairnessPolicy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/DominantResourceFairnessPolicy.java
+index 45fbf98..696bd25 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/DominantResourceFairnessPolicy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/DominantResourceFairnessPolicy.java
+@@ -94,11 +94,6 @@ public boolean checkIfUsageOverFairShare(Resource usage, Resource fairShare) {
+   }
+ 
+   @Override
+-  public boolean checkIfAMResourceUsageOverLimit(Resource usage, Resource maxAMResource) {
+-    return !Resources.fitsIn(usage, maxAMResource);
+-  }
+-
+-  @Override
+   public Resource getHeadroom(Resource queueFairShare, Resource queueUsage,
+                               Resource maxAvailable) {
+     int queueAvailableMemory =
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java
+index 3b9f07f..e39a490 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java
+@@ -151,11 +151,6 @@ public boolean checkIfUsageOverFairShare(Resource usage, Resource fairShare) {
+   }
+ 
+   @Override
+-  public boolean checkIfAMResourceUsageOverLimit(Resource usage, Resource maxAMResource) {
+-    return usage.getMemory() > maxAMResource.getMemory();
+-  }
+-
+-  @Override
+   public byte getApplicableDepth() {
+     return SchedulingPolicy.DEPTH_ANY;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FifoPolicy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FifoPolicy.java
+index a644e58..49abde0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FifoPolicy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FifoPolicy.java
+@@ -114,11 +114,6 @@ public boolean checkIfUsageOverFairShare(Resource usage, Resource fairShare) {
+   }
+ 
+   @Override
+-  public boolean checkIfAMResourceUsageOverLimit(Resource usage, Resource maxAMResource) {
+-    return usage.getMemory() > maxAMResource.getMemory();
+-  }
+-
+-  @Override
+   public Resource getHeadroom(Resource queueFairShare,
+                               Resource queueUsage, Resource maxAvailable) {
+     int queueAvailableMemory = Math.max(
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index ad1667c..ecddabe 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -1079,6 +1079,84 @@ public void testContainerReservationAttemptExceedingQueueMax()
+         getCurrentReservation().getMemory());
+   }
+ 
++  /**
++   * The test verifies that zero-FairShare queues (because of zero/tiny
++   * weight) can get resources for the AM.
++   */
++  @Test
++  public void testRequestAMResourceInZeroFairShareQueue() throws Exception {
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
++
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
++    out.println("<queue name=\"queue1\">");
++    out.println("<weight>0.0</weight>");
++    out.println("<maxResources>4096mb,10vcores</maxResources>");
++    out.println("<maxAMShare>0.5</maxAMShare>");
++    out.println("</queue>");
++    out.println("<queue name=\"queue2\">");
++    out.println("<weight>2.0</weight>");
++    out.println("</queue>");
++    out.println("<queue name=\"queue3\">");
++    out.println("<weight>0.000001</weight>");
++    out.println("</queue>");
++    out.println("</allocations>");
++    out.close();
++
++    scheduler.init(conf);
++    scheduler.start();
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++
++    RMNode node =
++            MockNodes.newNodeInfo(1, Resources.createResource(8192, 20),
++                    0, "127.0.0.1");
++    NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
++    NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node);
++    scheduler.handle(nodeEvent);
++    scheduler.update();
++
++    //create request for non-zero weight queue
++    createSchedulingRequest(1024, "root.queue2", "user2", 1);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++
++    // A managed AM which need 3G memory will not get resource,
++    // since it request more than the maxAMShare (4G * 0.5 = 2G).
++    Resource amResource = Resource.newInstance(1024, 1);
++    int amPriority = RMAppAttemptImpl.AM_CONTAINER_PRIORITY.getPriority();
++    ApplicationAttemptId attId1 = createAppAttemptId(1, 1);
++    createApplicationWithAMResource(attId1, "root.queue1", "user1", amResource);
++    createSchedulingRequestExistingApplication(3 * 1024, 1, amPriority, attId1);
++    FSAppAttempt app1 = scheduler.getSchedulerApp(attId1);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    assertEquals("Application 1 should not be running",
++            0, app1.getLiveContainers().size());
++
++    // A managed AM which need 2G memory will get resource,
++    // since it request no more than the maxAMShare (4G * 0.5 = 2G).
++    ApplicationAttemptId attId2 = createAppAttemptId(2, 1);
++    createApplicationWithAMResource(attId2, "root.queue1", "user1", amResource);
++    createSchedulingRequestExistingApplication(2 * 1024, 1, amPriority, attId2);
++    FSAppAttempt app2 = scheduler.getSchedulerApp(attId2);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    assertEquals("Application 2 should be running",
++            1, app2.getLiveContainers().size());
++
++    // A managed AM which need 1G memory will get resource, even thought its
++    // fair share is 0 because its weight is tiny(0.000001).
++    ApplicationAttemptId attId3 = createAppAttemptId(3, 1);
++    createApplicationWithAMResource(attId3, "root.queue3", "user1", amResource);
++    createSchedulingRequestExistingApplication(1024, 1, amPriority, attId3);
++    FSAppAttempt app3 = scheduler.getSchedulerApp(attId3);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    assertEquals("Application 3 should be running",
++            1, app3.getLiveContainers().size());
++  }
++
+     @Test (timeout = 500000)
+   public void testContainerReservationNotExceedingQueueMax() throws Exception {
+     conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-- 
+1.7.9.5
+

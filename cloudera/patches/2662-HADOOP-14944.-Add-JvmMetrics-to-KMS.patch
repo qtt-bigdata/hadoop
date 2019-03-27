@@ -1,0 +1,211 @@
+From 90f464da082a045f8101fb2baf83db808205bf32 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 19 Oct 2017 22:36:39 -0700
+Subject: [PATCH 2662/2848] HADOOP-14944. Add JvmMetrics to KMS.
+
+(cherry picked from commit a6370dde90acc944ff466f44143f9e45ad5e7890)
+
+Change-Id: I071d0f10392eb4fd41e0828a014f30882ba0be21
+---
+ .../apache/hadoop/metrics2/source/JvmMetrics.java  |   17 +++++++++
+ .../crypto/key/kms/server/KMSConfiguration.java    |    9 +++++
+ .../hadoop/crypto/key/kms/server/KMSWebApp.java    |   23 ++++++++++++
+ .../hadoop/crypto/key/kms/server/TestKMS.java      |   37 ++++++++++++++++++++
+ 4 files changed, 86 insertions(+)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
+index a6de50b..e18f46d 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
+@@ -27,6 +27,7 @@
+ import java.util.List;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.log.metrics.EventCounter;
+ import org.apache.hadoop.metrics2.MetricsCollector;
+@@ -57,6 +58,11 @@ synchronized JvmMetrics init(String processName, String sessionId) {
+       }
+       return impl;
+     }
++
++    synchronized void shutdown() {
++      DefaultMetricsSystem.instance().unregisterSource(JvmMetrics.name());
++      impl = null;
++    }
+   }
+ 
+   static final float M = 1024*1024;
+@@ -71,6 +77,7 @@ synchronized JvmMetrics init(String processName, String sessionId) {
+   final ConcurrentHashMap<String, MetricsInfo[]> gcInfoCache =
+       new ConcurrentHashMap<String, MetricsInfo[]>();
+ 
++  @VisibleForTesting
+   JvmMetrics(String processName, String sessionId) {
+     this.processName = processName;
+     this.sessionId = sessionId;
+@@ -90,6 +97,16 @@ public static JvmMetrics initSingleton(String processName, String sessionId) {
+     return Singleton.INSTANCE.init(processName, sessionId);
+   }
+ 
++  /**
++   * Shutdown the JvmMetrics singleton. This is not necessary if the JVM itself
++   * is shutdown, but may be necessary for scenarios where JvmMetrics instance
++   * needs to be re-created while the JVM is still around. One such scenario
++   * is unit-testing.
++   */
++  public static void shutdownSingleton() {
++    Singleton.INSTANCE.shutdown();
++  }
++
+   @Override
+   public void getMetrics(MetricsCollector collector, boolean all) {
+     MetricsRecordBuilder rb = collector.addRecord(JvmMetrics)
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
+index d825b2b..cb89561 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
+@@ -63,6 +63,15 @@
+   public static final String KMS_AUDIT_AGGREGATION_WINDOW = CONFIG_PREFIX +
+       "audit.aggregation.window.ms";
+ 
++  // Process name shown in metrics
++  public static final String METRICS_PROCESS_NAME_KEY =
++      CONFIG_PREFIX + "metrics.process.name";
++  public static final String METRICS_PROCESS_NAME_DEFAULT = "KMS";
++
++  // Session id for metrics
++  public static final String METRICS_SESSION_ID_KEY =
++      CONFIG_PREFIX + "metrics.session.id";
++
+   // KMS Audit logger classes to use
+   public static final String KMS_AUDIT_LOGGER_KEY = CONFIG_PREFIX +
+       "audit.logger";
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
+index b895e3c..67edf2e 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
+@@ -28,8 +28,11 @@
+ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
+ import org.apache.hadoop.crypto.key.KeyProviderFactory;
+ import org.apache.hadoop.http.HttpServer2;
++import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
++import org.apache.hadoop.metrics2.source.JvmMetrics;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AccessControlList;
++import org.apache.hadoop.util.JvmPauseMonitor;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.apache.log4j.PropertyConfigurator;
+ import org.slf4j.Logger;
+@@ -44,6 +47,10 @@
+ import java.net.URI;
+ import java.net.URL;
+ 
++import static org.apache.hadoop.crypto.key.kms.server.KMSConfiguration.METRICS_PROCESS_NAME_DEFAULT;
++import static org.apache.hadoop.crypto.key.kms.server.KMSConfiguration.METRICS_PROCESS_NAME_KEY;
++import static org.apache.hadoop.crypto.key.kms.server.KMSConfiguration.METRICS_SESSION_ID_KEY;
++
+ @InterfaceAudience.Private
+ public class KMSWebApp implements ServletContextListener {
+ 
+@@ -84,6 +91,9 @@
+   private static Meter reencryptEEKBatchCallsMeter;
+   private static Meter generateEEKCallsMeter;
+   private static Meter invalidCallsMeter;
++  private static String processName;
++  private static String sessionId;
++  private static JvmPauseMonitor pauseMonitor;
+   private static KMSAudit kmsAudit;
+   private static KeyProviderCryptoExtension keyProviderCryptoExtension;
+ 
+@@ -159,6 +169,16 @@ public void contextInitialized(ServletContextEvent sce) {
+       unauthenticatedCallsMeter = metricRegistry.register(
+           UNAUTHENTICATED_CALLS_METER, new Meter());
+ 
++      processName =
++          kmsConf.get(METRICS_PROCESS_NAME_KEY, METRICS_PROCESS_NAME_DEFAULT);
++      sessionId = kmsConf.get(METRICS_SESSION_ID_KEY);
++      pauseMonitor = new JvmPauseMonitor();
++      pauseMonitor.init(kmsConf);
++      DefaultMetricsSystem.initialize(processName);
++      final JvmMetrics jm = JvmMetrics.initSingleton(processName, sessionId);
++      jm.setPauseMonitor(pauseMonitor);
++      pauseMonitor.start();
++
+       kmsAudit = new KMSAudit(kmsConf);
+ 
+       // this is required for the the JMXJsonServlet to work properly.
+@@ -232,6 +252,9 @@ public void contextDestroyed(ServletContextEvent sce) {
+     }
+     kmsAudit.shutdown();
+     kmsAcls.stopReloader();
++    pauseMonitor.stop();
++    JvmMetrics.shutdownSingleton();
++    DefaultMetricsSystem.shutdown();
+     jmxReporter.stop();
+     jmxReporter.close();
+     metricRegistry = null;
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+index 266dcff..25ac898 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+@@ -64,6 +64,7 @@
+ import java.io.File;
+ import java.io.FileWriter;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.io.Writer;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+@@ -94,6 +95,8 @@
+ import static org.junit.Assert.fail;
+ import static org.mockito.Mockito.when;
+ 
++import static org.junit.Assert.assertTrue;
++
+ public class TestKMS {
+   private static final Logger LOG = LoggerFactory.getLogger(TestKMS.class);
+ 
+@@ -2547,4 +2550,38 @@ public Void run() throws Exception {
+     });
+   }
+ 
++  /*
++   * Test the jmx page can return, and contains the basic JvmMetrics. Only
++   * testing in simple mode since the page content is the same, kerberized
++   * or not.
++   */
++  @Test
++  public void testKMSJMX() throws Exception {
++    Configuration conf = new Configuration();
++    final File confDir = getTestDir();
++    conf = createBaseKMSConf(confDir, conf);
++    final String processName = "testkmsjmx";
++    conf.set(KMSConfiguration.METRICS_PROCESS_NAME_KEY, processName);
++    writeConf(confDir, conf);
++
++    runServer(null, null, confDir, new KMSCallable<Void>() {
++      @Override
++      public Void call() throws Exception {
++        final URL jmxUrl = new URL(
++            getKMSUrl() + "/jmx?user.name=whatever&qry=Hadoop:service="
++                + processName + ",name=JvmMetrics");
++        LOG.info("Requesting jmx from " + jmxUrl);
++        final StringBuilder sb = new StringBuilder();
++        final InputStream in = jmxUrl.openConnection().getInputStream();
++        final byte[] buffer = new byte[64 * 1024];
++        int len;
++        while ((len = in.read(buffer)) > 0) {
++          sb.append(new String(buffer, 0, len));
++        }
++        LOG.info("jmx returned: " + sb.toString());
++        assertTrue(sb.toString().contains("JvmMetrics"));
++        return null;
++      }
++    });
++  }
+ }
+-- 
+1.7.9.5
+

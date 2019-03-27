@@ -1,0 +1,182 @@
+From c8e1ba7e01cd458b50fd996109b5bdf2c27b0957 Mon Sep 17 00:00:00 2001
+From: Daniel Templeton <templedf@apache.org>
+Date: Wed, 7 Dec 2016 11:12:14 -0800
+Subject: [PATCH 2124/2848] YARN-5136. Error in handling event type
+ APP_ATTEMPT_REMOVED to the scheduler (Contributed
+ by Wilfred Spiegelenburg via Daniel Templeton)
+
+(cherry picked from commit 9f5d2c4fff6d31acc8b422b52462ef4927c4eea1)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+
+Change-Id: Ia3ba8477df0cf980c4c1a7e2e96a0e5356d4f99f
+---
+ .../scheduler/fair/FairScheduler.java              |   29 ++++++-
+ .../scheduler/fair/TestFairScheduler.java          |   89 ++++++++++++++++++++
+ 2 files changed, 114 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 0566e23..54e275d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -798,6 +798,13 @@ private synchronized void removeApplicationAttempt(
+       return;
+     }
+ 
++    // Check if the attempt is already stopped and don't stop it twice.
++    if (attempt.isStopped()) {
++      LOG.info("Application " + applicationAttemptId + " has already been "
++          + "stopped!");
++      return;
++    }
++
+     // Release all the running containers
+     for (RMContainer rmContainer : attempt.getLiveContainers()) {
+       if (keepContainers
+@@ -1602,6 +1609,13 @@ public synchronized String moveApplication(ApplicationId appId,
+     // To serialize with FairScheduler#allocate, synchronize on app attempt
+     synchronized (attempt) {
+       FSLeafQueue oldQueue = (FSLeafQueue) app.getQueue();
++      // Check if the attempt is already stopped: don't move stopped app
++      // attempt. The attempt has already been removed from all queues.
++      if (attempt.isStopped()) {
++        LOG.info("Application " + appId + " is stopped and can't be moved!");
++        throw new YarnException("Application " + appId
++            + " is stopped and can't be moved!");
++      }
+       FSLeafQueue targetQueue = queueMgr.getLeafQueue(queueName, false);
+       if (targetQueue == null) {
+         throw new YarnException("Target queue " + queueName
+@@ -1658,16 +1672,23 @@ private void verifyMoveDoesNotViolateConstraints(FSAppAttempt app,
+    * operations will be atomic.
+    */
+   private void executeMove(SchedulerApplication<FSAppAttempt> app,
+-      FSAppAttempt attempt, FSLeafQueue oldQueue, FSLeafQueue newQueue) {
+-    boolean wasRunnable = oldQueue.removeApp(attempt);
++      FSAppAttempt attempt, FSLeafQueue oldQueue, FSLeafQueue newQueue)
++      throws YarnException {
++    // Check current runs state. Do not remove the attempt from the queue until
++    // after the check has been performed otherwise it could remove the app
++    // from a queue without moving it to a new queue.
++    boolean wasRunnable = oldQueue.isRunnableApp(attempt);
+     // if app was not runnable before, it may be runnable now
+     boolean nowRunnable = maxRunningEnforcer.canAppBeRunnable(newQueue,
+         attempt.getUser());
+     if (wasRunnable && !nowRunnable) {
+-      throw new IllegalStateException("Should have already verified that app "
++      throw new YarnException("Should have already verified that app "
+           + attempt.getApplicationId() + " would be runnable in new queue");
+     }
+-    
++
++    // Now it is safe to remove from the queue.
++    oldQueue.removeApp(attempt);
++
+     if (wasRunnable) {
+       maxRunningEnforcer.untrackRunnableApp(attempt);
+     } else if (nowRunnable) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 4499e41..3093e6b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -6043,6 +6043,95 @@ public void testLowestCommonAncestorDeeperHierarchy() throws Exception {
+   }
+ 
+   @Test
++  public void testDoubleRemoval() throws Exception {
++    String testUser = "user1"; // convenience var
++    scheduler.init(conf);
++    scheduler.start();
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++
++    ApplicationAttemptId attemptId = createAppAttemptId(1, 1);
++    // The placement rule will add the app to the user based queue but the
++    // passed in queue must exist.
++    AppAddedSchedulerEvent appAddedEvent =
++        new AppAddedSchedulerEvent(attemptId.getApplicationId(), testUser,
++            testUser);
++    scheduler.handle(appAddedEvent);
++    AppAttemptAddedSchedulerEvent attemptAddedEvent =
++        new AppAttemptAddedSchedulerEvent(createAppAttemptId(1, 1), false);
++    scheduler.handle(attemptAddedEvent);
++
++    // Get a handle on the attempt.
++    FSAppAttempt attempt = scheduler.getSchedulerApp(attemptId);
++
++    AppAttemptRemovedSchedulerEvent attemptRemovedEvent =
++        new AppAttemptRemovedSchedulerEvent(createAppAttemptId(1, 1),
++            RMAppAttemptState.FINISHED, false);
++
++    // Make sure the app attempt is in the queue.
++    List<ApplicationAttemptId> attemptList =
++        scheduler.getAppsInQueue(testUser);
++    assertNotNull("Queue missing", attemptList);
++    assertTrue("Attempt should be in the queue",
++        attemptList.contains(attemptId));
++    assertFalse("Attempt is stopped", attempt.isStopped());
++
++    // Now remove the app attempt
++    scheduler.handle(attemptRemovedEvent);
++    // The attempt is not in the queue, and stopped
++    attemptList = scheduler.getAppsInQueue(testUser);
++    assertFalse("Attempt should not be in the queue",
++        attemptList.contains(attemptId));
++    assertTrue("Attempt should have been stopped", attempt.isStopped());
++
++    // Now remove the app attempt again, since it is stopped nothing happens.
++    scheduler.handle(attemptRemovedEvent);
++    // The attempt should still show the original queue info.
++    assertTrue("Attempt queue has changed",
++        attempt.getQueue().getName().endsWith(testUser));
++  }
++
++  @Test (expected = YarnException.class)
++  public void testMoveAfterRemoval() throws Exception {
++    String testUser = "user1"; // convenience var
++    scheduler.init(conf);
++    scheduler.start();
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++
++    ApplicationAttemptId attemptId = createAppAttemptId(1, 1);
++    AppAddedSchedulerEvent appAddedEvent =
++        new AppAddedSchedulerEvent(attemptId.getApplicationId(), testUser,
++            testUser);
++    scheduler.handle(appAddedEvent);
++    AppAttemptAddedSchedulerEvent attemptAddedEvent =
++        new AppAttemptAddedSchedulerEvent(createAppAttemptId(1, 1), false);
++    scheduler.handle(attemptAddedEvent);
++
++    // Get a handle on the attempt.
++    FSAppAttempt attempt = scheduler.getSchedulerApp(attemptId);
++
++    AppAttemptRemovedSchedulerEvent attemptRemovedEvent =
++        new AppAttemptRemovedSchedulerEvent(createAppAttemptId(1, 1),
++            RMAppAttemptState.FINISHED, false);
++
++    // Remove the app attempt
++    scheduler.handle(attemptRemovedEvent);
++    // Make sure the app attempt is not in the queue and stopped.
++    List<ApplicationAttemptId> attemptList =
++        scheduler.getAppsInQueue(testUser);
++    assertNotNull("Queue missing", attemptList);
++    assertFalse("Attempt should not be in the queue",
++        attemptList.contains(attemptId));
++    assertTrue("Attempt should have been stopped", attempt.isStopped());
++    // The attempt should still show the original queue info.
++    assertTrue("Attempt queue has changed",
++        attempt.getQueue().getName().endsWith(testUser));
++
++    // Now move the app: not using an event since there is none
++    // in the scheduler. This should throw.
++    scheduler.moveApplication(attemptId.getApplicationId(), "default");
++  }
++
++  @Test
+   public void testThreadLifeCycle() throws InterruptedException {
+     conf.setBoolean(
+         FairSchedulerConfiguration.CONTINUOUS_SCHEDULING_ENABLED, true);
+-- 
+1.7.9.5
+

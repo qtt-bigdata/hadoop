@@ -1,0 +1,647 @@
+From 4da5de1a7c965f63f0b798e9ec4ec72ed7249f18 Mon Sep 17 00:00:00 2001
+From: Aaron Fabbri <fabbri@apache.org>
+Date: Mon, 20 Feb 2017 10:25:09 -0800
+Subject: [PATCH 2282/2848] HADOOP-14041 CLI command to prune old metadata
+ (Contributed by Sean Mackrory)
+
+(cherry picked from commit 2ff5812d4b353fcf82b85a586e15276fe86bd20c)
+
+Change-Id: Ic4dc1f0ff68265a4937c66097d2ed9b0fc93e99a
+---
+ .../src/main/resources/core-default.xml            |   23 ++++-
+ .../java/org/apache/hadoop/fs/s3a/Constants.java   |   18 ++++
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |   41 ++++++++
+ .../hadoop/fs/s3a/s3guard/LocalMetadataStore.java  |   42 ++++++++
+ .../hadoop/fs/s3a/s3guard/MetadataStore.java       |   14 +++
+ .../hadoop/fs/s3a/s3guard/NullMetadataStore.java   |    5 +
+ .../apache/hadoop/fs/s3a/s3guard/S3GuardTool.java  |   90 ++++++++++++++++-
+ .../src/site/markdown/tools/hadoop-aws/s3guard.md  |    8 ++
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |  105 ++++++++++++++++++--
+ .../hadoop/fs/s3a/s3guard/S3GuardToolTestBase.java |   44 +++++++-
+ .../hadoop/fs/s3a/s3guard/TestS3GuardTool.java     |    4 +-
+ 11 files changed, 380 insertions(+), 14 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index be36d13..bf70315 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -1194,6 +1194,16 @@ for ldap providers in the same way as above does.
+     </description>
+ </property>
+ 
++<property>
++    <name>fs.s3a.s3guard.cli.prune.age</name>
++    <value>86400000</value>
++    <description>
++        Default age (in milliseconds) after which to prune metadata from the
++        metadatastore when the prune command is run.  Can be overridden on the
++        command-line.
++    </description>
++</property>
++
+ 
+ <property>
+   <name>fs.s3a.impl</name>
+@@ -1265,7 +1275,18 @@ for ldap providers in the same way as above does.
+     </description>
+ </property>
+ 
+-  <property>
++<property>
++  <name>fs.s3a.s3guard.ddb.background.sleep</name>
++  <value>25</value>
++  <description>
++    Length (in milliseconds) of pause between each batch of deletes when
++    pruning metadata.  Prevents prune operations (which can typically be low
++    priority background operations) from overly interfering with other I/O
++    operations.
++  </description>
++</property>
++
++<property>
+   <name>fs.AbstractFileSystem.s3a.impl</name>
+   <value>org.apache.hadoop.fs.s3a.S3A</value>
+   <description>The implementation class of the S3A AbstractFileSystem.</description>
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index 8cea28e..09940de 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -338,6 +338,14 @@ private Constants() {
+   /* Constants. */
+   public static final String S3_METADATA_STORE_IMPL =
+       "fs.s3a.metadatastore.impl";
++
++  /** Minimum period of time (in milliseconds) to keep metadata (may only be
++   * applied when a prune command is manually run).
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_CLI_PRUNE_AGE =
++      "fs.s3a.s3guard.cli.prune.age";
++
+   /**
+    * The endpoint of the DynamoDB service.
+    *
+@@ -391,6 +399,16 @@ private Constants() {
+   public static final int S3GUARD_DDB_MAX_RETRIES_DEFAULT = 9;
+ 
+   /**
++   * Period of time (in milliseconds) to sleep between batches of writes.
++   * Currently only applies to prune operations, as they are naturally a
++   * lower priority than other operations.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_BACKGROUND_SLEEP_MSEC_KEY =
++      "fs.s3a.s3guard.ddb.background.sleep";
++  public static final int S3GUARD_DDB_BACKGROUND_SLEEP_MSEC_DEFAULT = 25;
++
++  /**
+    * V1 committer.
+    */
+   @InterfaceStability.Unstable
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index 46357d7..c7d7ac3 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -38,10 +38,12 @@
+ import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
+ import com.amazonaws.services.dynamodbv2.document.PutItemOutcome;
+ import com.amazonaws.services.dynamodbv2.document.QueryOutcome;
++import com.amazonaws.services.dynamodbv2.document.ScanOutcome;
+ import com.amazonaws.services.dynamodbv2.document.Table;
+ import com.amazonaws.services.dynamodbv2.document.TableWriteItems;
+ import com.amazonaws.services.dynamodbv2.document.spec.GetItemSpec;
+ import com.amazonaws.services.dynamodbv2.document.spec.QuerySpec;
++import com.amazonaws.services.dynamodbv2.document.utils.ValueMap;
+ import com.amazonaws.services.dynamodbv2.model.CreateTableRequest;
+ import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughput;
+ import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughputDescription;
+@@ -598,6 +600,45 @@ public void destroy() throws IOException {
+     }
+   }
+ 
++  private ItemCollection<ScanOutcome> expiredFiles(long modTime) {
++    String filterExpression = "mod_time < :mod_time";
++    String projectionExpression = "parent,child";
++    ValueMap map = new ValueMap().withLong(":mod_time", modTime);
++    return table.scan(filterExpression, projectionExpression, null, map);
++  }
++
++  @Override
++  public void prune(long modTime) throws IOException {
++    int itemCount = 0;
++    try {
++      Collection<Path> deletionBatch =
++          new ArrayList(S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT);
++      int delay = conf.getInt(S3GUARD_DDB_BACKGROUND_SLEEP_MSEC_KEY,
++          S3GUARD_DDB_BACKGROUND_SLEEP_MSEC_DEFAULT);
++      for (Item item : expiredFiles(modTime)) {
++        PathMetadata md = PathMetadataDynamoDBTranslation
++            .itemToPathMetadata(item, username);
++        Path path = md.getFileStatus().getPath();
++        deletionBatch.add(path);
++        itemCount++;
++        if (deletionBatch.size() == S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT) {
++          Thread.sleep(delay);
++          processBatchWriteRequest(pathToKey(deletionBatch), new Item[0]);
++          deletionBatch.clear();
++        }
++      }
++      if (deletionBatch.size() > 0) {
++        Thread.sleep(delay);
++        processBatchWriteRequest(pathToKey(deletionBatch), new Item[0]);
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupted();
++      throw new InterruptedIOException("Pruning was interrupted");
++    }
++    LOG.info("Finished pruning {} items in batches of {}", itemCount,
++        S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT);
++  }
++
+   @Override
+   public String toString() {
+     return getClass().getSimpleName() + '{'
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+index d40c45c..97d4fe2 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+@@ -33,6 +33,7 @@
+ import java.net.URI;
+ import java.util.Collection;
+ import java.util.Iterator;
++import java.util.LinkedList;
+ import java.util.Map;
+ 
+ /**
+@@ -270,6 +271,47 @@ public void destroy() throws IOException {
+     }
+   }
+ 
++  @Override
++  public synchronized void prune(long modTime) throws IOException {
++    Iterator<Map.Entry<Path, PathMetadata>> files =
++        fileHash.entrySet().iterator();
++    while (files.hasNext()) {
++      Map.Entry<Path, PathMetadata> entry = files.next();
++      if (expired(entry.getValue().getFileStatus(), modTime)) {
++        files.remove();
++      }
++    }
++    Iterator<Map.Entry<Path, DirListingMetadata>> dirs =
++        dirHash.entrySet().iterator();
++    Collection<Path> ancestors = new LinkedList<>();
++    while (dirs.hasNext()) {
++      Map.Entry<Path, DirListingMetadata> entry = dirs.next();
++      Path path = entry.getKey();
++      DirListingMetadata metadata = entry.getValue();
++      Collection<PathMetadata> oldChildren = metadata.getListing();
++      Collection<PathMetadata> newChildren = new LinkedList<>();
++
++      for (PathMetadata child : oldChildren) {
++        FileStatus status = child.getFileStatus();
++        if (!expired(status, modTime)) {
++          newChildren.add(child);
++        }
++      }
++      if (newChildren.size() == 0) {
++        dirs.remove();
++        ancestors.add(entry.getKey());
++      } else {
++        dirHash.put(path, new DirListingMetadata(path, newChildren, false));
++      }
++    }
++  }
++
++  private boolean expired(FileStatus status, long expiry) {
++    // Note: S3 doesn't track modification time on directories, so for
++    // consistency with the DynamoDB implementation we ignore that here
++    return status.getModificationTime() < expiry && !status.isDirectory();
++  }
++
+   @VisibleForTesting
+   static <T> void clearHashByAncestor(Path ancestor, Map<Path, T> hash) {
+     for (Iterator<Map.Entry<Path, T>> it = hash.entrySet().iterator();
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+index 59b39a5..dc3433c 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+@@ -165,4 +165,18 @@ void move(Collection<Path> pathsToDelete, Collection<PathMetadata>
+    * @throws IOException if there is an error
+    */
+   void destroy() throws IOException;
++
++  /**
++   * Clear any metadata older than a specified time from the repository.
++   * Implementations MUST clear file metadata, and MAY clear directory metadata
++   * (s3a itself does not track modification time for directories).
++   * Implementations may also choose to throw UnsupportedOperationException
++   * istead. Note that modification times should be in UTC, as returned by
++   * System.currentTimeMillis at the time of modification.
++   *
++   * @param modTime Oldest modification time to allow
++   * @throws IOException if there is an error
++   * @throws UnsupportedOperationException if not implemented
++   */
++  void prune(long modTime) throws IOException, UnsupportedOperationException;
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
+index aed9590..082e0f9 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
+@@ -87,6 +87,11 @@ public void destroy() throws IOException {
+   }
+ 
+   @Override
++  public void prune(long modTime) {
++    return;
++  }
++
++  @Override
+   public String toString() {
+     return "NullMetadataStore";
+   }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardTool.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardTool.java
+index e5cc416..d187524 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardTool.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardTool.java
+@@ -27,6 +27,7 @@
+ import org.apache.hadoop.fs.LocatedFileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.RemoteIterator;
++import org.apache.hadoop.fs.s3a.Constants;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.shell.CommandFormat;
+@@ -45,6 +46,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.TimeUnit;
+ 
+ import static org.apache.hadoop.fs.s3a.Constants.*;
+ 
+@@ -601,10 +603,93 @@ public int run(String[] args) throws IOException {
+     }
+   }
+ 
++  /**
++   * Prune metadata that has not been modified recently.
++   */
++  static class Prune extends S3GuardTool {
++    private static final String NAME = "prune";
++    private static final String USAGE = NAME +
++        "([-D days] [-H hours] [-M minutes] [-S seconds]))" +
++        " ( -m METASTORE | s3a://bucket/path/ )";
++
++    Prune(Configuration conf) {
++      super(conf);
++
++      commandFormat.addOptionWithValue("D");
++      commandFormat.addOptionWithValue("H");
++      commandFormat.addOptionWithValue("M");
++      commandFormat.addOptionWithValue("S");
++    }
++
++    @VisibleForTesting
++    void setMetadataStore(MetadataStore ms) {
++      Preconditions.checkNotNull(ms);
++      this.ms = ms;
++    }
++
++    @Override
++    String getName() {
++      return NAME;
++    }
++
++    private long getDeltaComponent(TimeUnit unit, String arg) {
++      String raw = commandFormat.getOptValue(arg);
++      if (raw == null || raw.isEmpty()) {
++        return 0;
++      }
++      Long parsed = Long.parseLong(raw);
++      return unit.toMillis(parsed);
++    }
++
++    @VisibleForTesting
++    public int run(String[] args, PrintStream out) throws
++        InterruptedException, IOException {
++      List<String> paths = parseArgs(args);
++      if (!parseDynamoDBEndPoint(paths)) {
++        System.out.println(USAGE);
++        return INVALID_ARGUMENT;
++      }
++      initMetadataStore(false);
++
++      Configuration conf = getConf();
++      long confDelta = conf.getLong(Constants.S3GUARD_CLI_PRUNE_AGE, 0);
++
++      long cliDelta = 0;
++      cliDelta += getDeltaComponent(TimeUnit.DAYS, "D");
++      cliDelta += getDeltaComponent(TimeUnit.HOURS, "H");
++      cliDelta += getDeltaComponent(TimeUnit.MINUTES, "M");
++      cliDelta += getDeltaComponent(TimeUnit.SECONDS, "S");
++
++      if (confDelta <= 0 && cliDelta <= 0) {
++        System.err.println(
++            "You must specify a positive age for metadata to prune.");
++      }
++
++      // A delta provided on the CLI overrides if one is configured
++      long delta = confDelta;
++      if (cliDelta > 0) {
++        delta = cliDelta;
++      }
++
++      long now = System.currentTimeMillis();
++      long divide = now - delta;
++
++      ms.prune(divide);
++
++      out.flush();
++      return SUCCESS;
++    }
++
++    @Override
++    public int run(String[] args) throws InterruptedException, IOException {
++      return run(args, System.out);
++    }
++  }
++
+   private static void printHelp() {
+     System.out.println("Usage: hadoop " + NAME + " [" +
+         InitMetadata.NAME + "|" + DestroyMetadata.NAME +
+-        "|" + Import.NAME + "|" + Diff.NAME +
++        "|" + Import.NAME + "|" + Diff.NAME + "|" + Prune.NAME +
+         "] [OPTIONS] [ARGUMENTS]");
+ 
+     System.out.println("\tperform metadata store " +
+@@ -639,6 +724,9 @@ public static int run(String[] args, Configuration conf) throws Exception {
+     case Diff.NAME:
+       cmd = new Diff(conf);
+       break;
++    case Prune.NAME:
++      cmd = new Prune(conf);
++      break;
+     default:
+       printHelp();
+       return INVALID_ARGUMENT;
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+index 368a809..4455334 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+@@ -280,6 +280,14 @@ hadoop s3a destroy [-m URI] ( -e ENDPOINT | s3a://BUCKET )
+ 
+ Deletes a metadata store.
+ 
++### Prune
++
++```
++hadoop s3a prune [-D DAYS] [-H HOURS] [-M MINUTES] [-S SECONDS] [-m URI] ( -e ENDPOINT | s3a://BUCKET )
++```
++
++Trims metadata for files that are older than the time given. Must supply at least length of time.
++
+ ## Debugging and Error Handling
+ 
+ If you run into network connectivity issues, or have a machine failure in the
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index bbf3b6d..bb0c24f 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -27,6 +27,7 @@
+ import com.google.common.collect.Sets;
+ import org.junit.After;
+ import org.junit.Assert;
++import org.junit.Assume;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.slf4j.Logger;
+@@ -77,6 +78,15 @@ public boolean allowMissing() {
+     return false;
+   }
+ 
++  /**
++   * Pruning is an optional feature for metadata store implementations.
++   * Tests will only check that functionality if it is expected to work.
++   * @return true if the test should expect pruning to work.
++   */
++  public boolean supportsPruning() {
++    return true;
++  }
++
+   /** The MetadataStore contract used to test against. */
+   private AbstractMSContract contract;
+ 
+@@ -484,6 +494,68 @@ public void testMultiBucketPaths() throws Exception {
+     ms.delete(new Path(p1));
+   }
+ 
++  @Test
++  public void testPruneFiles() throws Exception {
++    Assume.assumeTrue(supportsPruning());
++    createNewDirs("/pruneFiles");
++
++    long oldTime = getTime();
++    ms.put(new PathMetadata(makeFileStatus("/pruneFiles/old", 1, oldTime,
++        oldTime)));
++    DirListingMetadata ls2 = ms.listChildren(strToPath("/pruneFiles"));
++    if (!allowMissing()) {
++      assertListingsEqual(ls2.getListing(), "/pruneFiles/old");
++    }
++
++    // It's possible for the Local implementation to get from /pruneFiles/old's
++    // modification time to here in under 1ms, causing it to not get pruned
++    Thread.sleep(1);
++    long cutoff = System.currentTimeMillis();
++    long newTime = getTime();
++    ms.put(new PathMetadata(makeFileStatus("/pruneFiles/new", 1, newTime,
++        newTime)));
++
++    DirListingMetadata ls;
++    ls = ms.listChildren(strToPath("/pruneFiles"));
++    if (!allowMissing()) {
++      assertListingsEqual(ls.getListing(), "/pruneFiles/new",
++          "/pruneFiles/old");
++    }
++    ms.prune(cutoff);
++    ls = ms.listChildren(strToPath("/pruneFiles"));
++    if (allowMissing()) {
++      assertNotCached("/pruneFiles/old");
++    } else {
++      assertListingsEqual(ls.getListing(), "/pruneFiles/new");
++    }
++  }
++
++  @Test
++  public void testPruneDirs() throws Exception {
++    Assume.assumeTrue(supportsPruning());
++
++    // We only test that files, not dirs, are removed during prune.
++    // We specifically allow directories to remain, as it is more robust
++    // for DynamoDBMetadataStore's prune() implementation: If a
++    // file was created in a directory while it was being pruned, it would
++    // violate the invariant that all ancestors of a file exist in the table.
++
++    createNewDirs("/pruneDirs/dir");
++
++    long oldTime = getTime();
++    ms.put(new PathMetadata(makeFileStatus("/pruneDirs/dir/file",
++        1, oldTime, oldTime)));
++
++    // It's possible for the Local implementation to get from the old
++    // modification time to here in under 1ms, causing it to not get pruned
++    Thread.sleep(1);
++    long cutoff = getTime();
++
++    ms.prune(cutoff);
++
++    assertNotCached("/pruneDirs/dir/file");
++  }
++
+   /*
+    * Helper functions.
+    */
+@@ -600,23 +672,34 @@ private void assertEmptyDirs(String ...dirs) throws IOException {
+     }
+   }
+ 
+-  FileStatus basicFileStatus(Path path, int size, boolean isDir)
+-      throws IOException {
+-    return new FileStatus(size, isDir, REPLICATION, BLOCK_SIZE, modTime,
+-        accessTime, PERMISSION, OWNER, GROUP, path);
++  FileStatus basicFileStatus(Path path, int size, boolean isDir) throws
++      IOException {
++    return basicFileStatus(path, size, isDir, modTime, accessTime);
+   }
+ 
+-  private FileStatus makeFileStatus(String pathStr, int size)
+-      throws IOException {
+-    return basicFileStatus(strToPath(pathStr), size, false);
++  FileStatus basicFileStatus(Path path, int size, boolean isDir,
++      long newModTime, long newAccessTime) throws IOException {
++    return new FileStatus(size, isDir, REPLICATION, BLOCK_SIZE, newModTime,
++        newAccessTime, PERMISSION, OWNER, GROUP, path);
++  }
++
++  private FileStatus makeFileStatus(String pathStr, int size) throws
++      IOException {
++    return makeFileStatus(pathStr, size, modTime, accessTime);
++  }
++
++  private FileStatus makeFileStatus(String pathStr, int size, long newModTime,
++      long newAccessTime) throws IOException {
++    return basicFileStatus(strToPath(pathStr), size, false,
++        newModTime, newAccessTime);
+   }
+ 
+   void verifyFileStatus(FileStatus status, long size) {
+-    S3ATestUtils.verifyFileStatus(status, size, BLOCK_SIZE, getModTime());
++    S3ATestUtils.verifyFileStatus(status, size, BLOCK_SIZE, modTime);
+   }
+ 
+   private FileStatus makeDirStatus(String pathStr) throws IOException {
+-    return basicFileStatus(strToPath(pathStr), 0, true);
++    return basicFileStatus(strToPath(pathStr), 0, true, modTime, accessTime);
+   }
+ 
+   /**
+@@ -635,4 +718,8 @@ long getAccessTime() {
+     return accessTime;
+   }
+ 
++  protected static long getTime() {
++    return System.currentTimeMillis();
++  }
++
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardToolTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardToolTestBase.java
+index 32fcef1..666ec8e 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardToolTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardToolTestBase.java
+@@ -21,15 +21,20 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.contract.ContractTestUtils;
++import org.apache.hadoop.fs.s3a.Constants;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.s3a.S3ATestUtils;
+ import org.junit.After;
+ import org.junit.Before;
++import org.junit.Test;
++import static org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.SUCCESS;
+ 
+ import java.io.IOException;
++import java.util.concurrent.TimeUnit;
+ 
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertEquals;
+ 
+ /**
+  * Common functionality for S3GuardTool test cases.
+@@ -112,9 +117,46 @@ protected void createFile(Path path, boolean onS3, boolean onMetadataStore)
+     }
+ 
+     if (onMetadataStore) {
+-      S3AFileStatus status = new S3AFileStatus(100L, 10000L,
++      S3AFileStatus status = new S3AFileStatus(100L, System.currentTimeMillis(),
+           fs.qualify(path), 512L, "hdfs");
+       putFile(ms, status);
+     }
+   }
++
++  private void testPruneCommand(Configuration cmdConf, String[] args)
++      throws Exception {
++    Path parent = new Path(getTestPath("/prune-cli"));
++    try {
++      fs.mkdirs(parent);
++
++      S3GuardTool.Prune cmd = new S3GuardTool.Prune(cmdConf);
++      cmd.setMetadataStore(ms);
++
++      createFile(new Path(parent, "stale"), true, true);
++      Thread.sleep(TimeUnit.SECONDS.toMillis(2));
++      createFile(new Path(parent, "fresh"), true, true);
++
++      assertEquals(2, ms.listChildren(parent).getListing().size());
++      assertEquals("Prune command did not exit successfully - see output",
++          SUCCESS, cmd.run(args));
++      assertEquals(1, ms.listChildren(parent).getListing().size());
++    } finally {
++      fs.delete(parent, true);
++      ms.prune(Long.MAX_VALUE);
++    }
++  }
++
++  @Test
++  public void testPruneCommandCLI() throws Exception {
++    String testPath = getTestPath("testPruneCommandCLI");
++    testPruneCommand(fs.getConf(), new String[]{"prune", "-S", "1", testPath});
++  }
++
++  @Test
++  public void testPruneCommandConf() throws Exception {
++    conf.setLong(Constants.S3GUARD_CLI_PRUNE_AGE,
++        TimeUnit.SECONDS.toMillis(1));
++    String testPath = getTestPath("testPruneCommandConf");
++    testPruneCommand(conf, new String[]{"prune", testPath});
++  }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3GuardTool.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3GuardTool.java
+index 77f0919..6a39d7b 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3GuardTool.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3GuardTool.java
+@@ -78,8 +78,8 @@ public void testImportCommand() throws IOException {
+   public void testDiffCommand() throws IOException {
+     S3AFileSystem fs = getFs();
+     MetadataStore ms = getMetadataStore();
+-    Set<Path> filesOnS3 = new HashSet<>();  // files on S3.
+-    Set<Path> filesOnMS = new HashSet<>();  // files on metadata store.
++    Set<Path> filesOnS3 = new HashSet<>(); // files on S3.
++    Set<Path> filesOnMS = new HashSet<>(); // files on metadata store.
+ 
+     String testPath = getTestPath("/test-diff");
+     mkdirs(new Path(testPath), true, true);
+-- 
+1.7.9.5
+

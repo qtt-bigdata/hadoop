@@ -1,0 +1,482 @@
+From a69fc307d7d18d6571f79b3c5dac26510a14cb60 Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Sun, 6 Dec 2015 17:42:56 +0000
+Subject: [PATCH 1295/2848] HADOOP-12321. Make JvmPauseMonitor an
+ AbstractService. (Sunil G via Stevel) [includes
+ HDFS-8947 MAPREDUCE-6462 and YARN-4072]
+
+(cherry picked from commit af14458de7738be4877ce7d93f38aba7c97a32ee)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestJobHistoryServer.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+
+Change-Id: I06838883de075a42416cf3807fca42087be3b453
+---
+ .../org/apache/hadoop/util/JvmPauseMonitor.java    |   50 ++++++++------
+ .../hadoop/metrics2/source/TestJvmMetrics.java     |   70 +++++++++++++++++++-
+ .../hadoop/hdfs/nfs/nfs3/RpcProgramNfs3.java       |    3 +-
+ .../hadoop/hdfs/server/datanode/DataNode.java      |    3 +-
+ .../hadoop/hdfs/server/namenode/NameNode.java      |    3 +-
+ .../hadoop/mapreduce/v2/hs/JobHistoryServer.java   |    7 +-
+ .../mapreduce/v2/hs/TestJobHistoryServer.java      |    1 -
+ .../ApplicationHistoryServer.java                  |    9 +--
+ .../TestApplicationHistoryServer.java              |    1 -
+ .../yarn/server/nodemanager/NodeManager.java       |    7 +-
+ .../server/resourcemanager/ResourceManager.java    |   11 ++-
+ .../yarn/server/webproxy/WebAppProxyServer.java    |    9 +--
+ 12 files changed, 115 insertions(+), 59 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/JvmPauseMonitor.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/JvmPauseMonitor.java
+index 72ccf9d..17a1952 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/JvmPauseMonitor.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/JvmPauseMonitor.java
+@@ -28,6 +28,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.service.AbstractService;
+ 
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+@@ -43,21 +44,21 @@
+  * detected, the thread logs a message.
+  */
+ @InterfaceAudience.Private
+-public class JvmPauseMonitor {
++public class JvmPauseMonitor extends AbstractService {
+   private static final Log LOG = LogFactory.getLog(
+       JvmPauseMonitor.class);
+ 
+   /** The target sleep time */
+   private static final long SLEEP_INTERVAL_MS = 500;
+-  
++
+   /** log WARN if we detect a pause longer than this threshold */
+-  private final long warnThresholdMs;
++  private long warnThresholdMs;
+   private static final String WARN_THRESHOLD_KEY =
+       "jvm.pause.warn-threshold.ms";
+   private static final long WARN_THRESHOLD_DEFAULT = 10000;
+-  
++
+   /** log INFO if we detect a pause longer than this threshold */
+-  private final long infoThresholdMs;
++  private long infoThresholdMs;
+   private static final String INFO_THRESHOLD_KEY =
+       "jvm.pause.info-threshold.ms";
+   private static final long INFO_THRESHOLD_DEFAULT = 1000;
+@@ -65,29 +66,32 @@
+   private long numGcWarnThresholdExceeded = 0;
+   private long numGcInfoThresholdExceeded = 0;
+   private long totalGcExtraSleepTime = 0;
+-   
++
+   private Thread monitorThread;
+   private volatile boolean shouldRun = true;
+ 
+-  public JvmPauseMonitor(Configuration conf) {
++  public JvmPauseMonitor() {
++    super(JvmPauseMonitor.class.getName());
++  }
++
++  @Override
++  protected void serviceInit(Configuration conf) throws Exception {
+     this.warnThresholdMs = conf.getLong(WARN_THRESHOLD_KEY, WARN_THRESHOLD_DEFAULT);
+     this.infoThresholdMs = conf.getLong(INFO_THRESHOLD_KEY, INFO_THRESHOLD_DEFAULT);
++    super.serviceInit(conf);
+   }
+-  
+-  public void start() {
+-    Preconditions.checkState(monitorThread == null,
+-        "Already started");
++
++  @Override
++  protected void serviceStart() throws Exception {
+     monitorThread = new Daemon(new Monitor());
+-    if (shouldRun) {
+-      monitorThread.start();
+-    } else {
+-      LOG.warn("stop() was called before start() completed");
+-    }
++    monitorThread.start();
++    super.serviceStart();
+   }
+-  
+-  public void stop() {
++
++  @Override
++  protected void serviceStop() throws Exception {
+     shouldRun = false;
+-    if (isStarted()) {
++    if (monitorThread != null) {
+       monitorThread.interrupt();
+       try {
+         monitorThread.join();
+@@ -95,12 +99,13 @@ public void stop() {
+         Thread.currentThread().interrupt();
+       }
+     }
++    super.serviceStop();
+   }
+ 
+   public boolean isStarted() {
+     return monitorThread != null;
+   }
+-  
++
+   public long getNumGcWarnThreadholdExceeded() {
+     return numGcWarnThresholdExceeded;
+   }
+@@ -213,8 +218,11 @@ public void run() {
+    * with a 1GB heap will very quickly go into "GC hell" and result in
+    * log messages about the GC pauses.
+    */
++  @SuppressWarnings("resource")
+   public static void main(String []args) throws Exception {
+-    new JvmPauseMonitor(new Configuration()).start();
++    JvmPauseMonitor monitor = new JvmPauseMonitor();
++    monitor.init(new Configuration());
++    monitor.start();
+     List<String> list = Lists.newArrayList();
+     int i = 0;
+     while (true) {
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
+index 3cb3384..69e7565 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
+@@ -18,7 +18,11 @@
+ 
+ package org.apache.hadoop.metrics2.source;
+ 
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ 
+ import static org.mockito.Mockito.*;
+ import static org.apache.hadoop.test.MetricsAsserts.*;
+@@ -26,6 +30,9 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.metrics2.MetricsCollector;
+ import org.apache.hadoop.metrics2.MetricsRecordBuilder;
++import org.apache.hadoop.service.ServiceOperations;
++import org.apache.hadoop.service.ServiceStateException;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.JvmPauseMonitor;
+ 
+ import static org.apache.hadoop.metrics2.source.JvmMetricsInfo.*;
+@@ -33,8 +40,23 @@
+ 
+ public class TestJvmMetrics {
+ 
+-  @Test public void testPresence() {
+-    JvmPauseMonitor pauseMonitor = new JvmPauseMonitor(new Configuration());
++  @Rule
++  public Timeout timeout = new Timeout(30000);
++  private JvmPauseMonitor pauseMonitor;
++
++  /**
++   * Robust shutdown of the pause monitor if it hasn't been stopped already.
++   */
++  @After
++  public void teardown() {
++    ServiceOperations.stop(pauseMonitor);
++  }
++
++  @Test
++  public void testPresence() {
++    pauseMonitor = new JvmPauseMonitor();
++    pauseMonitor.init(new Configuration());
++    pauseMonitor.start();
+     JvmMetrics jvmMetrics = new JvmMetrics("test", "test");
+     jvmMetrics.setPauseMonitor(pauseMonitor);
+     MetricsRecordBuilder rb = getMetrics(jvmMetrics);
+@@ -54,4 +76,48 @@ else if (info.name().startsWith("Log"))
+         verify(rb).addCounter(eq(info), anyLong());
+     }
+   }
++
++  @Test
++  public void testDoubleStop() throws Throwable {
++    pauseMonitor = new JvmPauseMonitor();
++    pauseMonitor.init(new Configuration());
++    pauseMonitor.start();
++    pauseMonitor.stop();
++    pauseMonitor.stop();
++  }
++
++  @Test
++  public void testDoubleStart() throws Throwable {
++    pauseMonitor = new JvmPauseMonitor();
++    pauseMonitor.init(new Configuration());
++    pauseMonitor.start();
++    pauseMonitor.start();
++    pauseMonitor.stop();
++  }
++
++  @Test
++  public void testStopBeforeStart() throws Throwable {
++    pauseMonitor = new JvmPauseMonitor();
++    try {
++      pauseMonitor.init(new Configuration());
++      pauseMonitor.stop();
++      pauseMonitor.start();
++      Assert.fail("Expected an exception, got " + pauseMonitor);
++    } catch (ServiceStateException e) {
++      GenericTestUtils.assertExceptionContains("cannot enter state", e);
++    }
++  }
++
++  @Test
++  public void testStopBeforeInit() throws Throwable {
++    pauseMonitor = new JvmPauseMonitor();
++    try {
++      pauseMonitor.stop();
++      pauseMonitor.init(new Configuration());
++      Assert.fail("Expected an exception, got " + pauseMonitor);
++    } catch (ServiceStateException e) {
++      GenericTestUtils.assertExceptionContains("cannot enter state", e);
++    }
++  }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-nfs/src/main/java/org/apache/hadoop/hdfs/nfs/nfs3/RpcProgramNfs3.java b/hadoop-hdfs-project/hadoop-hdfs-nfs/src/main/java/org/apache/hadoop/hdfs/nfs/nfs3/RpcProgramNfs3.java
+index 8947d68..56c7b31 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-nfs/src/main/java/org/apache/hadoop/hdfs/nfs/nfs3/RpcProgramNfs3.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-nfs/src/main/java/org/apache/hadoop/hdfs/nfs/nfs3/RpcProgramNfs3.java
+@@ -242,7 +242,8 @@ private void clearDirectory(String writeDumpDir) throws IOException {
+   @Override
+   public void startDaemons() {
+     if (pauseMonitor == null) {
+-      pauseMonitor = new JvmPauseMonitor(config);
++      pauseMonitor = new JvmPauseMonitor();
++      pauseMonitor.init(config);
+       pauseMonitor.start();
+       metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index b68451c..652d8ac 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -1136,7 +1136,8 @@ void startDataNode(Configuration conf,
+     registerMXBean();
+     initDataXceiver(conf);
+     startInfoServer(conf);
+-    pauseMonitor = new JvmPauseMonitor(conf);
++    pauseMonitor = new JvmPauseMonitor();
++    pauseMonitor.init(conf);
+     pauseMonitor.start();
+   
+     // BlockPoolTokenSecretManager is required to create ipc server.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index fbc81d8..ed97d69 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -659,7 +659,8 @@ protected void initialize(Configuration conf) throws IOException {
+     NameNode.initMetrics(conf, this.getRole());
+     StartupProgressMetrics.register(startupProgress);
+ 
+-    pauseMonitor = new JvmPauseMonitor(conf);
++    pauseMonitor = new JvmPauseMonitor();
++    pauseMonitor.init(conf);
+     pauseMonitor.start();
+     metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/JobHistoryServer.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/JobHistoryServer.java
+index aa0506d..d4f87bd 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/JobHistoryServer.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/JobHistoryServer.java
+@@ -147,7 +147,8 @@ protected void serviceInit(Configuration conf) throws Exception {
+ 
+     DefaultMetricsSystem.initialize("JobHistoryServer");
+     JvmMetrics jm = JvmMetrics.initSingleton("JobHistoryServer", null);
+-    pauseMonitor = new JvmPauseMonitor(getConfig());
++    pauseMonitor = new JvmPauseMonitor();
++    addService(pauseMonitor);
+     jm.setPauseMonitor(pauseMonitor);
+ 
+     super.serviceInit(config);
+@@ -200,16 +201,12 @@ public static InetSocketAddress getBindAddress(Configuration conf) {
+ 
+   @Override
+   protected void serviceStart() throws Exception {
+-    pauseMonitor.start();
+     super.serviceStart();
+   }
+   
+   @Override
+   protected void serviceStop() throws Exception {
+     DefaultMetricsSystem.shutdown();
+-    if (pauseMonitor != null) {
+-      pauseMonitor.stop();
+-    }
+     super.serviceStop();
+   }
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestJobHistoryServer.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestJobHistoryServer.java
+index a0b370b..cc69e8d 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestJobHistoryServer.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestJobHistoryServer.java
+@@ -72,7 +72,6 @@ public void testStartStopServer() throws Exception {
+     Configuration config = new Configuration();
+     historyServer.init(config);
+     assertEquals(STATE.INITED, historyServer.getServiceState());
+-    assertEquals(7, historyServer.getServices().size());
+     HistoryClientService historyService = historyServer.getClientService();
+     assertNotNull(historyServer.getClientService());
+     assertEquals(STATE.INITED, historyService.getServiceState());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/main/java/org/apache/hadoop/yarn/server/applicationhistoryservice/ApplicationHistoryServer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/main/java/org/apache/hadoop/yarn/server/applicationhistoryservice/ApplicationHistoryServer.java
+index 0f8b464..3d42a5f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/main/java/org/apache/hadoop/yarn/server/applicationhistoryservice/ApplicationHistoryServer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/main/java/org/apache/hadoop/yarn/server/applicationhistoryservice/ApplicationHistoryServer.java
+@@ -98,7 +98,8 @@ protected void serviceInit(Configuration conf) throws Exception {
+ 
+     DefaultMetricsSystem.initialize("ApplicationHistoryServer");
+     JvmMetrics jm = JvmMetrics.initSingleton("ApplicationHistoryServer", null);
+-    pauseMonitor = new JvmPauseMonitor(conf);
++    pauseMonitor = new JvmPauseMonitor();
++    addService(pauseMonitor);
+     jm.setPauseMonitor(pauseMonitor);
+     super.serviceInit(conf);
+   }
+@@ -111,9 +112,6 @@ protected void serviceStart() throws Exception {
+       throw new YarnRuntimeException("Failed to login", ie);
+     }
+ 
+-    if (pauseMonitor != null) {
+-      pauseMonitor.start();
+-    }
+     super.serviceStart();
+     startWebApp();
+   }
+@@ -123,9 +121,6 @@ protected void serviceStop() throws Exception {
+     if (webApp != null) {
+       webApp.stop();
+     }
+-    if (pauseMonitor != null) {
+-      pauseMonitor.stop();
+-    }
+     DefaultMetricsSystem.shutdown();
+     super.serviceStop();
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/test/java/org/apache/hadoop/yarn/server/applicationhistoryservice/TestApplicationHistoryServer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/test/java/org/apache/hadoop/yarn/server/applicationhistoryservice/TestApplicationHistoryServer.java
+index 7a4062d..7e0616a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/test/java/org/apache/hadoop/yarn/server/applicationhistoryservice/TestApplicationHistoryServer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-applicationhistoryservice/src/test/java/org/apache/hadoop/yarn/server/applicationhistoryservice/TestApplicationHistoryServer.java
+@@ -51,7 +51,6 @@ public void testStartStopServer() throws Exception {
+     try {
+       historyServer.init(config);
+       assertEquals(STATE.INITED, historyServer.getServiceState());
+-      assertEquals(5, historyServer.getServices().size());
+       ApplicationHistoryClientService historyService =
+           historyServer.getClientService();
+       assertNotNull(historyServer.getClientService());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+index 145f918..51e619e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+@@ -248,7 +248,8 @@ protected void serviceInit(Configuration conf) throws Exception {
+     dispatcher.register(NodeManagerEventType.class, this);
+     addService(dispatcher);
+ 
+-    pauseMonitor = new JvmPauseMonitor(conf);
++    pauseMonitor = new JvmPauseMonitor();
++    addService(pauseMonitor);
+     metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
+ 
+     DefaultMetricsSystem.initialize("NodeManager");
+@@ -268,7 +269,6 @@ protected void serviceStart() throws Exception {
+     } catch (IOException e) {
+       throw new YarnRuntimeException("Failed NodeManager login", e);
+     }
+-    pauseMonitor.start();
+     super.serviceStart();
+   }
+ 
+@@ -280,9 +280,6 @@ protected void serviceStop() throws Exception {
+     try {
+       super.serviceStop();
+       DefaultMetricsSystem.shutdown();
+-      if (pauseMonitor != null) {
+-        pauseMonitor.stop();
+-      }
+     } finally {
+       // YARN-3641: NM's services stop get failed shouldn't block the
+       // release of NMLevelDBStore.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+index e3f3c59..a9616e1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+@@ -524,7 +524,8 @@ protected void serviceInit(Configuration configuration) throws Exception {
+ 
+       DefaultMetricsSystem.initialize("ResourceManager");
+       JvmMetrics jm = JvmMetrics.initSingleton("ResourceManager", null);
+-      pauseMonitor = new JvmPauseMonitor(conf);
++      pauseMonitor = new JvmPauseMonitor();
++      addService(pauseMonitor);
+       jm.setPauseMonitor(pauseMonitor);
+ 
+       // Initialize the Reservation system
+@@ -580,8 +581,6 @@ protected void serviceStart() throws Exception {
+       // need events to move to further states.
+       rmStore.start();
+ 
+-      pauseMonitor.start();
+-
+       if(recoveryEnabled) {
+         try {
+           rmStore.checkVersion();
+@@ -604,11 +603,9 @@ protected void serviceStart() throws Exception {
+     @Override
+     protected void serviceStop() throws Exception {
+ 
+-      DefaultMetricsSystem.shutdown();
+-      if (pauseMonitor != null) {
+-        pauseMonitor.stop();
+-      }
++      super.serviceStop();
+ 
++      DefaultMetricsSystem.shutdown();
+       if (rmContext != null) {
+         RMStateStore store = rmContext.getStateStore();
+         try {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServer.java
+index 698a5cc..e3d3b53 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServer.java
+@@ -69,7 +69,8 @@ protected void serviceInit(Configuration conf) throws Exception {
+ 
+     DefaultMetricsSystem.initialize("WebAppProxyServer");
+     JvmMetrics jm = JvmMetrics.initSingleton("WebAppProxyServer", null);
+-    pauseMonitor = new JvmPauseMonitor(conf);
++    pauseMonitor = new JvmPauseMonitor();
++    addService(pauseMonitor);
+     jm.setPauseMonitor(pauseMonitor);
+ 
+     super.serviceInit(config);
+@@ -77,9 +78,6 @@ protected void serviceInit(Configuration conf) throws Exception {
+ 
+   @Override
+   protected void serviceStart() throws Exception {
+-    if (pauseMonitor != null) {
+-      pauseMonitor.start();
+-    }
+     super.serviceStart();
+   }
+ 
+@@ -87,9 +85,6 @@ protected void serviceStart() throws Exception {
+   protected void serviceStop() throws Exception {
+     super.serviceStop();
+     DefaultMetricsSystem.shutdown();
+-    if (pauseMonitor != null) {
+-      pauseMonitor.stop();
+-    }
+   }
+ 
+   /**
+-- 
+1.7.9.5
+

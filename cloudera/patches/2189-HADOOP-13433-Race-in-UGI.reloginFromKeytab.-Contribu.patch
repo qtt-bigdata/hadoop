@@ -1,0 +1,170 @@
+From ed64b584c82d936d334dbb58b078bfcc84c2031b Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Wed, 25 Jan 2017 21:26:01 +0000
+Subject: [PATCH 2189/2848] HADOOP-13433 Race in UGI.reloginFromKeytab.
+ Contributed by Duo Zhang.
+
+(cherry picked from commit bb46d405581dc3a20bd7c57b494c5f45c7b62078)
+
+Change-Id: Ie61c420ffbc3b8d5cd9db409081c857af87bbf17
+---
+ .../hadoop/security/UserGroupInformation.java      |   64 +++++++++++++++-----
+ 1 file changed, 49 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+index e218c26..2f1ff34 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+@@ -23,6 +23,8 @@
+ import static org.apache.hadoop.security.UGIExceptionMessages.*;
+ import static org.apache.hadoop.util.PlatformName.IBM_JAVA;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ import java.io.File;
+ import java.io.IOException;
+ import java.lang.reflect.UndeclaredThrowableException;
+@@ -43,6 +45,7 @@
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ 
++import javax.security.auth.DestroyFailedException;
+ import javax.security.auth.Subject;
+ import javax.security.auth.callback.CallbackHandler;
+ import javax.security.auth.kerberos.KerberosPrincipal;
+@@ -75,8 +78,6 @@
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+-
+-import com.google.common.annotations.VisibleForTesting;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -1122,10 +1123,40 @@ public synchronized void checkTGTAndReloginFromKeytab() throws IOException {
+     reloginFromKeytab();
+   }
+ 
++  // if the first kerberos ticket is not TGT, then remove and destroy it since
++  // the kerberos library of jdk always use the first kerberos ticket as TGT.
++  // See HADOOP-13433 for more details.
++  private void fixKerberosTicketOrder() {
++    Set<Object> creds = getSubject().getPrivateCredentials();
++    synchronized (creds) {
++      for (Iterator<Object> iter = creds.iterator(); iter.hasNext();) {
++        Object cred = iter.next();
++        if (cred instanceof KerberosTicket) {
++          KerberosTicket ticket = (KerberosTicket) cred;
++          if (!ticket.getServer().getName().startsWith("krbtgt")) {
++            LOG.warn(
++                "The first kerberos ticket is not TGT"
++                    + "(the server principal is {}), remove and destroy it.",
++                ticket.getServer());
++            iter.remove();
++            try {
++              ticket.destroy();
++            } catch (DestroyFailedException e) {
++              LOG.warn("destroy ticket failed", e);
++            }
++          } else {
++            return;
++          }
++        }
++      }
++    }
++    LOG.warn("Warning, no kerberos ticket found while attempting to renew ticket");
++  }
++
+   /**
+    * Re-Login a user in from a keytab file. Loads a user identity from a keytab
+    * file and logs them in. They become the currently logged-in user. This
+-   * method assumes that {@link #loginUserFromKeytab(String, String)} had 
++   * method assumes that {@link #loginUserFromKeytab(String, String)} had
+    * happened already.
+    * The Subject field of this UserGroupInformation object is updated to have
+    * the new credentials.
+@@ -1135,11 +1166,12 @@ public synchronized void checkTGTAndReloginFromKeytab() throws IOException {
+   @InterfaceAudience.Public
+   @InterfaceStability.Evolving
+   public synchronized void reloginFromKeytab() throws IOException {
+-    if (!isSecurityEnabled() ||
+-         user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS ||
+-         !isKeytab)
++    if (!isSecurityEnabled()
++        || user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS
++        || !isKeytab) {
+       return;
+-    
++    }
++
+     long now = Time.now();
+     if (!shouldRenewImmediatelyForTests && !hasSufficientTimeElapsed(now)) {
+       return;
+@@ -1151,12 +1183,12 @@ public synchronized void reloginFromKeytab() throws IOException {
+         now < getRefreshTime(tgt)) {
+       return;
+     }
+-    
++
+     LoginContext login = getLogin();
+     if (login == null || keytabFile == null) {
+       throw new KerberosAuthException(MUST_FIRST_LOGIN_FROM_KEYTAB);
+     }
+-    
++
+     long start = 0;
+     // register most recent relogin attempt
+     user.setLastLogin(now);
+@@ -1179,6 +1211,7 @@ public synchronized void reloginFromKeytab() throws IOException {
+         }
+         start = Time.now();
+         login.login();
++        fixKerberosTicketOrder();
+         metrics.loginSuccess.add(Time.now() - start);
+         setLogin(login);
+       }
+@@ -1190,7 +1223,7 @@ public synchronized void reloginFromKeytab() throws IOException {
+       kae.setPrincipal(keytabPrincipal);
+       kae.setKeytabFile(keytabFile);
+       throw kae;
+-    } 
++    }
+   }
+ 
+   /**
+@@ -1204,10 +1237,11 @@ public synchronized void reloginFromKeytab() throws IOException {
+   @InterfaceAudience.Public
+   @InterfaceStability.Evolving
+   public synchronized void reloginFromTicketCache() throws IOException {
+-    if (!isSecurityEnabled() || 
+-        user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS ||
+-        !isKrbTkt)
++    if (!isSecurityEnabled()
++        || user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS
++        || !isKrbTkt) {
+       return;
++    }
+     LoginContext login = getLogin();
+     if (login == null) {
+       throw new KerberosAuthException(MUST_FIRST_LOGIN);
+@@ -1235,15 +1269,15 @@ public synchronized void reloginFromTicketCache() throws IOException {
+         LOG.debug("Initiating re-login for " + getUserName());
+       }
+       login.login();
++      fixKerberosTicketOrder();
+       setLogin(login);
+     } catch (LoginException le) {
+       KerberosAuthException kae = new KerberosAuthException(LOGIN_FAILURE, le);
+       kae.setUser(getUserName());
+       throw kae;
+-    } 
++    }
+   }
+ 
+-
+   /**
+    * Log a user in from a keytab file. Loads a user identity from a keytab
+    * file and login them in. This new user does not affect the currently
+-- 
+1.7.9.5
+

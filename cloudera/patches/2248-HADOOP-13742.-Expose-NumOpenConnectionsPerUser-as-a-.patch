@@ -1,0 +1,233 @@
+From 5a2c7fe2c5d1506a0656d6b43c846df9c8b00759 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Thu, 17 Nov 2016 12:20:01 -0600
+Subject: [PATCH 2248/2848] HADOOP-13742. Expose NumOpenConnectionsPerUser as
+ a metric. Brahma Reddy Battula.
+
+(cherry picked from commit bd3735554fa5c3bc064c57ec78f4308430b14b48)
+(cherry picked from commit 0fb1306f9329be7bc793a342daaaa08b2fe16f4a)
+(cherry picked from commit ba10a055e4c48ba10cd3e04136560d80f8020edc)
+
+ Conflicts:
+	hadoop-common-project/hadoop-common/CHANGES.txt
+
+Change-Id: I8fd254dd04578367d9b5a54163c4de63450ec066
+---
+ .../main/java/org/apache/hadoop/ipc/Server.java    |   61 +++++++++++++++++++-
+ .../org/apache/hadoop/ipc/metrics/RpcMetrics.java  |    5 ++
+ .../test/java/org/apache/hadoop/ipc/TestRPC.java   |   26 +++++++++
+ .../org/apache/hadoop/test/MetricsAsserts.java     |    7 +++
+ 4 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+index 6143575..8d6e9942 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+@@ -125,6 +125,7 @@
+ import com.google.protobuf.CodedOutputStream;
+ import com.google.protobuf.Message;
+ import com.google.protobuf.Message.Builder;
++import org.codehaus.jackson.map.ObjectMapper;
+ 
+ /** An abstract IPC service.  IPC calls take a single {@link Writable} as a
+  * parameter, and return a {@link Writable} as their value.  A service runs on
+@@ -1833,6 +1834,9 @@ private void processConnectionContext(DataInputStream dis)
+       authorizeConnection();
+       // don't set until after authz because connection isn't established
+       connectionContextRead = true;
++      if (user != null) {
++        connectionManager.incrUserConnections(user.getShortUserName());
++      }
+     }
+     
+     /**
+@@ -2696,7 +2700,20 @@ public int getPort() {
+   public int getNumOpenConnections() {
+     return connectionManager.size();
+   }
+-  
++
++  /**
++   * Get the NumOpenConnections/User.
++   */
++  public String getNumOpenConnectionsPerUser() {
++    ObjectMapper mapper = new ObjectMapper();
++    try {
++      return mapper
++          .writeValueAsString(connectionManager.getUserToConnectionsMap());
++    } catch (IOException ignored) {
++    }
++    return null;
++  }
++
+   /**
+    * The number of rpc calls in the queue.
+    * @return The number of rpc calls in the queue.
+@@ -2808,6 +2825,9 @@ private static int channelIO(ReadableByteChannel readCh,
+   private class ConnectionManager {
+     final private AtomicInteger count = new AtomicInteger();    
+     final private Set<Connection> connections;
++    /* Map to maintain the statistics per User */
++    final private Map<String, Integer> userToConnectionsMap;
++    final private Object userToConnectionsMapLock = new Object();
+ 
+     final private Timer idleScanTimer;
+     final private int idleScanThreshold;
+@@ -2835,6 +2855,7 @@ private static int channelIO(ReadableByteChannel readCh,
+       this.connections = Collections.newSetFromMap(
+           new ConcurrentHashMap<Connection,Boolean>(
+               maxQueueSize, 0.75f, readThreads+2));
++      this.userToConnectionsMap = new ConcurrentHashMap<>();
+     }
+ 
+     private boolean add(Connection connection) {
+@@ -2852,7 +2873,39 @@ private boolean remove(Connection connection) {
+       }
+       return removed;
+     }
+-    
++
++    void incrUserConnections(String user) {
++      synchronized (userToConnectionsMapLock) {
++        Integer count = userToConnectionsMap.get(user);
++        if (count == null) {
++          count = 1;
++        } else {
++          count++;
++        }
++        userToConnectionsMap.put(user, count);
++      }
++    }
++
++    void decrUserConnections(String user) {
++      synchronized (userToConnectionsMapLock) {
++        Integer count = userToConnectionsMap.get(user);
++        if (count == null) {
++          return;
++        } else {
++          count--;
++        }
++        if (count == 0) {
++          userToConnectionsMap.remove(user);
++        } else {
++          userToConnectionsMap.put(user, count);
++        }
++      }
++    }
++
++    Map<String, Integer> getUserToConnectionsMap() {
++      return userToConnectionsMap;
++    }
++
+     int size() {
+       return count.get();
+     }
+@@ -2883,6 +2936,10 @@ boolean close(Connection connection) {
+         // only close if actually removed to avoid double-closing due
+         // to possible races
+         connection.close();
++        // Remove authorized users only
++        if (connection.user != null && connection.connectionContextRead) {
++          decrUserConnections(connection.user.getShortUserName());
++        }
+       }
+       return exists;
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/metrics/RpcMetrics.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/metrics/RpcMetrics.java
+index 07968e8..2a0e127 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/metrics/RpcMetrics.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/metrics/RpcMetrics.java
+@@ -104,6 +104,11 @@ public static RpcMetrics create(Server server, Configuration conf) {
+     return server.getNumOpenConnections();
+   }
+ 
++  @Metric("Number of open connections per user")
++  public String numOpenConnectionsPerUser() {
++    return server.getNumOpenConnectionsPerUser();
++  }
++
+   @Metric("Length of the call queue") public int callQueueLength() {
+     return server.getCallQueueLen();
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+index 0ba0f54..158cd58 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+@@ -43,6 +43,7 @@
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.net.SocketTimeoutException;
++import java.security.PrivilegedAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+@@ -999,12 +1000,28 @@ public void testRpcMetrics() throws Exception {
+         .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
+         .build();
+     server.start();
++    String testUser = "testUser";
++    UserGroupInformation anotherUser =
++        UserGroupInformation.createRemoteUser(testUser);
++    TestProtocol proxy2 =
++        anotherUser.doAs(new PrivilegedAction<TestProtocol>() {
++          public TestProtocol run() {
++            try {
++              return RPC.getProxy(TestProtocol.class, 0,
++                  server.getListenerAddress(), conf);
++            } catch (IOException e) {
++              e.printStackTrace();
++            }
++            return null;
++          }
++        });
+     final TestProtocol proxy = RPC.getProxy(TestProtocol.class,
+         TestProtocol.versionID, server.getListenerAddress(), configuration);
+     try {
+       for (int i=0; i<1000; i++) {
+         proxy.ping();
+         proxy.echo("" + i);
++        proxy2.echo("" + i);
+       }
+       MetricsRecordBuilder rpcMetrics =
+           getMetrics(server.getRpcMetrics().name());
+@@ -1016,10 +1033,19 @@ public void testRpcMetrics() throws Exception {
+           rpcMetrics);
+       MetricsAsserts.assertQuantileGauges("RpcProcessingTime" + interval + "s",
+           rpcMetrics);
++      String actualUserVsCon = MetricsAsserts
++          .getStringMetric("NumOpenConnectionsPerUser", rpcMetrics);
++      String proxyUser =
++          UserGroupInformation.getCurrentUser().getShortUserName();
++      assertTrue(actualUserVsCon.contains("\"" + proxyUser + "\":1"));
++      assertTrue(actualUserVsCon.contains("\"" + testUser + "\":1"));
+     } finally {
+       if (proxy != null) {
+         RPC.stopProxy(proxy);
+       }
++      if (proxy2 != null) {
++        RPC.stopProxy(proxy2);
++      }
+       server.stop();
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MetricsAsserts.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MetricsAsserts.java
+index 982481e..5d87b07 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MetricsAsserts.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MetricsAsserts.java
+@@ -236,6 +236,13 @@ public static long getLongCounter(String name, MetricsRecordBuilder rb) {
+     return captor.getValue();
+   }
+ 
++  public static String getStringMetric(String name, MetricsRecordBuilder rb) {
++    ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
++    verify(rb, atLeast(0)).tag(eqName(info(name, "")), captor.capture());
++    checkCaptured(captor, name);
++    return captor.getValue();
++  }
++
+    /**
+    * Assert a float gauge metric as expected
+    * @param name  of the metric
+-- 
+1.7.9.5
+

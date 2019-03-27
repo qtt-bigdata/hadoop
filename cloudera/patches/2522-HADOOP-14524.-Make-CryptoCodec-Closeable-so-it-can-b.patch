@@ -1,0 +1,324 @@
+From 28c99ebc82e01aa5904536c73f883e42f412b559 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Fri, 16 Jun 2017 09:37:38 -0700
+Subject: [PATCH 2522/2848] HADOOP-14524. Make CryptoCodec Closeable so it can
+ be cleaned up proactively.
+
+(cherry picked from commit 2afe9722af2fa4c8e870b0dbf1328e31d1f0fec7)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/sasl/DataTransferSaslUtil.java
+
+Change-Id: I9ff6f34573fe86f2df660814fbf19286856db7df
+---
+ .../apache/hadoop/crypto/AesCtrCryptoCodec.java    |    6 ++
+ .../java/org/apache/hadoop/crypto/CryptoCodec.java |    3 +-
+ .../apache/hadoop/crypto/CryptoInputStream.java    |    1 +
+ .../apache/hadoop/crypto/CryptoOutputStream.java   |    1 +
+ .../hadoop/crypto/OpensslAesCtrCryptoCodec.java    |   13 +++-
+ .../crypto/key/KeyProviderCryptoExtension.java     |   76 +++++++++++---------
+ ...tCryptoStreamsWithOpensslAesCtrCryptoCodec.java |   32 ++++++++-
+ .../datatransfer/sasl/DataTransferSaslUtil.java    |    1 +
+ .../org/apache/hadoop/mapreduce/CryptoUtils.java   |   14 +++-
+ 9 files changed, 106 insertions(+), 41 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/AesCtrCryptoCodec.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/AesCtrCryptoCodec.java
+index 5e286b9..3e52560 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/AesCtrCryptoCodec.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/AesCtrCryptoCodec.java
+@@ -22,6 +22,8 @@
+ 
+ import com.google.common.base.Preconditions;
+ 
++import java.io.IOException;
++
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+ public abstract class AesCtrCryptoCodec extends CryptoCodec {
+@@ -61,4 +63,8 @@ public void calculateIV(byte[] initIV, long counter, byte[] IV) {
+       IV[i] = (byte) sum;
+     }
+   }
++
++  @Override
++  public void close() throws IOException {
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoCodec.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoCodec.java
+index 493e23d..d9c16bb 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoCodec.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoCodec.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.crypto;
+ 
++import java.io.Closeable;
+ import java.security.GeneralSecurityException;
+ import java.util.List;
+ 
+@@ -42,7 +43,7 @@
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-public abstract class CryptoCodec implements Configurable {
++public abstract class CryptoCodec implements Configurable, Closeable {
+   public static Logger LOG = LoggerFactory.getLogger(CryptoCodec.class);
+   
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoInputStream.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoInputStream.java
+index b7ded92..0be6e34 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoInputStream.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoInputStream.java
+@@ -315,6 +315,7 @@ public void close() throws IOException {
+     
+     super.close();
+     freeBuffers();
++    codec.close();
+     closed = true;
+   }
+   
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoOutputStream.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoOutputStream.java
+index ab51bfe..f32679e 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoOutputStream.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/CryptoOutputStream.java
+@@ -239,6 +239,7 @@ public synchronized void close() throws IOException {
+       flush();
+       if (closeOutputStream) {
+         super.close();
++        codec.close();
+       }
+       freeBuffers();
+     } finally {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/OpensslAesCtrCryptoCodec.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/OpensslAesCtrCryptoCodec.java
+index d0a12e9..d08e588 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/OpensslAesCtrCryptoCodec.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/OpensslAesCtrCryptoCodec.java
+@@ -19,6 +19,7 @@
+ 
+ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_SECURE_RANDOM_IMPL_KEY;
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.security.GeneralSecurityException;
+@@ -89,7 +90,17 @@ public Decryptor createDecryptor() throws GeneralSecurityException {
+   public void generateSecureRandom(byte[] bytes) {
+     random.nextBytes(bytes);
+   }
+-  
++
++  @Override
++  public void close() throws IOException {
++    try {
++      Closeable r = (Closeable) this.random;
++      r.close();
++    } catch (ClassCastException e) {
++    }
++    super.close();
++  }
++
+   private static class OpensslAesCtrCipher implements Encryptor, Decryptor {
+     private final OpensslCipher cipher;
+     private final int mode;
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
+index 680a367..992ba42 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
+@@ -254,26 +254,30 @@ public EncryptedKeyVersion generateEncryptedKey(String encryptionKeyName)
+       // Generate random bytes for new key and IV
+ 
+       CryptoCodec cc = CryptoCodec.getInstance(keyProvider.getConf());
+-      final byte[] newKey = new byte[encryptionKey.getMaterial().length];
+-      cc.generateSecureRandom(newKey);
+-      final byte[] iv = new byte[cc.getCipherSuite().getAlgorithmBlockSize()];
+-      cc.generateSecureRandom(iv);
+-      // Encryption key IV is derived from new key's IV
+-      final byte[] encryptionIV = EncryptedKeyVersion.deriveIV(iv);
+-      Encryptor encryptor = cc.createEncryptor();
+-      encryptor.init(encryptionKey.getMaterial(), encryptionIV);
+-      int keyLen = newKey.length;
+-      ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
+-      ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
+-      bbIn.put(newKey);
+-      bbIn.flip();
+-      encryptor.encrypt(bbIn, bbOut);
+-      bbOut.flip();
+-      byte[] encryptedKey = new byte[keyLen];
+-      bbOut.get(encryptedKey);    
+-      return new EncryptedKeyVersion(encryptionKeyName,
+-          encryptionKey.getVersionName(), iv,
+-          new KeyVersion(encryptionKey.getName(), EEK, encryptedKey));
++      try {
++        final byte[] newKey = new byte[encryptionKey.getMaterial().length];
++        cc.generateSecureRandom(newKey);
++        final byte[] iv = new byte[cc.getCipherSuite().getAlgorithmBlockSize()];
++        cc.generateSecureRandom(iv);
++        // Encryption key IV is derived from new key's IV
++        final byte[] encryptionIV = EncryptedKeyVersion.deriveIV(iv);
++        Encryptor encryptor = cc.createEncryptor();
++        encryptor.init(encryptionKey.getMaterial(), encryptionIV);
++        int keyLen = newKey.length;
++        ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
++        ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
++        bbIn.put(newKey);
++        bbIn.flip();
++        encryptor.encrypt(bbIn, bbOut);
++        bbOut.flip();
++        byte[] encryptedKey = new byte[keyLen];
++        bbOut.get(encryptedKey);
++        return new EncryptedKeyVersion(encryptionKeyName,
++            encryptionKey.getVersionName(), iv,
++            new KeyVersion(encryptionKey.getName(), EEK, encryptedKey));
++      } finally {
++        cc.close();
++      }
+     }
+ 
+     @Override
+@@ -300,20 +304,24 @@ public KeyVersion decryptEncryptedKey(
+           EncryptedKeyVersion.deriveIV(encryptedKeyVersion.getEncryptedKeyIv());
+ 
+       CryptoCodec cc = CryptoCodec.getInstance(keyProvider.getConf());
+-      Decryptor decryptor = cc.createDecryptor();
+-      decryptor.init(encryptionKey.getMaterial(), encryptionIV);
+-      final KeyVersion encryptedKV =
+-          encryptedKeyVersion.getEncryptedKeyVersion();
+-      int keyLen = encryptedKV.getMaterial().length;
+-      ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
+-      ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
+-      bbIn.put(encryptedKV.getMaterial());
+-      bbIn.flip();
+-      decryptor.decrypt(bbIn, bbOut);
+-      bbOut.flip();
+-      byte[] decryptedKey = new byte[keyLen];
+-      bbOut.get(decryptedKey);
+-      return new KeyVersion(encryptionKey.getName(), EK, decryptedKey);
++      try {
++        Decryptor decryptor = cc.createDecryptor();
++        decryptor.init(encryptionKey.getMaterial(), encryptionIV);
++        final KeyVersion encryptedKV =
++            encryptedKeyVersion.getEncryptedKeyVersion();
++        int keyLen = encryptedKV.getMaterial().length;
++        ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
++        ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
++        bbIn.put(encryptedKV.getMaterial());
++        bbIn.flip();
++        decryptor.decrypt(bbIn, bbOut);
++        bbOut.flip();
++        byte[] decryptedKey = new byte[keyLen];
++        bbOut.get(decryptedKey);
++        return new KeyVersion(encryptionKey.getName(), EK, decryptedKey);
++      } finally {
++        cc.close();
++      }
+     }
+ 
+     @Override
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/TestCryptoStreamsWithOpensslAesCtrCryptoCodec.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/TestCryptoStreamsWithOpensslAesCtrCryptoCodec.java
+index cc02f48..241e876 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/TestCryptoStreamsWithOpensslAesCtrCryptoCodec.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/TestCryptoStreamsWithOpensslAesCtrCryptoCodec.java
+@@ -18,12 +18,17 @@
+ package org.apache.hadoop.crypto;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.crypto.random.OsSecureRandom;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.junit.BeforeClass;
++import org.junit.Test;
++import org.mockito.internal.util.reflection.Whitebox;
+ 
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_CRYPTO_CODEC_CLASSES_AES_CTR_NOPADDING_KEY;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
+ 
+ public class TestCryptoStreamsWithOpensslAesCtrCryptoCodec 
+     extends TestCryptoStreams {
+@@ -32,8 +37,7 @@
+   public static void init() throws Exception {
+     GenericTestUtils.assumeInNativeProfile();
+     Configuration conf = new Configuration();
+-    conf.set(
+-        CommonConfigurationKeysPublic.HADOOP_SECURITY_CRYPTO_CODEC_CLASSES_AES_CTR_NOPADDING_KEY,
++    conf.set(HADOOP_SECURITY_CRYPTO_CODEC_CLASSES_AES_CTR_NOPADDING_KEY,
+         OpensslAesCtrCryptoCodec.class.getName());
+     codec = CryptoCodec.getInstance(conf);
+     assertNotNull("Unable to instantiate codec " +
+@@ -42,4 +46,28 @@ public static void init() throws Exception {
+     assertEquals(OpensslAesCtrCryptoCodec.class.getCanonicalName(),
+         codec.getClass().getCanonicalName());
+   }
++
++  @Test
++  public void testCodecClosesRandom() throws Exception {
++    GenericTestUtils.assumeInNativeProfile();
++    Configuration conf = new Configuration();
++    conf.set(HADOOP_SECURITY_CRYPTO_CODEC_CLASSES_AES_CTR_NOPADDING_KEY,
++        OpensslAesCtrCryptoCodec.class.getName());
++    conf.set(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_SECURE_RANDOM_IMPL_KEY,
++        OsSecureRandom.class.getName());
++    CryptoCodec codecWithRandom = CryptoCodec.getInstance(conf);
++    assertNotNull(
++        "Unable to instantiate codec " + OpensslAesCtrCryptoCodec.class
++            .getName() + ", is the required " + "version of OpenSSL installed?",
++        codecWithRandom);
++    OsSecureRandom random =
++        (OsSecureRandom) Whitebox.getInternalState(codecWithRandom, "random");
++    // trigger the OsSecureRandom to create an internal FileInputStream
++    random.nextBytes(new byte[10]);
++    assertNotNull(Whitebox.getInternalState(random, "stream"));
++    // verify closing the codec closes the codec's random's stream.
++    codecWithRandom.close();
++    assertNull(Whitebox.getInternalState(random, "stream"));
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/sasl/DataTransferSaslUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/sasl/DataTransferSaslUtil.java
+index 398d44c..6411464 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/sasl/DataTransferSaslUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/sasl/DataTransferSaslUtil.java
+@@ -283,6 +283,7 @@ public static CipherOption negotiateCipherOption(Configuration conf,
+           codec.generateSecureRandom(inIv);
+           codec.generateSecureRandom(outKey);
+           codec.generateSecureRandom(outIv);
++          codec.close();
+           return new CipherOption(suite, inKey, inIv, outKey, outIv);
+         }
+       }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/CryptoUtils.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/CryptoUtils.java
+index db97139..c2d1644 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/CryptoUtils.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/CryptoUtils.java
+@@ -66,16 +66,24 @@ public static boolean isEncryptedSpillEnabled(Configuration conf) {
+     if (isEncryptedSpillEnabled(conf)) {
+       byte[] iv = new byte[cryptoCodec.getCipherSuite().getAlgorithmBlockSize()];
+       cryptoCodec.generateSecureRandom(iv);
++      cryptoCodec.close();
+       return iv;
+     } else {
+       return null;
+     }
+   }
+ 
+-  public static int cryptoPadding(Configuration conf) {
++  public static int cryptoPadding(Configuration conf) throws IOException {
+     // Sizeof(IV) + long(start-offset)
+-    return isEncryptedSpillEnabled(conf) ? CryptoCodec.getInstance(conf)
+-        .getCipherSuite().getAlgorithmBlockSize() + 8 : 0;
++    if (!isEncryptedSpillEnabled(conf)) {
++      return 0;
++    }
++    final CryptoCodec cryptoCodec = CryptoCodec.getInstance(conf);
++    try {
++      return cryptoCodec.getCipherSuite().getAlgorithmBlockSize() + 8;
++    } finally {
++      cryptoCodec.close();
++    }
+   }
+ 
+   private static byte[] getEncryptionKey() throws IOException {
+-- 
+1.7.9.5
+

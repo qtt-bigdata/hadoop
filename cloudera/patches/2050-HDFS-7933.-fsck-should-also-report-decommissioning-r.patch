@@ -1,0 +1,514 @@
+From 1204b72b729e775b8d57bbb159bf961a2199e512 Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Tue, 16 Aug 2016 10:35:52 -0700
+Subject: [PATCH 2050/2848] HDFS-7933. fsck should also report decommissioning
+ replicas. Contributed by Xiaoyu Yao.
+
+(cherry picked from commit 293c763e82586b4f3230771a86734aae593f468d)
+(cherry picked from commit 040a1b7b90d10ffab9d2fe6e68935c045c72baf8)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+
+Change-Id: I3678c13d234fb7fc3fab8e71f07a99c85effed85
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |   39 ++++++----
+ .../blockmanagement/DecommissionManager.java       |    7 +-
+ .../server/blockmanagement/NumberReplicas.java     |   57 ++++++++++++--
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |   40 +++++++---
+ .../hadoop/hdfs/TestClientReportBadBlock.java      |    2 +-
+ .../server/datanode/TestReadOnlySharedStorage.java |    2 +-
+ .../hadoop/hdfs/server/namenode/TestFsck.java      |   80 ++++++++++++++++++++
+ 7 files changed, 188 insertions(+), 39 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 91b21c5..5d8bc90 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -579,7 +579,7 @@ private void dumpBlockMeta(Block block, PrintWriter out) {
+     // not included in the numReplicas.liveReplicas() count
+     assert containingLiveReplicasNodes.size() >= numReplicas.liveReplicas();
+     int usableReplicas = numReplicas.liveReplicas() +
+-                         numReplicas.decommissionedReplicas();
++                         numReplicas.decommissionedAndDecommissioning();
+     
+     if (block instanceof BlockInfo) {
+       BlockCollection bc = ((BlockInfo) block).getBlockCollection();
+@@ -590,7 +590,7 @@ private void dumpBlockMeta(Block block, PrintWriter out) {
+     out.print(block + ((usableReplicas > 0)? "" : " MISSING") + 
+               " (replicas:" +
+               " l: " + numReplicas.liveReplicas() +
+-              " d: " + numReplicas.decommissionedReplicas() +
++              " d: " + numReplicas.decommissionedAndDecommissioning() +
+               " c: " + numReplicas.corruptReplicas() +
+               " e: " + numReplicas.excessReplicas() + ") "); 
+ 
+@@ -769,7 +769,7 @@ public LocatedBlock convertLastBlockToUnderConstruction(
+     // Remove block from replication queue.
+     NumberReplicas replicas = countNodes(ucBlock);
+     neededReplications.remove(ucBlock, replicas.liveReplicas(),
+-        replicas.decommissionedReplicas(), getReplication(ucBlock));
++        replicas.decommissionedAndDecommissioning(), getReplication(ucBlock));
+     pendingReplications.remove(ucBlock);
+ 
+     // remove this block from the list of pending blocks to be deleted. 
+@@ -1688,6 +1688,7 @@ DatanodeDescriptor chooseSourceDatanode(Block block,
+     DatanodeDescriptor srcNode = null;
+     int live = 0;
+     int decommissioned = 0;
++    int decommissioning = 0;
+     int corrupt = 0;
+     int excess = 0;
+     
+@@ -1699,9 +1700,11 @@ DatanodeDescriptor chooseSourceDatanode(Block block,
+       int countableReplica = storage.getState() == State.NORMAL ? 1 : 0; 
+       if ((nodesCorrupt != null) && (nodesCorrupt.contains(node)))
+         corrupt += countableReplica;
+-      else if (node.isDecommissionInProgress() || node.isDecommissioned())
++      else if (node.isDecommissionInProgress()) {
++        decommissioning += countableReplica;
++      } else if (node.isDecommissioned()) {
+         decommissioned += countableReplica;
+-      else if (excessBlocks != null && excessBlocks.contains(block)) {
++      } else if (excessBlocks != null && excessBlocks.contains(block)) {
+         excess += countableReplica;
+       } else {
+         nodesContainingLiveReplicas.add(storage);
+@@ -1741,7 +1744,8 @@ else if (excessBlocks != null && excessBlocks.contains(block)) {
+         srcNode = node;
+     }
+     if(numReplicas != null)
+-      numReplicas.initialize(live, decommissioned, corrupt, excess, 0);
++      numReplicas.initialize(live, decommissioned, decommissioning, corrupt,
++          excess, 0);
+     return srcNode;
+   }
+ 
+@@ -1766,7 +1770,7 @@ private void processPendingReplications() {
+           NumberReplicas num = countNodes(timedOutItems[i]);
+           if (isNeededReplication(bi, getReplication(bi), num.liveReplicas())) {
+             neededReplications.add(bi, num.liveReplicas(),
+-                num.decommissionedReplicas(), getReplication(bi));
++                num.decommissionedAndDecommissioning(), getReplication(bi));
+           }
+         }
+       } finally {
+@@ -2700,7 +2704,7 @@ private Block addStoredBlock(final BlockInfo block,
+     short fileReplication = bc.getBlockReplication();
+     if (!isNeededReplication(storedBlock, fileReplication, numCurrentReplica)) {
+       neededReplications.remove(storedBlock, numCurrentReplica,
+-          num.decommissionedReplicas(), fileReplication);
++          num.decommissionedAndDecommissioning(), fileReplication);
+     } else {
+       updateNeededReplications(storedBlock, curReplicaDelta, 0);
+     }
+@@ -2933,7 +2937,7 @@ private MisReplicationResult processMisReplicatedBlock(BlockInfo block) {
+     // add to under-replicated queue if need to be
+     if (isNeededReplication(block, expectedReplication, numCurrentReplica)) {
+       if (neededReplications.add(block, numCurrentReplica, num
+-          .decommissionedReplicas(), expectedReplication)) {
++          .decommissionedAndDecommissioning(), expectedReplication)) {
+         return MisReplicationResult.UNDER_REPLICATED;
+       }
+     }
+@@ -3361,6 +3365,7 @@ private void processIncrementalBlockReport(final DatanodeDescriptor node,
+    */
+   public NumberReplicas countNodes(BlockInfo b) {
+     int decommissioned = 0;
++    int decommissioning = 0;
+     int live = 0;
+     int corrupt = 0;
+     int excess = 0;
+@@ -3370,7 +3375,9 @@ public NumberReplicas countNodes(BlockInfo b) {
+       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
+       if ((nodesCorrupt != null) && (nodesCorrupt.contains(node))) {
+         corrupt++;
+-      } else if (node.isDecommissionInProgress() || node.isDecommissioned()) {
++      } else if (node.isDecommissionInProgress()) {
++        decommissioning++;
++      } else if (node.isDecommissioned()) {
+         decommissioned++;
+       } else {
+         LightWeightLinkedSet<Block> blocksExcess = excessReplicateMap.get(node
+@@ -3385,7 +3392,7 @@ public NumberReplicas countNodes(BlockInfo b) {
+         stale++;
+       }
+     }
+-    return new NumberReplicas(live, decommissioned, corrupt, excess, stale);
++    return new NumberReplicas(live, decommissioned, decommissioning, corrupt, excess, stale);
+   }
+ 
+   /** 
+@@ -3522,13 +3529,13 @@ private void updateNeededReplications(final BlockInfo block,
+       int curExpectedReplicas = getReplication(block);
+       if (isNeededReplication(block, curExpectedReplicas, repl.liveReplicas())) {
+         neededReplications.update(block, repl.liveReplicas(), repl
+-            .decommissionedReplicas(), curExpectedReplicas, curReplicasDelta,
+-            expectedReplicasDelta);
++            .decommissionedAndDecommissioning(), curExpectedReplicas,
++            curReplicasDelta, expectedReplicasDelta);
+       } else {
+         int oldReplicas = repl.liveReplicas()-curReplicasDelta;
+         int oldExpectedReplicas = curExpectedReplicas-expectedReplicasDelta;
+-        neededReplications.remove(block, oldReplicas, repl.decommissionedReplicas(),
+-                                  oldExpectedReplicas);
++        neededReplications.remove(block, oldReplicas,
++            repl.decommissionedAndDecommissioning(), oldExpectedReplicas);
+       }
+     } finally {
+       namesystem.writeUnlock();
+@@ -3547,7 +3554,7 @@ public void checkReplication(BlockCollection bc) {
+       final NumberReplicas n = countNodes(block);
+       if (isNeededReplication(block, expected, n.liveReplicas())) { 
+         neededReplications.add(block, n.liveReplicas(),
+-            n.decommissionedReplicas(), expected);
++            n.decommissionedAndDecommissioning(), expected);
+       } else if (n.liveReplicas() > expected) {
+         processOverReplicatedBlock(block, expected, null, null);
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+index b58a29d..f99056c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+@@ -346,7 +346,8 @@ private static void logBlockReplicationInfo(Block block, BlockCollection bc,
+     LOG.info("Block: " + block + ", Expected Replicas: "
+         + curExpectedReplicas + ", live replicas: " + curReplicas
+         + ", corrupt replicas: " + num.corruptReplicas()
+-        + ", decommissioned replicas: " + num.decommissionedReplicas()
++        + ", decommissioned replicas: " + num.decommissioned()
++        + ", decommissioning replicas: " + num.decommissioning()
+         + ", excess replicas: " + num.excessReplicas()
+         + ", Is Open File: " + bc.isUnderConstruction()
+         + ", Datanodes having this block: " + nodeList + ", Current Datanode: "
+@@ -632,7 +633,7 @@ private void processBlocksForDecomInternal(
+             // Process these blocks only when active NN is out of safe mode.
+             blockManager.neededReplications.add(block,
+                 curReplicas,
+-                num.decommissionedReplicas(),
++                num.decommissionedAndDecommissioning(),
+                 bc.getBlockReplication());
+           }
+         }
+@@ -661,7 +662,7 @@ private void processBlocksForDecomInternal(
+         if (bc.isUnderConstruction()) {
+           underReplicatedInOpenFiles++;
+         }
+-        if ((curReplicas == 0) && (num.decommissionedReplicas() > 0)) {
++        if ((curReplicas == 0) && (num.decommissionedAndDecommissioning() > 0)) {
+           decommissionOnlyReplicas++;
+         }
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
+index 9e5c8df..e567bbf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
+@@ -19,26 +19,33 @@
+ 
+ /**
+  * A immutable object that stores the number of live replicas and
+- * the number of decommissined Replicas.
++ * the number of decommissioned Replicas.
+  */
+ public class NumberReplicas {
+   private int liveReplicas;
+-  private int decommissionedReplicas;
++
++  // Tracks only the decommissioning replicas
++  private int decommissioning;
++  // Tracks only the decommissioned replicas
++  private int decommissioned;
+   private int corruptReplicas;
+   private int excessReplicas;
+   private int replicasOnStaleNodes;
+ 
+   NumberReplicas() {
+-    initialize(0, 0, 0, 0, 0);
++    initialize(0, 0, 0, 0, 0, 0);
+   }
+ 
+-  NumberReplicas(int live, int decommissioned, int corrupt, int excess, int stale) {
+-    initialize(live, decommissioned, corrupt, excess, stale);
++  NumberReplicas(int live, int decommissioned, int decommissioning, int corrupt,
++                 int excess, int stale) {
++    initialize(live, decommissioned, decommissioning, corrupt, excess, stale);
+   }
+ 
+-  void initialize(int live, int decommissioned, int corrupt, int excess, int stale) {
++  void initialize(int live, int decommissioned, int decommissioning,
++                  int corrupt, int excess, int stale) {
+     liveReplicas = live;
+-    decommissionedReplicas = decommissioned;
++    this.decommissioning = decommissioning;
++    this.decommissioned = decommissioned;
+     corruptReplicas = corrupt;
+     excessReplicas = excess;
+     replicasOnStaleNodes = stale;
+@@ -47,12 +54,46 @@ void initialize(int live, int decommissioned, int corrupt, int excess, int stale
+   public int liveReplicas() {
+     return liveReplicas;
+   }
++
++  /**
++   *
++   * @return decommissioned replicas + decommissioning replicas
++   * It is deprecated by decommissionedAndDecommissioning
++   * due to its misleading name.
++   */
++  @Deprecated
+   public int decommissionedReplicas() {
+-    return decommissionedReplicas;
++    return decommissionedAndDecommissioning();
++  }
++
++  /**
++   *
++   * @return decommissioned and decommissioning replicas
++   */
++  public int decommissionedAndDecommissioning() {
++    return decommissioned + decommissioning;
++  }
++
++  /**
++   *
++   * @return decommissioned replicas only
++   */
++  public int decommissioned() {
++    return decommissioned;
+   }
++
++  /**
++   *
++   * @return decommissioning replicas only
++   */
++  public int decommissioning() {
++    return decommissioning;
++  }
++
+   public int corruptReplicas() {
+     return corruptReplicas;
+   }
++
+   public int excessReplicas() {
+     return excessReplicas;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 7d1774f..2ed072e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -248,8 +248,10 @@ public void blockIdCK(String blockId) {
+       out.println("No. of live Replica: " + numberReplicas.liveReplicas());
+       out.println("No. of excess Replica: " + numberReplicas.excessReplicas());
+       out.println("No. of stale Replica: " + numberReplicas.replicasOnStaleNodes());
+-      out.println("No. of decommission Replica: "
+-          + numberReplicas.decommissionedReplicas());
++      out.println("No. of decommissioned Replica: "
++          + numberReplicas.decommissioned());
++      out.println("No. of decommissioning Replica: "
++          + numberReplicas.decommissioning());
+       out.println("No. of corrupted Replica: " + numberReplicas.corruptReplicas());
+       //record datanodes that have corrupted block replica
+       Collection<DatanodeDescriptor> corruptionRecord = null;
+@@ -505,10 +507,16 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+               .getBlockManager().countNodes(namenode.getNamesystem()
+                       .getBlockManager().getStoredBlock(block.getLocalBlock()));
+       int liveReplicas = numberReplicas.liveReplicas();
+-      res.totalReplicas += liveReplicas;
++      int decommissionedReplicas = numberReplicas.decommissioned();;
++      int decommissioningReplicas = numberReplicas.decommissioning();
++      res.decommissionedReplicas +=  decommissionedReplicas;
++      res.decommissioningReplicas += decommissioningReplicas;
++      int totalReplicas = liveReplicas + decommissionedReplicas +
++          decommissioningReplicas;
++      res.totalReplicas += totalReplicas;
+       short targetFileReplication = file.getReplication();
+       res.numExpectedReplicas += targetFileReplication;
+-      if(liveReplicas < res.minReplication){
++      if(totalReplicas < res.minReplication){
+         res.numUnderMinReplicatedBlocks++;
+       }
+       if (liveReplicas > targetFileReplication) {
+@@ -522,10 +530,10 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+         out.print("\n" + path + ": CORRUPT blockpool " + block.getBlockPoolId() +
+             " block " + block.getBlockName()+"\n");
+       }
+-      if (liveReplicas >= res.minReplication)
++      if (totalReplicas >= res.minReplication)
+         res.numMinReplicatedBlocks++;
+-      if (liveReplicas < targetFileReplication && liveReplicas > 0) {
+-        res.missingReplicas += (targetFileReplication - liveReplicas);
++      if (totalReplicas < targetFileReplication && totalReplicas > 0) {
++        res.missingReplicas += (targetFileReplication - totalReplicas);
+         res.numUnderReplicatedBlocks += 1;
+         underReplicatedPerFile++;
+         if (!showFiles) {
+@@ -534,7 +542,9 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+         out.println(" Under replicated " + block +
+                     ". Target Replicas is " +
+                     targetFileReplication + " but found " +
+-                    liveReplicas + " replica(s).");
++                    liveReplicas + " live replica(s), " +
++                    decommissionedReplicas + " decommissioned replica(s) and " +
++                    decommissioningReplicas + " decommissioning replica(s).");
+       }
+ 
+       // count mis replicated blocks
+@@ -552,7 +562,7 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+                     block + ". " + blockPlacementStatus.getErrorDescription());
+       }
+       report.append(i + ". " + blkName + " len=" + block.getNumBytes());
+-      if (liveReplicas == 0) {
++      if (totalReplicas == 0) {
+         report.append(" MISSING!");
+         res.addMissing(block.toString(), block.getNumBytes());
+         missing++;
+@@ -857,6 +867,8 @@ private void lostFoundInit(DFSClient dfs) {
+     long corruptBlocks = 0L;
+     long excessiveReplicas = 0L;
+     long missingReplicas = 0L;
++    long decommissionedReplicas = 0L;
++    long decommissioningReplicas = 0L;
+     long numUnderMinReplicatedBlocks=0L;
+     long numOverReplicatedBlocks = 0L;
+     long numUnderReplicatedBlocks = 0L;
+@@ -928,7 +940,7 @@ public String toString() {
+         res.append(" (Total open file blocks (not validated): ").append(
+             totalOpenFilesBlocks).append(")");
+       }
+-      if (corruptFiles > 0 || numUnderMinReplicatedBlocks>0) {
++      if (corruptFiles > 0 || numUnderMinReplicatedBlocks > 0) {
+         res.append("\n  ********************************");
+         if(numUnderMinReplicatedBlocks>0){
+           res.append("\n  UNDER MIN REPL'D BLOCKS:\t").append(numUnderMinReplicatedBlocks);
+@@ -991,6 +1003,14 @@ public String toString() {
+             ((float) (missingReplicas * 100) / (float) numExpectedReplicas)).append(
+             " %)");
+       }
++      if (decommissionedReplicas > 0) {
++        res.append("\n DecommissionedReplicas:\t").append(
++            decommissionedReplicas);
++      }
++      if (decommissioningReplicas > 0) {
++        res.append("\n DecommissioningReplicas:\t").append(
++            decommissioningReplicas);
++      }
+       return res.toString();
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientReportBadBlock.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientReportBadBlock.java
+index 645c13e..d625f4d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientReportBadBlock.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientReportBadBlock.java
+@@ -188,7 +188,7 @@ public void testCorruptTwoOutOfThreeReplicas() throws Exception {
+       verifyFirstBlockCorrupted(filePath, false);
+       int expectedReplicaCount = repl-corruptBlocReplicas;
+       verifyCorruptedBlockCount(filePath, expectedReplicaCount);
+-      verifyFsckHealth("Target Replicas is 3 but found 1 replica");
++      verifyFsckHealth("Target Replicas is 3 but found 1 live replica");
+       testFsckListCorruptFilesBlocks(filePath, 0);
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+index dbc9bc4..90eb7d1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+@@ -195,7 +195,7 @@ private void validateNumberReplicas(int expectedReplicas) throws IOException {
+     assertThat(numberReplicas.liveReplicas(), is(expectedReplicas));
+     assertThat(numberReplicas.excessReplicas(), is(0));
+     assertThat(numberReplicas.corruptReplicas(), is(0));
+-    assertThat(numberReplicas.decommissionedReplicas(), is(0));
++    assertThat(numberReplicas.decommissionedAndDecommissioning(), is(0));
+     assertThat(numberReplicas.replicasOnStaleNodes(), is(0));
+     
+     BlockManagerTestUtil.updateState(blockManager);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index 0204dac..f683818 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -1617,4 +1617,84 @@ public Boolean get() {
+     }
+   }
+ 
++  /**
++   * Test for blocks on decommissioning hosts are not shown as missing
++   */
++  @Test
++  public void testFsckWithDecommissionedReplicas() throws Exception {
++
++    final short REPL_FACTOR = 1;
++    short NUM_DN = 2;
++    final long blockSize = 512;
++    final long fileSize = 1024;
++    boolean checkDecommissionInProgress = false;
++    String [] racks = {"/rack1", "/rack2"};
++    String [] hosts = {"host1", "host2"};
++
++    Configuration conf = new Configuration();
++    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, blockSize);
++    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY, 1);
++
++    MiniDFSCluster cluster;
++    DistributedFileSystem dfs ;
++    cluster =
++        new MiniDFSCluster.Builder(conf).numDataNodes(NUM_DN).hosts(hosts)
++            .racks(racks).build();
++
++    assertNotNull("Failed Cluster Creation", cluster);
++    cluster.waitClusterUp();
++    dfs = cluster.getFileSystem();
++    assertNotNull("Failed to get FileSystem", dfs);
++
++    DFSTestUtil util = new DFSTestUtil.Builder().
++        setName(getClass().getSimpleName()).setNumFiles(1).build();
++
++    //create files
++    final String testFile = new String("/testfile");
++    final Path path = new Path(testFile);
++    util.createFile(dfs, path, fileSize, REPL_FACTOR, 1000L);
++    util.waitReplication(dfs, path, REPL_FACTOR);
++    try {
++      // make sure datanode that has replica is fine before decommission
++      String outStr = runFsck(conf, 0, true, testFile);
++      System.out.println(outStr);
++      assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
++
++      // decommission datanode
++      ExtendedBlock eb = util.getFirstBlock(dfs, path);
++      DatanodeDescriptor dn = cluster.getNameNode().getNamesystem()
++          .getBlockManager().getBlockCollection(eb.getLocalBlock())
++          .getBlocks()[0].getDatanode(0);
++      cluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().getDecomManager().startDecommission(dn);
++      String dnName = dn.getXferAddr();
++
++      // wait for decommission start
++      DatanodeInfo datanodeInfo = null;
++      int count = 0;
++      do {
++        Thread.sleep(2000);
++        for (DatanodeInfo info : dfs.getDataNodeStats()) {
++          if (dnName.equals(info.getXferAddr())) {
++            datanodeInfo = info;
++          }
++        }
++        // check the replica status should be healthy(0)
++        // instead of corruption (1) during decommissioning
++        if(!checkDecommissionInProgress && datanodeInfo != null
++            && datanodeInfo.isDecommissionInProgress()) {
++          String fsckOut = runFsck(conf, 0, true, testFile);
++          checkDecommissionInProgress =  true;
++        }
++      } while (datanodeInfo != null && !datanodeInfo.isDecommissioned());
++
++      // check the replica status should be healthy(0) after decommission
++      // is done
++      String fsckOut = runFsck(conf, 0, true, testFile);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

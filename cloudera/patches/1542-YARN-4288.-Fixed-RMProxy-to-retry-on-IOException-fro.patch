@@ -1,0 +1,204 @@
+From 54a19c4c9b70e8a7ab012f906a440703b14c063e Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Thu, 29 Oct 2015 00:00:48 -0700
+Subject: [PATCH 1542/2848] YARN-4288. Fixed RMProxy to retry on IOException
+ from local host. Contributed by Junping Du
+ (cherry picked from commit
+ c41699965e78ce5e87669d17923ab84e494c4188)
+
+(cherry picked from commit 7d109ef5b5b6f004d2ef3b1feeec17799be53109)
+
+Conflicts:
+	hadoop-yarn-project/CHANGES.txt
+
+Change-Id: If23d376a68ebd79cfef8450d30a2de4a9601120d
+---
+ .../org/apache/hadoop/io/retry/RetryPolicies.java  |   44 +++++++++++++++++++-
+ .../org/apache/hadoop/io/retry/TestRetryProxy.java |   27 +++++++++++-
+ .../hadoop/io/retry/UnreliableImplementation.java  |   17 ++++++++
+ .../hadoop/io/retry/UnreliableInterface.java       |    3 ++
+ .../org/apache/hadoop/yarn/client/RMProxy.java     |    6 ++-
+ 5 files changed, 91 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+index 5668ad1..3c9cda8 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+@@ -134,7 +134,17 @@ public static final RetryPolicy retryByRemoteException(
+       Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap) {
+     return new RemoteExceptionDependentRetry(defaultPolicy, exceptionToPolicyMap);
+   }
+-  
++
++  /**
++   * A retry policy for exceptions other than RemoteException.
++   */
++  public static final RetryPolicy retryOtherThanRemoteException(
++      RetryPolicy defaultPolicy,
++      Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap) {
++    return new OtherThanRemoteExceptionDependentRetry(defaultPolicy,
++        exceptionToPolicyMap);
++  }
++
+   public static final RetryPolicy failoverOnNetworkException(int maxFailovers) {
+     return failoverOnNetworkException(TRY_ONCE_THEN_FAIL, maxFailovers);
+   }
+@@ -483,7 +493,37 @@ public RetryAction shouldRetry(Exception e, int retries, int failovers,
+       return policy.shouldRetry(e, retries, failovers, isIdempotentOrAtMostOnce);
+     }
+   }
+-  
++
++  static class OtherThanRemoteExceptionDependentRetry implements RetryPolicy {
++
++    private RetryPolicy defaultPolicy;
++    private Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap;
++
++    public OtherThanRemoteExceptionDependentRetry(RetryPolicy defaultPolicy,
++        Map<Class<? extends Exception>,
++        RetryPolicy> exceptionToPolicyMap) {
++      this.defaultPolicy = defaultPolicy;
++      this.exceptionToPolicyMap = exceptionToPolicyMap;
++    }
++
++    @Override
++    public RetryAction shouldRetry(Exception e, int retries, int failovers,
++        boolean isIdempotentOrAtMostOnce) throws Exception {
++      RetryPolicy policy = null;
++      // ignore Remote Exception
++      if (e instanceof RemoteException) {
++        // do nothing
++      } else {
++        policy = exceptionToPolicyMap.get(e.getClass());
++      }
++      if (policy == null) {
++        policy = defaultPolicy;
++      }
++      return policy.shouldRetry(
++          e, retries, failovers, isIdempotentOrAtMostOnce);
++    }
++  }
++
+   static class ExponentialBackoffRetry extends RetryLimited {
+     
+     public ExponentialBackoffRetry(
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
+index 79ea1b9..4ea93a8 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/TestRetryProxy.java
+@@ -22,12 +22,14 @@
+ import static org.apache.hadoop.io.retry.RetryPolicies.TRY_ONCE_THEN_FAIL;
+ import static org.apache.hadoop.io.retry.RetryPolicies.retryByException;
+ import static org.apache.hadoop.io.retry.RetryPolicies.retryByRemoteException;
++import static org.apache.hadoop.io.retry.RetryPolicies.retryOtherThanRemoteException;
+ import static org.apache.hadoop.io.retry.RetryPolicies.retryUpToMaximumCountWithFixedSleep;
+ import static org.apache.hadoop.io.retry.RetryPolicies.retryUpToMaximumCountWithProportionalSleep;
+ import static org.apache.hadoop.io.retry.RetryPolicies.retryUpToMaximumTimeWithFixedSleep;
+ import static org.apache.hadoop.io.retry.RetryPolicies.exponentialBackoffRetry;
+ import static org.junit.Assert.*;
+ 
++import java.io.IOException;
+ import java.util.Collections;
+ import java.util.Map;
+ import java.util.concurrent.Callable;
+@@ -202,8 +204,29 @@ public void testRetryByRemoteException() {
+     } catch (RemoteException e) {
+       // expected
+     }
+-  }  
+-  
++  }
++
++  @Test
++  public void testRetryOtherThanRemoteException() throws Throwable {
++    Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap =
++        Collections.<Class<? extends Exception>, RetryPolicy>singletonMap(
++            IOException.class, RETRY_FOREVER);
++
++    UnreliableInterface unreliable = (UnreliableInterface)
++        RetryProxy.create(UnreliableInterface.class, unreliableImpl,
++            retryOtherThanRemoteException(TRY_ONCE_THEN_FAIL,
++                exceptionToPolicyMap));
++    // should retry with local IOException.
++    unreliable.failsOnceWithIOException();
++    try {
++      // won't get retry on remote exception
++      unreliable.failsOnceWithRemoteException();
++      fail("Should fail");
++    } catch (RemoteException e) {
++      // expected
++    }
++  }
++
+   @Test
+   public void testRetryInterruptible() throws Throwable {
+     final UnreliableInterface unreliable = (UnreliableInterface)
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableImplementation.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableImplementation.java
+index ce9c16e..9387772 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableImplementation.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableImplementation.java
+@@ -26,6 +26,8 @@
+ 
+   private int failsOnceInvocationCount,
+     failsOnceWithValueInvocationCount,
++    failsOnceIOExceptionInvocationCount,
++    failsOnceRemoteExceptionInvocationCount,
+     failsTenTimesInvocationCount,
+     succeedsOnceThenFailsCount,
+     succeedsOnceThenFailsIdempotentCount,
+@@ -90,6 +92,21 @@ public boolean failsOnceThenSucceedsWithReturnValue() throws UnreliableException
+   }
+ 
+   @Override
++  public void failsOnceWithIOException() throws IOException {
++    if (failsOnceIOExceptionInvocationCount++ == 0) {
++      throw new IOException("test exception for failsOnceWithIOException");
++    }
++  }
++
++  @Override
++  public void failsOnceWithRemoteException() throws RemoteException {
++    if (failsOnceRemoteExceptionInvocationCount++ == 0) {
++      throw new RemoteException(IOException.class.getName(),
++          "test exception for failsOnceWithRemoteException");
++    }
++  }
++
++  @Override
+   public void failsTenTimesThenSucceeds() throws UnreliableException {
+     if (failsTenTimesInvocationCount++ < 10) {
+       throw new UnreliableException();
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableInterface.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableInterface.java
+index 3fbe11a..6c9c153 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableInterface.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/retry/UnreliableInterface.java
+@@ -54,6 +54,9 @@ public String getMessage() {
+   void alwaysFailsWithFatalException() throws FatalException;
+   void alwaysFailsWithRemoteFatalException() throws RemoteException;
+ 
++  void failsOnceWithIOException() throws IOException;
++  void failsOnceWithRemoteException() throws RemoteException;
++
+   void failsOnceThenSucceeds() throws UnreliableException;
+   boolean failsOnceThenSucceedsWithReturnValue() throws UnreliableException;
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+index fa8d642..b6295ca 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+@@ -248,8 +248,10 @@ public static RetryPolicy createRetryPolicy(Configuration conf) {
+     exceptionToPolicyMap.put(ConnectTimeoutException.class, retryPolicy);
+     exceptionToPolicyMap.put(RetriableException.class, retryPolicy);
+     exceptionToPolicyMap.put(SocketException.class, retryPolicy);
+-
+-    return RetryPolicies.retryByException(
++    // YARN-4288: local IOException is also possible.
++    exceptionToPolicyMap.put(IOException.class, retryPolicy);
++    // Not retry on remote IO exception.
++    return RetryPolicies.retryOtherThanRemoteException(
+         RetryPolicies.TRY_ONCE_THEN_FAIL, exceptionToPolicyMap);
+   }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,206 @@
+From fbd57520401118b5efaa1b0a4220ce0313da83f5 Mon Sep 17 00:00:00 2001
+From: Tsz-Wo Nicholas Sze <szetszwo@hortonworks.com>
+Date: Mon, 10 Aug 2015 16:52:02 -0700
+Subject: [PATCH 2608/2848] HDFS-8818. Changes the global moveExecutor to per
+ datanode executors and changes MAX_SIZE_TO_MOVE
+ to be configurable.
+
+(cherry picked from commit ac8d153046d542e9d13cb3f67c0461764eaf0a26)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+
+Change-Id: I8a8909f640b1e7d2d9b9c1273d6e521af35f71c5
+---
+ .../hadoop/hdfs/server/balancer/Dispatcher.java    |   80 ++++++++++++++++----
+ 1 file changed, 65 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+index 17c5a63..d498e3a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+@@ -112,9 +112,10 @@
+ 
+   private NetworkTopology cluster;
+ 
+-  private final ExecutorService moveExecutor;
+   private final ExecutorService dispatchExecutor;
+ 
++  private final Allocator moverThreadAllocator;
++
+   /** The maximum number of concurrent blocks moves at a datanode */
+   private final int maxConcurrentMovesPerNode;
+ 
+@@ -126,6 +127,30 @@
+    */
+   private final int maxNoMoveInterval;
+ 
++  static class Allocator {
++    private final int max;
++    private int count = 0;
++
++    Allocator(int max) {
++      this.max = max;
++    }
++
++    synchronized int allocate(int n) {
++      final int remaining = max - count;
++      if (remaining <= 0) {
++        return 0;
++      } else {
++        final int allocated = remaining < n? remaining: n;
++        count += allocated;
++        return allocated;
++      }
++    }
++
++    synchronized void reset() {
++      count = 0;
++    }
++  }
++
+   private static class GlobalBlockMap {
+     private final Map<Block, DBlock> map = new HashMap<Block, DBlock>();
+ 
+@@ -527,7 +552,7 @@ public boolean equals(Object obj) {
+     /** blocks being moved but not confirmed yet */
+     private final List<PendingMove> pendings;
+     private volatile boolean hasFailure = false;
+-    private final int maxConcurrentMoves;
++    private ExecutorService moveExecutor;
+ 
+     @Override
+     public String toString() {
+@@ -536,7 +561,6 @@ public String toString() {
+ 
+     private DDatanode(DatanodeInfo datanode, int maxConcurrentMoves) {
+       this.datanode = datanode;
+-      this.maxConcurrentMoves = maxConcurrentMoves;
+       this.pendings = new ArrayList<PendingMove>(maxConcurrentMoves);
+     }
+ 
+@@ -544,6 +568,21 @@ public DatanodeInfo getDatanodeInfo() {
+       return datanode;
+     }
+ 
++    synchronized ExecutorService initMoveExecutor(int poolSize) {
++      return moveExecutor = Executors.newFixedThreadPool(poolSize);
++    }
++
++    synchronized ExecutorService getMoveExecutor() {
++      return moveExecutor;
++    }
++
++    synchronized void shutdownMoveExecutor() {
++      if (moveExecutor != null) {
++        moveExecutor.shutdown();
++        moveExecutor = null;
++      }
++    }
++
+     private static <G extends StorageGroup> void put(StorageType storageType,
+         G g, EnumMap<StorageType, G> map) {
+       final StorageGroup existing = map.put(storageType, g);
+@@ -575,11 +614,6 @@ synchronized private boolean isDelayActive() {
+       return true;
+     }
+ 
+-    /** Check if the node can schedule more blocks to move */
+-    synchronized boolean isPendingQNotFull() {
+-      return pendings.size() < maxConcurrentMoves;
+-    }
+-
+     /** Check if all the dispatched moves are done */
+     synchronized boolean isPendingQEmpty() {
+       return pendings.isEmpty();
+@@ -587,7 +621,7 @@ synchronized boolean isPendingQEmpty() {
+ 
+     /** Add a scheduled block move to the node */
+     synchronized boolean addPendingBlock(PendingMove pendingBlock) {
+-      if (!isDelayActive() && isPendingQNotFull()) {
++      if (!isDelayActive()) {
+         return pendings.add(pendingBlock);
+       }
+       return false;
+@@ -745,11 +779,9 @@ private void removeMovedBlocks() {
+       }
+     }
+ 
+-    private static final int SOURCE_BLOCKS_MIN_SIZE = 5;
+-
+     /** @return if should fetch more blocks from namenode */
+     private boolean shouldFetchMoreBlocks() {
+-      return srcBlocks.size() < SOURCE_BLOCKS_MIN_SIZE && blocksToReceive > 0;
++      return blocksToReceive > 0;
+     }
+ 
+     private static final long MAX_ITERATION_TIME = 20 * 60 * 1000L; // 20 mins
+@@ -772,7 +804,7 @@ private void dispatchBlocks() {
+               + ", scheduledSize=" + getScheduledSize()
+               + ", srcBlocks#=" + srcBlocks.size());
+         }
+-       final PendingMove p = chooseNextMove();
++        final PendingMove p = chooseNextMove();
+         if (p != null) {
+           // Reset previous move timestamp
+           previousMoveTimestamp = Time.monotonicNow();
+@@ -857,9 +889,9 @@ public Dispatcher(NameNodeConnector nnc, Set<String> includedNodes,
+ 
+     this.cluster = NetworkTopology.getInstance(conf);
+ 
+-    this.moveExecutor = Executors.newFixedThreadPool(moverThreads);
+     this.dispatchExecutor = dispatcherThreads == 0? null
+         : Executors.newFixedThreadPool(dispatcherThreads);
++    this.moverThreadAllocator = new Allocator(moverThreads);
+     this.maxConcurrentMovesPerNode = maxConcurrentMovesPerNode;
+     this.blockMoveTimeout = blockMoveTimeout;
+     this.maxNoMoveInterval = maxNoMoveInterval;
+@@ -948,8 +980,22 @@ public DDatanode newDatanode(DatanodeInfo datanode) {
+     return new DDatanode(datanode, maxConcurrentMovesPerNode);
+   }
+ 
++
+   public void executePendingMove(final PendingMove p) {
+     // move the block
++    final DDatanode targetDn = p.target.getDDatanode();
++    ExecutorService moveExecutor = targetDn.getMoveExecutor();
++    if (moveExecutor == null) {
++      final int nThreads = moverThreadAllocator.allocate(maxConcurrentMovesPerNode);
++      if (nThreads > 0) {
++        moveExecutor = targetDn.initMoveExecutor(nThreads);
++      }
++    }
++    if (moveExecutor == null) {
++      LOG.warn("No mover threads available: skip moving " + p);
++      return;
++    }
++
+     moveExecutor.execute(new Runnable() {
+       @Override
+       public void run() {
+@@ -1129,6 +1175,11 @@ void reset(Configuration conf) {
+     cluster = NetworkTopology.getInstance(conf);
+     storageGroupMap.clear();
+     sources.clear();
++
++    moverThreadAllocator.reset();
++    for(StorageGroup t : targets) {
++      t.getDDatanode().shutdownMoveExecutor();
++    }
+     targets.clear();
+     globalBlocks.removeAllButRetain(movedBlocks);
+     movedBlocks.cleanup();
+@@ -1150,7 +1201,6 @@ public void shutdownNow() {
+     if (dispatchExecutor != null) {
+       dispatchExecutor.shutdownNow();
+     }
+-    moveExecutor.shutdownNow();
+   }
+ 
+   static class Util {
+-- 
+1.7.9.5
+

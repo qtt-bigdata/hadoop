@@ -1,0 +1,857 @@
+From 200558925ab53c6ba39062ada63505fd8fa99c1b Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@cloudera.com>
+Date: Thu, 8 Sep 2016 10:54:14 -0700
+Subject: [PATCH 1843/2848] HDFS-8986. Add option to -du to calculate
+ directory space usage excluding snapshots.
+ Contributed by Xiao Chen.
+
+(cherry picked from commit f0efea490e5aa9dd629d2199aae9c5b1290a17ee)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ContentSummary.java
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/Count.java
+	hadoop-common-project/hadoop-common/src/site/markdown/FileSystemShell.md
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/shell/TestCount.java
+	hadoop-common-project/hadoop-common/src/test/resources/testConf.xml
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSShell.java
+
+Change-Id: I41e233ced798119ffdf659b8f31d782cd908cab7
+---
+ .../java/org/apache/hadoop/fs/ContentSummary.java  |  106 ++++++++-
+ .../java/org/apache/hadoop/fs/shell/Count.java     |   15 +-
+ .../java/org/apache/hadoop/fs/shell/FsUsage.java   |   31 ++-
+ .../src/site/apt/FileSystemShell.apt.vm            |   13 +-
+ .../java/org/apache/hadoop/fs/shell/TestCount.java |    7 +-
+ .../hadoop-common/src/test/resources/testConf.xml  |   12 +-
+ .../apache/hadoop/hdfs/protocolPB/PBHelper.java    |    8 +-
+ .../namenode/ContentSummaryComputationContext.java |    6 +
+ .../apache/hadoop/hdfs/server/namenode/INode.java  |   10 +-
+ .../hdfs/server/namenode/INodeDirectory.java       |    3 +
+ .../hadoop-hdfs/src/main/proto/hdfs.proto          |   18 ++
+ .../java/org/apache/hadoop/hdfs/TestDFSShell.java  |  238 +++++++++++++++++++-
+ 12 files changed, 425 insertions(+), 42 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ContentSummary.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ContentSummary.java
+index 6276dda..1c37acd 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ContentSummary.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ContentSummary.java
+@@ -36,7 +36,11 @@
+   private long quota;
+   private long spaceConsumed;
+   private long spaceQuota;
+-  
++  // These fields are to track the snapshot-related portion of the values.
++  private long snapshotLength;
++  private long snapshotFileCount;
++  private long snapshotDirectoryCount;
++  private long snapshotSpaceConsumed;
+ 
+   /** Constructor */
+   public ContentSummary() {}
+@@ -50,29 +54,59 @@ public ContentSummary(long length, long fileCount, long directoryCount) {
+   public ContentSummary(
+       long length, long fileCount, long directoryCount, long quota,
+       long spaceConsumed, long spaceQuota) {
++    this(length, fileCount, directoryCount, quota, spaceConsumed, spaceQuota,
++        0, 0, 0, 0);
++  }
++
++  /** Constructor */
++  public ContentSummary(
++      long length, long fileCount, long directoryCount, long quota,
++      long spaceConsumed, long spaceQuota, long snapshotLength,
++      long snapshotFileCount, long snapshotDirectoryCount,
++      long snapshotSpaceConsumed) {
+     this.length = length;
+     this.fileCount = fileCount;
+     this.directoryCount = directoryCount;
+     this.quota = quota;
+     this.spaceConsumed = spaceConsumed;
+     this.spaceQuota = spaceQuota;
++    this.snapshotLength = snapshotLength;
++    this.snapshotFileCount = snapshotFileCount;
++    this.snapshotDirectoryCount = snapshotDirectoryCount;
++    this.snapshotSpaceConsumed = snapshotSpaceConsumed;
+   }
+ 
+   /** @return the length */
+   public long getLength() {return length;}
+ 
++  public long getSnapshotLength() {
++    return snapshotLength;
++  }
++
+   /** @return the directory count */
+   public long getDirectoryCount() {return directoryCount;}
+ 
++  public long getSnapshotDirectoryCount() {
++    return snapshotDirectoryCount;
++  }
++
+   /** @return the file count */
+   public long getFileCount() {return fileCount;}
+-  
++
++  public long getSnapshotFileCount() {
++    return snapshotFileCount;
++  }
++
+   /** Return the directory quota */
+   public long getQuota() {return quota;}
+   
+   /** Retuns (disk) space consumed */ 
+   public long getSpaceConsumed() {return spaceConsumed;}
+ 
++  public long getSnapshotSpaceConsumed() {
++    return snapshotSpaceConsumed;
++  }
++
+   /** Returns (disk) space quota */
+   public long getSpaceQuota() {return spaceQuota;}
+   
+@@ -98,6 +132,33 @@ public void readFields(DataInput in) throws IOException {
+     this.spaceQuota = in.readLong();
+   }
+ 
++  @Override
++  public boolean equals(Object to) {
++    if (this == to) {
++      return true;
++    } else if (to instanceof ContentSummary) {
++      ContentSummary right = (ContentSummary) to;
++      return getLength() == right.getLength() &&
++          getFileCount() == right.getFileCount() &&
++          getDirectoryCount() == right.getDirectoryCount() &&
++          getSnapshotLength() == right.getSnapshotLength() &&
++          getSnapshotFileCount() == right.getSnapshotFileCount() &&
++          getSnapshotDirectoryCount() == right.getSnapshotDirectoryCount() &&
++          getSnapshotSpaceConsumed() == right.getSnapshotSpaceConsumed() &&
++          super.equals(to);
++    } else {
++      return super.equals(to);
++    }
++  }
++
++  @Override
++  public int hashCode() {
++    long result = getLength() ^ getFileCount() ^ getDirectoryCount()
++        ^ getSnapshotLength() ^ getSnapshotFileCount()
++        ^ getSnapshotDirectoryCount() ^ getSnapshotSpaceConsumed();
++    return ((int) result) ^ super.hashCode();
++  }
++
+   /**
+    * Output format:
+    * <----12----> <----12----> <-------18------->
+@@ -174,16 +235,32 @@ public String toString(boolean qOption) {
+   }
+ 
+   /** Return the string representation of the object in the output format.
+-   * if qOption is false, output directory count, file count, and content size;
+-   * if qOption is true, output quota and remaining quota as well.
+-   * if hOption is false file sizes are returned in bytes
+-   * if hOption is true file sizes are returned in human readable 
++   * For description of the options,
++   * @see #toString(boolean, boolean, boolean)
+    * 
+    * @param qOption a flag indicating if quota needs to be printed or not
+    * @param hOption a flag indicating if human readable output if to be used
+    * @return the string representation of the object
+    */
+   public String toString(boolean qOption, boolean hOption) {
++    return toString(qOption, hOption, false);
++  }
++
++  /** Return the string representation of the object in the output format.
++   * if qOption is false, output directory count, file count, and content size;
++   * if qOption is true, output quota and remaining quota as well.
++   * if hOption is false, file sizes are returned in bytes
++   * if hOption is true, file sizes are returned in human readable
++   * if xOption is false, output includes the calculation from snapshots
++   * if xOption is true, output excludes the calculation from snapshots
++   *
++   * @param qOption a flag indicating if quota needs to be printed or not
++   * @param hOption a flag indicating if human readable output is to be used
++   * @param xOption a flag indicating if calculation from snapshots is to be
++   *                included in the output
++   * @return the string representation of the object
++   */
++  public String toString(boolean qOption, boolean hOption, boolean xOption) {
+     String prefix = "";
+     if (qOption) {
+       String quotaStr = "none";
+@@ -203,11 +280,18 @@ public String toString(boolean qOption, boolean hOption) {
+       prefix = String.format(QUOTA_SUMMARY_FORMAT + SPACE_QUOTA_SUMMARY_FORMAT,
+                              quotaStr, quotaRem, spaceQuotaStr, spaceQuotaRem);
+     }
+-    
+-    return prefix + String.format(SUMMARY_FORMAT,
+-     formatSize(directoryCount, hOption),
+-     formatSize(fileCount, hOption),
+-     formatSize(length, hOption));
++
++    if (xOption) {
++      return prefix + String.format(SUMMARY_FORMAT,
++          formatSize(directoryCount - snapshotDirectoryCount, hOption),
++          formatSize(fileCount - snapshotFileCount, hOption),
++          formatSize(length - snapshotLength, hOption));
++    } else {
++      return prefix + String.format(SUMMARY_FORMAT,
++          formatSize(directoryCount, hOption),
++          formatSize(fileCount, hOption),
++          formatSize(length, hOption));
++    }
+   }
+   /**
+    * Formats a size to be human readable or in bytes
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/Count.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/Count.java
+index dd7d168..bd967ea 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/Count.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/Count.java
+@@ -46,11 +46,13 @@ public static void registerCommands(CommandFactory factory) {
+   private static final String OPTION_QUOTA = "q";
+   private static final String OPTION_HUMAN = "h";
+   private static final String OPTION_HEADER = "v";
++  // exclude snapshots from calculation. Only work on default columns.
++  private static final String OPTION_EXCLUDE_SNAPSHOT = "x";
+ 
+   public static final String NAME = "count";
+   public static final String USAGE =
+       "[-" + OPTION_QUOTA + "] [-" + OPTION_HUMAN + "] [-" + OPTION_HEADER
+-          + "] <path> ...";
++          + "] [-" + OPTION_EXCLUDE_SNAPSHOT + "] <path> ...";
+   public static final String DESCRIPTION =
+       "Count the number of directories, files and bytes under the paths\n" +
+           "that match the specified file pattern.  The output columns are:\n" +
+@@ -63,10 +65,13 @@ public static void registerCommands(CommandFactory factory) {
+           " PATHNAME\n" +
+           "The -" + OPTION_HUMAN +
+           " option shows file sizes in human readable format.\n" +
+-          "The -" + OPTION_HEADER + " option displays a header line.";
++          "The -" + OPTION_HEADER + " option displays a header line.\n" +
++          "The -" + OPTION_EXCLUDE_SNAPSHOT + " option excludes snapshots " +
++          "from being calculated.";
+ 
+   private boolean showQuotas;
+   private boolean humanReadable;
++  private boolean excludeSnapshots;
+ 
+   /** Constructor */
+   public Count() {}
+@@ -86,13 +91,14 @@ public Count(String[] cmd, int pos, Configuration conf) {
+   @Override
+   protected void processOptions(LinkedList<String> args) {
+     CommandFormat cf = new CommandFormat(1, Integer.MAX_VALUE,
+-        OPTION_QUOTA, OPTION_HUMAN, OPTION_HEADER);
++        OPTION_QUOTA, OPTION_HUMAN, OPTION_HEADER, OPTION_EXCLUDE_SNAPSHOT);
+     cf.parse(args);
+     if (args.isEmpty()) { // default path is the current working directory
+       args.add(".");
+     }
+     showQuotas = cf.getOpt(OPTION_QUOTA);
+     humanReadable = cf.getOpt(OPTION_HUMAN);
++    excludeSnapshots = cf.getOpt(OPTION_EXCLUDE_SNAPSHOT);
+     if (cf.getOpt(OPTION_HEADER)) {
+       out.println(ContentSummary.getHeader(showQuotas) + "PATHNAME");
+     }
+@@ -101,7 +107,8 @@ protected void processOptions(LinkedList<String> args) {
+   @Override
+   protected void processPath(PathData src) throws IOException {
+     ContentSummary summary = src.fs.getContentSummary(src.path);
+-    out.println(summary.toString(showQuotas, isHumanReadable()) + src);
++    out.println(summary.
++        toString(showQuotas, isHumanReadable(), excludeSnapshots) + src);
+   }
+   
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/FsUsage.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/FsUsage.java
+index 5c1dbf0..e4adae2 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/FsUsage.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/FsUsage.java
+@@ -107,27 +107,30 @@ protected void processPath(PathData item) throws IOException {
+   /** show disk usage */
+   public static class Du extends FsUsage {
+     public static final String NAME = "du";
+-    public static final String USAGE = "[-s] [-h] <path> ...";
++    public static final String USAGE = "[-s] [-h] [-x] <path> ...";
+     public static final String DESCRIPTION =
+-    "Show the amount of space, in bytes, used by the files that " +
+-    "match the specified file pattern. The following flags are optional:\n" +
+-    "-s: Rather than showing the size of each individual file that" +
+-    " matches the pattern, shows the total (summary) size.\n" +
+-    "-h: Formats the sizes of files in a human-readable fashion" +
+-    " rather than a number of bytes.\n\n" +
+-    "Note that, even without the -s option, this only shows size summaries " +
+-    "one level deep into a directory.\n\n" +
+-    "The output is in the form \n" + 
+-    "\tsize\tdisk space consumed\tname(full path)\n";
++        "Show the amount of space, in bytes, used by the files that match " +
++            "the specified file pattern. The following flags are optional:\n" +
++            "-s: Rather than showing the size of each individual file that" +
++            " matches the pattern, shows the total (summary) size.\n" +
++            "-h: Formats the sizes of files in a human-readable fashion" +
++            " rather than a number of bytes.\n" +
++            "-x: Excludes snapshots from being counted.\n\n" +
++            "Note that, even without the -s option, this only shows size " +
++            "summaries one level deep into a directory.\n\n" +
++            "The output is in the form \n" +
++            "\tsize\tdisk space consumed\tname(full path)\n";
+ 
+     protected boolean summary = false;
++    private boolean excludeSnapshots = false;
+     
+     @Override
+     protected void processOptions(LinkedList<String> args) throws IOException {
+-      CommandFormat cf = new CommandFormat(0, Integer.MAX_VALUE, "h", "s");
++      CommandFormat cf = new CommandFormat(0, Integer.MAX_VALUE, "h", "s", "x");
+       cf.parse(args);
+       humanReadable = cf.getOpt("h");
+       summary = cf.getOpt("s");
++      excludeSnapshots = cf.getOpt("x");
+       if (args.isEmpty()) args.add(Path.CUR_DIR);
+     }
+ 
+@@ -148,6 +151,10 @@ protected void processPath(PathData item) throws IOException {
+       ContentSummary contentSummary = item.fs.getContentSummary(item.path);
+       long length = contentSummary.getLength();
+       long spaceConsumed = contentSummary.getSpaceConsumed();
++      if (excludeSnapshots) {
++        length -= contentSummary.getSnapshotLength();
++        spaceConsumed -= contentSummary.getSnapshotSpaceConsumed();
++      }
+       usagesTable.addRow(formatSize(length), formatSize(spaceConsumed), item);
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/site/apt/FileSystemShell.apt.vm b/hadoop-common-project/hadoop-common/src/site/apt/FileSystemShell.apt.vm
+index a70e5bb..9d148f7 100644
+--- a/hadoop-common-project/hadoop-common/src/site/apt/FileSystemShell.apt.vm
++++ b/hadoop-common-project/hadoop-common/src/site/apt/FileSystemShell.apt.vm
+@@ -138,7 +138,7 @@ copyToLocal
+ 
+ count
+ 
+-   Usage: <<<hdfs dfs -count [-q] [-h] [-v] <paths> >>>
++   Usage: <<<hdfs dfs -count [-q] [-h] [-v] [-x] <paths> >>>
+ 
+    Count the number of directories, files and bytes under the paths that match
+    the specified file pattern.  The output columns with -count are: DIR_COUNT,
+@@ -151,6 +151,8 @@ count
+ 
+    The -v option displays a header line.
+ 
++   The -x option excludes snapshots from the result calculation. Without the -x option (default), the result is always calculated from all INodes, including all snapshots under the given path. The -x option is ignored if -u or -q option is given.
++
+    Example:
+ 
+      * <<<hdfs dfs -count hdfs://nn1.example.com/file1 hdfs://nn2.example.com/file2>>>
+@@ -201,7 +203,7 @@ cp
+ 
+ du
+ 
+-   Usage: <<<hdfs dfs -du [-s] [-h] URI [URI ...]>>>
++   Usage: <<<hdfs dfs -du [-s] [-h] [-x] URI [URI ...]>>>
+ 
+    Displays sizes of files and directories contained in the given directory or
+    the length of a file in case its just a file.
+@@ -209,11 +211,16 @@ du
+    Options:
+ 
+      * The -s option will result in an aggregate summary of file lengths being
+-       displayed, rather than the individual files.
++       displayed, rather than the individual files. Without the -s option,
++       calculation is done by going 1-level deep from the given path.
+ 
+      * The -h option will format file sizes in a "human-readable" fashion (e.g
+        64.0m instead of 67108864)
+ 
++     * The -x option will exclude snapshots from the result calculation.
++       Without the -x option (default), the result is always calculated from
++       all INodes, including all snapshots under the given path.
++
+    Example:
+ 
+     * hdfs dfs -du /user/hadoop/dir1 /user/hadoop/file1 hdfs://nn.example.com/user/hadoop/dir1
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/shell/TestCount.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/shell/TestCount.java
+index 1f2f2d4..d6d7fd1 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/shell/TestCount.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/shell/TestCount.java
+@@ -289,7 +289,7 @@ public void getName() {
+   public void getUsage() {
+     Count count = new Count();
+     String actual = count.getUsage();
+-    String expected = "-count [-q] [-h] [-v] <path> ...";
++    String expected = "-count [-q] [-h] [-v] [-x] <path> ...";
+     assertEquals("Count.getUsage", expected, actual);
+   }
+ 
+@@ -306,7 +306,8 @@ public void getDescription() {
+         + "QUOTA REM_QUOTA SPACE_QUOTA REM_SPACE_QUOTA\n"
+         + "      DIR_COUNT FILE_COUNT CONTENT_SIZE PATHNAME\n"
+         + "The -h option shows file sizes in human readable format.\n"
+-        + "The -v option displays a header line.";
++        + "The -v option displays a header line.\n"
++        + "The -x option excludes snapshots from being calculated.";
+ 
+     assertEquals("Count.getDescription", expected, actual);
+   }
+@@ -319,7 +320,7 @@ public MockContentSummary() {
+     }
+ 
+     @Override
+-    public String toString(boolean qOption, boolean hOption) {
++    public String toString(boolean qOption, boolean hOption, boolean xOption) {
+       if (qOption) {
+         if (hOption) {
+           return (HUMAN + WITH_QUOTAS);
+diff --git a/hadoop-common-project/hadoop-common/src/test/resources/testConf.xml b/hadoop-common-project/hadoop-common/src/test/resources/testConf.xml
+index 0021f82..c2e8350 100644
+--- a/hadoop-common-project/hadoop-common/src/test/resources/testConf.xml
++++ b/hadoop-common-project/hadoop-common/src/test/resources/testConf.xml
+@@ -196,7 +196,7 @@
+       <comparators>
+         <comparator>
+           <type>RegexpComparator</type>
+-          <expected-output>^-du \[-s\] \[-h\] &lt;path&gt; \.\.\. :\s*</expected-output>
++          <expected-output>^-du \[-s\] \[-h\] \[-x\] &lt;path&gt; \.\.\. :\s*</expected-output>
+         </comparator>
+         <comparator>
+           <type>RegexpComparator</type>
+@@ -224,6 +224,10 @@
+         </comparator>
+         <comparator>
+           <type>RegexpComparator</type>
++          <expected-output>^\s*-x\s*Excludes snapshots from being counted.\s*</expected-output>
++        </comparator>
++        <comparator>
++          <type>RegexpComparator</type>
+           <expected-output>^\s*Note that, even without the -s option, this only shows size summaries one level\s*</expected-output>
+         </comparator>
+         <comparator>
+@@ -270,7 +274,7 @@
+       <comparators>
+         <comparator>
+           <type>RegexpComparator</type>
+-          <expected-output>^-count \[-q\] \[-h\] \[-v\] &lt;path&gt; \.\.\. :( )*</expected-output>
++          <expected-output>^-count \[-q\] \[-h\] \[-v\] \[-x\] &lt;path&gt; \.\.\. :( )*</expected-output>
+         </comparator>
+         <comparator>
+           <type>RegexpComparator</type>
+@@ -304,6 +308,10 @@
+           <type>RegexpComparator</type>
+           <expected-output>^( |\t)*The -v option displays a header line.( )*</expected-output>
+         </comparator>
++        <comparator>
++          <type>RegexpComparator</type>
++          <expected-output>^( |\t)*The -x option excludes snapshots from being calculated.( )*</expected-output>
++        </comparator>
+       </comparators>
+     </test>
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+index 4daeac7..3dcc296 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+@@ -1722,7 +1722,9 @@ public static ContentSummary convert(ContentSummaryProto cs) {
+     if (cs == null) return null;
+     return new ContentSummary(
+       cs.getLength(), cs.getFileCount(), cs.getDirectoryCount(), cs.getQuota(),
+-      cs.getSpaceConsumed(), cs.getSpaceQuota());
++      cs.getSpaceConsumed(), cs.getSpaceQuota(), cs.getSnapshotLength(),
++      cs.getSnapshotFileCount(), cs.getSnapshotDirectoryCount(),
++      cs.getSnapshotSpaceConsumed());
+   }
+   
+   public static ContentSummaryProto convert(ContentSummary cs) {
+@@ -1731,6 +1733,10 @@ public static ContentSummaryProto convert(ContentSummary cs) {
+         setLength(cs.getLength()).
+         setFileCount(cs.getFileCount()).
+         setDirectoryCount(cs.getDirectoryCount()).
++        setSnapshotLength(cs.getSnapshotLength()).
++        setSnapshotFileCount(cs.getSnapshotFileCount()).
++        setSnapshotDirectoryCount(cs.getSnapshotDirectoryCount()).
++        setSnapshotSpaceConsumed(cs.getSnapshotSpaceConsumed()).
+         setQuota(cs.getQuota()).
+         setSpaceConsumed(cs.getSpaceConsumed()).
+         setSpaceQuota(cs.getSpaceQuota()).
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
+index 17e16ab..1780d87 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
+@@ -26,6 +26,7 @@
+   private FSDirectory dir = null;
+   private FSNamesystem fsn = null;
+   private Content.Counts counts = null;
++  private Content.Counts snapshotCounts = null;
+   private long nextCountLimit = 0;
+   private long limitPerRun = 0;
+   private long yieldCount = 0;
+@@ -48,6 +49,7 @@ public ContentSummaryComputationContext(FSDirectory dir,
+     this.limitPerRun = limitPerRun;
+     this.nextCountLimit = limitPerRun;
+     this.counts = Content.Counts.newInstance();
++    this.snapshotCounts = Content.Counts.newInstance();
+     this.sleepMilliSec = sleepMicroSec/1000;
+     this.sleepNanoSec = (int)((sleepMicroSec%1000)*1000);
+   }
+@@ -120,4 +122,8 @@ public boolean yield() {
+   public Content.Counts getCounts() {
+     return counts;
+   }
++
++  public Content.Counts getSnapshotCounts() {
++    return snapshotCounts;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+index b41c950..9cf783b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+@@ -503,13 +503,17 @@ public final ContentSummary computeContentSummary() {
+    */
+   public final ContentSummary computeAndConvertContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+-    Content.Counts counts = computeContentSummary(snapshotId, summary)
+-        .getCounts();
++    computeContentSummary(snapshotId, summary);
++    final Content.Counts counts = summary.getCounts();
++    final Content.Counts snapshotCounts = summary.getSnapshotCounts();
+     final Quota.Counts q = getQuotaCounts();
+     return new ContentSummary(counts.get(Content.LENGTH),
+         counts.get(Content.FILE) + counts.get(Content.SYMLINK),
+         counts.get(Content.DIRECTORY), q.get(Quota.NAMESPACE),
+-        counts.get(Content.DISKSPACE), q.get(Quota.DISKSPACE));
++        counts.get(Content.DISKSPACE), q.get(Quota.DISKSPACE),
++        snapshotCounts.get(Content.LENGTH), snapshotCounts.get(Content.FILE),
++        snapshotCounts.get(Content.DIRECTORY),
++        snapshotCounts.get(Content.DISKSPACE));
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+index ab1f765..d476468 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+@@ -611,6 +611,9 @@ public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       // if the getContentSummary call is against a non-snapshot path, the
+       // computation should include all the deleted files/directories
+       sf.computeContentSummary4Snapshot(summary.getCounts());
++      // Also compute ContentSummary for snapshotCounts (So we can extract it
++      // later from the ContentSummary of all).
++      sf.computeContentSummary4Snapshot(summary.getSnapshotCounts());
+     }
+     final DirectoryWithQuotaFeature q = getDirectoryWithQuotaFeature();
+     if (q != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+index 06f3431..20ab299 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+@@ -133,6 +133,24 @@ message ContentSummaryProto {
+   required uint64 quota = 4;
+   required uint64 spaceConsumed = 5;
+   required uint64 spaceQuota = 6;
++  optional StorageTypeQuotaInfosProto typeQuotaInfos = 7;
++  optional uint64 snapshotLength = 8;
++  optional uint64 snapshotFileCount = 9;
++  optional uint64 snapshotDirectoryCount = 10;
++  optional uint64 snapshotSpaceConsumed = 11;
++}
++
++/**
++ * Storage type quota and usage information of a file or directory
++	 */
++message StorageTypeQuotaInfosProto {
++  repeated StorageTypeQuotaInfoProto typeQuotaInfo = 1;
++}
++
++message StorageTypeQuotaInfoProto {
++  required StorageTypeProto type = 1;
++  required uint64 quota = 2;
++  required uint64 consumed = 3;
+ }
+ 
+ /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSShell.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSShell.java
+index 3e031e5..e5bfb88 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSShell.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSShell.java
+@@ -102,6 +102,11 @@ static Path mkdir(FileSystem fs, Path p) throws IOException {
+     return p;
+   }
+ 
++  static void rmr(FileSystem fs, Path p) throws IOException {
++    assertTrue(fs.delete(p, true));
++    assertFalse(fs.exists(p));
++  }
++
+   static File createLocalFile(File f) throws IOException {
+     assertTrue(!f.exists());
+     PrintWriter out = new PrintWriter(f);
+@@ -177,8 +182,8 @@ public void testRecursiveRm() throws IOException {
+ 	  Configuration conf = new HdfsConfiguration();
+ 	  MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+ 	  FileSystem fs = cluster.getFileSystem();
+-	  assertTrue("Not a HDFS: " + fs.getUri(), 
+-			  fs instanceof DistributedFileSystem);
++	  assertTrue("Not a HDFS: " + fs.getUri(),
++        fs instanceof DistributedFileSystem);
+ 	  try {
+       fs.mkdirs(new Path(new Path("parent"), "child"));
+       try {
+@@ -213,6 +218,7 @@ public void testDu() throws IOException {
+     shell.setConf(conf);
+     
+     try {
++      cluster.waitActive();
+       Path myPath = new Path("/test/dir");
+       assertTrue(fs.mkdirs(myPath));
+       assertTrue(fs.exists(myPath));
+@@ -240,7 +246,7 @@ public void testDu() throws IOException {
+       assertTrue(val == 0);
+       String returnString = out.toString();
+       out.reset();
+-      // Check if size matchs as expected
++      // Check if size matches as expected
+       assertThat(returnString, containsString(myFileLength.toString()));
+       assertThat(returnString, containsString(myFileDiskUsed.toString()));
+       assertThat(returnString, containsString(myFile2Length.toString()));
+@@ -279,6 +285,232 @@ public void testDu() throws IOException {
+                                   
+   }
+ 
++  @Test (timeout = 180000)
++  public void testDuSnapshots() throws IOException {
++    final int replication = 2;
++    final Configuration conf = new HdfsConfiguration();
++    final MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .numDataNodes(replication).build();
++    final DistributedFileSystem dfs = cluster.getFileSystem();
++    final PrintStream psBackup = System.out;
++    final ByteArrayOutputStream out = new ByteArrayOutputStream();
++    final PrintStream psOut = new PrintStream(out);
++    final FsShell shell = new FsShell();
++    shell.setConf(conf);
++
++    try {
++      System.setOut(psOut);
++      cluster.waitActive();
++      final Path parent = new Path("/test");
++      final Path dir = new Path(parent, "dir");
++      mkdir(dfs, dir);
++      final Path file = new Path(dir, "file");
++      writeFile(dfs, file);
++      final Path file2 = new Path(dir, "file2");
++      writeFile(dfs, file2);
++      final Long fileLength = dfs.getFileStatus(file).getLen();
++      final Long fileDiskUsed = fileLength * replication;
++      final Long file2Length = dfs.getFileStatus(file2).getLen();
++      final Long file2DiskUsed = file2Length * replication;
++
++      /*
++       * Construct dir as follows:
++       * /test/dir/file   <- this will later be deleted after snapshot taken.
++       * /test/dir/newfile <- this will be created after snapshot taken.
++       * /test/dir/file2
++       * Snapshot enabled on /test
++       */
++
++      // test -du on /test/dir
++      int ret = -1;
++      try {
++        ret = shell.run(new String[] {"-du", dir.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, ret);
++      String returnString = out.toString();
++      LOG.info("-du return is:\n" + returnString);
++      // Check if size matches as expected
++      assertTrue(returnString.contains(fileLength.toString()));
++      assertTrue(returnString.contains(fileDiskUsed.toString()));
++      assertTrue(returnString.contains(file2Length.toString()));
++      assertTrue(returnString.contains(file2DiskUsed.toString()));
++      out.reset();
++
++      // take a snapshot, then remove file and add newFile
++      final String snapshotName = "ss1";
++      final Path snapshotPath = new Path(parent, ".snapshot/" + snapshotName);
++      dfs.allowSnapshot(parent);
++      assertThat(dfs.createSnapshot(parent, snapshotName), is(snapshotPath));
++      rmr(dfs, file);
++      final Path newFile = new Path(dir, "newfile");
++      writeFile(dfs, newFile);
++      final Long newFileLength = dfs.getFileStatus(newFile).getLen();
++      final Long newFileDiskUsed = newFileLength * replication;
++
++      // test -du -s on /test
++      ret = -1;
++      try {
++        ret = shell.run(new String[] {"-du", "-s", parent.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, ret);
++      returnString = out.toString();
++      LOG.info("-du -s return is:\n" + returnString);
++      Long combinedLength = fileLength + file2Length + newFileLength;
++      Long combinedDiskUsed = fileDiskUsed + file2DiskUsed + newFileDiskUsed;
++      assertTrue(returnString.contains(combinedLength.toString()));
++      assertTrue(returnString.contains(combinedDiskUsed.toString()));
++      out.reset();
++
++      // test -du on /test
++      ret = -1;
++      try {
++        ret = shell.run(new String[] {"-du", parent.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, ret);
++      returnString = out.toString();
++      LOG.info("-du return is:\n" + returnString);
++      assertTrue(returnString.contains(combinedLength.toString()));
++      assertTrue(returnString.contains(combinedDiskUsed.toString()));
++      out.reset();
++
++      // test -du -s -x on /test
++      ret = -1;
++      try {
++        ret = shell.run(new String[] {"-du", "-s", "-x", parent.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, ret);
++      returnString = out.toString();
++      LOG.info("-du -s -x return is:\n" + returnString);
++      Long exludeSnapshotLength = file2Length + newFileLength;
++      Long excludeSnapshotDiskUsed = file2DiskUsed + newFileDiskUsed;
++      assertTrue(returnString.contains(exludeSnapshotLength.toString()));
++      assertTrue(returnString.contains(excludeSnapshotDiskUsed.toString()));
++      out.reset();
++
++      // test -du -x on /test
++      ret = -1;
++      try {
++        ret = shell.run(new String[] {"-du", "-x", parent.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, ret);
++      returnString = out.toString();
++      LOG.info("-du -x return is:\n" + returnString);
++      assertTrue(returnString.contains(exludeSnapshotLength.toString()));
++      assertTrue(returnString.contains(excludeSnapshotDiskUsed.toString()));
++      out.reset();
++    } finally {
++      System.setOut(psBackup);
++      cluster.shutdown();
++    }
++  }
++
++  @Test (timeout = 180000)
++  public void testCountSnapshots() throws IOException {
++    final int replication = 2;
++    final Configuration conf = new HdfsConfiguration();
++    final MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .numDataNodes(replication).build();
++    final DistributedFileSystem dfs = cluster.getFileSystem();
++    final PrintStream psBackup = System.out;
++    final ByteArrayOutputStream out = new ByteArrayOutputStream();
++    final PrintStream psOut = new PrintStream(out);
++    System.setOut(psOut);
++    final FsShell shell = new FsShell();
++    shell.setConf(conf);
++
++    try {
++      cluster.waitActive();
++      final Path parent = new Path("/test");
++      final Path dir = new Path(parent, "dir");
++      mkdir(dfs, dir);
++      final Path file = new Path(dir, "file");
++      writeFile(dfs, file);
++      final Path file2 = new Path(dir, "file2");
++      writeFile(dfs, file2);
++      final long fileLength = dfs.getFileStatus(file).getLen();
++      final long file2Length = dfs.getFileStatus(file2).getLen();
++      final Path dir2 = new Path(parent, "dir2");
++      mkdir(dfs, dir2);
++
++      /*
++       * Construct dir as follows:
++       * /test/dir/file   <- this will later be deleted after snapshot taken.
++       * /test/dir/newfile <- this will be created after snapshot taken.
++       * /test/dir/file2
++       * /test/dir2       <- this will later be deleted after snapshot taken.
++       * Snapshot enabled on /test
++       */
++
++      // take a snapshot
++      // then create /test/dir/newfile and remove /test/dir/file, /test/dir2
++      final String snapshotName = "s1";
++      final Path snapshotPath = new Path(parent, ".snapshot/" + snapshotName);
++      dfs.allowSnapshot(parent);
++      assertThat(dfs.createSnapshot(parent, snapshotName), is(snapshotPath));
++      rmr(dfs, file);
++      rmr(dfs, dir2);
++      final Path newFile = new Path(dir, "new file");
++      writeFile(dfs, newFile);
++      final Long newFileLength = dfs.getFileStatus(newFile).getLen();
++
++      // test -count on /test. Include header for easier debugging.
++      int val = -1;
++      try {
++        val = shell.run(new String[] {"-count", "-v", parent.toString() });
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, val);
++      String returnString = out.toString();
++      LOG.info("-count return is:\n" + returnString);
++      Scanner in = new Scanner(returnString);
++      in.nextLine();
++      assertEquals(3, in.nextLong()); //DIR_COUNT
++      assertEquals(3, in.nextLong()); //FILE_COUNT
++      assertEquals(fileLength + file2Length + newFileLength,
++          in.nextLong()); //CONTENT_SIZE
++      out.reset();
++
++      // test -count -x on /test. Include header for easier debugging.
++      val = -1;
++      try {
++        val =
++            shell.run(new String[] {"-count", "-x", "-v", parent.toString()});
++      } catch (Exception e) {
++        System.err.println("Exception raised from DFSShell.run " +
++            e.getLocalizedMessage());
++      }
++      assertEquals(0, val);
++      returnString = out.toString();
++      LOG.info("-count -x return is:\n" + returnString);
++      in = new Scanner(returnString);
++      in.nextLine();
++      assertEquals(2, in.nextLong()); //DIR_COUNT
++      assertEquals(2, in.nextLong()); //FILE_COUNT
++      assertEquals(file2Length + newFileLength, in.nextLong()); //CONTENT_SIZE
++      out.reset();
++    } finally {
++      System.setOut(psBackup);
++      cluster.shutdown();
++    }
++  }
++
+   @Test (timeout = 30000)
+   public void testPut() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+-- 
+1.7.9.5
+

@@ -1,0 +1,258 @@
+From 6887661e941d8545ed506ccc848810da59ea0c03 Mon Sep 17 00:00:00 2001
+From: Robert Kanter <rkanter@apache.org>
+Date: Wed, 6 Apr 2016 17:15:43 -0700
+Subject: [PATCH 1563/2848] MAPREDUCE-6647. MR usage counters use the
+ resources requested instead of the resources
+ allocated (haibochen via rkanter)
+
+(cherry picked from commit 3be1ab485f557c8a3c6a5066453f24d8d61f30be)
+
+Change-Id: Ic06eba5403daef8b80eacb727eda79ccc7736fbf
+---
+ .../mapreduce/v2/app/job/impl/TaskAttemptImpl.java |   41 ++++++++++++--------
+ .../org/apache/hadoop/mapreduce/v2/app/MRApp.java  |   10 ++++-
+ .../hadoop/mapreduce/v2/app/TestRecovery.java      |   29 ++++++++------
+ .../mapreduce/v2/app/job/impl/TestTaskAttempt.java |   37 +++++++++++-------
+ 4 files changed, 74 insertions(+), 43 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+index 827ee53..368e750 100755
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+@@ -1401,29 +1401,36 @@ private void computeRackAndLocality() {
+   
+   private static void updateMillisCounters(JobCounterUpdateEvent jce,
+       TaskAttemptImpl taskAttempt) {
+-    TaskType taskType = taskAttempt.getID().getTaskId().getTaskType();
++    // if container/resource if not allocated, do not update
++    if (null == taskAttempt.container ||
++        null == taskAttempt.container.getResource()) {
++      return;
++    }
+     long duration = (taskAttempt.getFinishTime() - taskAttempt.getLaunchTime());
+-    int mbRequired =
+-        taskAttempt.getMemoryRequired(taskAttempt.conf, taskType);
+-    int vcoresRequired = taskAttempt.getCpuRequired(taskAttempt.conf, taskType);
+-
++    Resource allocatedResource = taskAttempt.container.getResource();
++    int mbAllocated = allocatedResource.getMemory();
++    int vcoresAllocated = allocatedResource.getVirtualCores();
+     int minSlotMemSize = taskAttempt.conf.getInt(
+-      YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB,
+-      YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB);
+-
+-    int simSlotsRequired =
+-        minSlotMemSize == 0 ? 0 : (int) Math.ceil((float) mbRequired
+-            / minSlotMemSize);
++        YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB,
++        YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB);
++    int simSlotsAllocated = minSlotMemSize == 0 ? 0 :
++        (int) Math.ceil((float) mbAllocated / minSlotMemSize);
+ 
++    TaskType taskType = taskAttempt.getID().getTaskId().getTaskType();
+     if (taskType == TaskType.MAP) {
+-      jce.addCounterUpdate(JobCounter.SLOTS_MILLIS_MAPS, simSlotsRequired * duration);
+-      jce.addCounterUpdate(JobCounter.MB_MILLIS_MAPS, duration * mbRequired);
+-      jce.addCounterUpdate(JobCounter.VCORES_MILLIS_MAPS, duration * vcoresRequired);
++      jce.addCounterUpdate(JobCounter.SLOTS_MILLIS_MAPS,
++          simSlotsAllocated * duration);
++      jce.addCounterUpdate(JobCounter.MB_MILLIS_MAPS, duration * mbAllocated);
++      jce.addCounterUpdate(JobCounter.VCORES_MILLIS_MAPS,
++          duration * vcoresAllocated);
+       jce.addCounterUpdate(JobCounter.MILLIS_MAPS, duration);
+     } else {
+-      jce.addCounterUpdate(JobCounter.SLOTS_MILLIS_REDUCES, simSlotsRequired * duration);
+-      jce.addCounterUpdate(JobCounter.MB_MILLIS_REDUCES, duration * mbRequired);
+-      jce.addCounterUpdate(JobCounter.VCORES_MILLIS_REDUCES, duration * vcoresRequired);
++      jce.addCounterUpdate(JobCounter.SLOTS_MILLIS_REDUCES,
++          simSlotsAllocated * duration);
++      jce.addCounterUpdate(JobCounter.MB_MILLIS_REDUCES,
++          duration * mbAllocated);
++      jce.addCounterUpdate(JobCounter.VCORES_MILLIS_REDUCES,
++          duration * vcoresAllocated);
+       jce.addCounterUpdate(JobCounter.MILLIS_REDUCES, duration);
+     }
+   }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+index 4e1348a..9bc0388 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+@@ -110,6 +110,10 @@
+ public class MRApp extends MRAppMaster {
+   private static final Log LOG = LogFactory.getLog(MRApp.class);
+ 
++  /**
++   * The available resource of each container allocated.
++   */
++  private Resource resource;
+   int maps;
+   int reduces;
+ 
+@@ -249,6 +253,7 @@ public MRApp(ApplicationAttemptId appAttemptId, ContainerId amContainerId,
+     // the job can reaches the final state when MRAppMaster shuts down.
+     this.successfullyUnregistered.set(unregistered);
+     this.assignedQueue = assignedQueue;
++    this.resource = Resource.newInstance(1234, 2);
+   }
+ 
+   @Override
+@@ -587,7 +592,6 @@ public void handle(ContainerAllocatorEvent event) {
+             ContainerId.newContainerId(getContext().getApplicationAttemptId(),
+               containerCount++);
+         NodeId nodeId = NodeId.newInstance(NM_HOST, NM_PORT);
+-        Resource resource = Resource.newInstance(1234, 2);
+         ContainerTokenIdentifier containerTokenIdentifier =
+             new ContainerTokenIdentifier(cId, nodeId.toString(), "user",
+             resource, System.currentTimeMillis() + 10000, 42, 42,
+@@ -710,6 +714,10 @@ public void setClusterInfo(ClusterInfo clusterInfo) {
+     }
+   }
+ 
++  public void setAllocatedContainerResource(Resource resource) {
++    this.resource = resource;
++  }
++
+   class TestJob extends JobImpl {
+     //override the init transition
+     private final TestInitTransition initTransition = new TestInitTransition(
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRecovery.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRecovery.java
+index 0e07bcf..713fd21 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRecovery.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRecovery.java
+@@ -1744,19 +1744,24 @@ private void recoveryChecker(MapTaskImpl checkTask, TaskState finalState,
+         expectedJobHistoryEvents.remove(0);
+       }  else if (current instanceof JobCounterUpdateEvent) {
+         JobCounterUpdateEvent jcue = (JobCounterUpdateEvent) current;
+-
+-        LOG.info("JobCounterUpdateEvent "
+-            + jcue.getCounterUpdates().get(0).getCounterKey()
+-            + " " + jcue.getCounterUpdates().get(0).getIncrementValue());
+-        if (jcue.getCounterUpdates().get(0).getCounterKey() ==
+-            JobCounter.NUM_FAILED_MAPS) {
+-          totalFailedMaps += jcue.getCounterUpdates().get(0)
+-              .getIncrementValue();
+-        } else if (jcue.getCounterUpdates().get(0).getCounterKey() ==
+-            JobCounter.TOTAL_LAUNCHED_MAPS) {
+-          totalLaunchedMaps += jcue.getCounterUpdates().get(0)
+-              .getIncrementValue();
++        boolean containsUpdates = jcue.getCounterUpdates().size() > 0;
++        // there is no updates in a JobCounterUpdateEvent emitted on
++        // TaskAttempt recovery. Check that first.
++        if(containsUpdates) {
++          LOG.info("JobCounterUpdateEvent "
++              + jcue.getCounterUpdates().get(0).getCounterKey()
++              + " " + jcue.getCounterUpdates().get(0).getIncrementValue());
++          if (jcue.getCounterUpdates().get(0).getCounterKey() ==
++              JobCounter.NUM_FAILED_MAPS) {
++            totalFailedMaps += jcue.getCounterUpdates().get(0)
++                .getIncrementValue();
++          } else if (jcue.getCounterUpdates().get(0).getCounterKey() ==
++              JobCounter.TOTAL_LAUNCHED_MAPS) {
++            totalLaunchedMaps += jcue.getCounterUpdates().get(0)
++                .getIncrementValue();
++          }
+         }
++
+       } else if (current instanceof JobTaskEvent) {
+         JobTaskEvent jte = (JobTaskEvent) current;
+         assertEquals(jte.getState(), finalState);
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskAttempt.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskAttempt.java
+index df59991..3ceb07a 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskAttempt.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskAttempt.java
+@@ -33,6 +33,12 @@
+ import java.util.Iterator;
+ import java.util.Map;
+ 
++import org.apache.hadoop.mapreduce.jobhistory.NormalizedResourceEvent;
++import org.apache.hadoop.mapreduce.v2.app.client.ClientService;
++import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocator;
++import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocatorEvent;
++import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
++import org.apache.hadoop.yarn.util.resource.Resources;
+ import org.junit.Assert;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+@@ -41,9 +47,11 @@
+ import org.apache.hadoop.fs.RawLocalFileSystem;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.MapTaskAttemptImpl;
++import org.apache.hadoop.mapreduce.JobID;
+ import org.apache.hadoop.mapreduce.Counters;
+ import org.apache.hadoop.mapreduce.JobCounter;
+ import org.apache.hadoop.mapreduce.MRJobConfig;
++import org.apache.hadoop.mapreduce.TypeConverter;
+ import org.apache.hadoop.mapreduce.jobhistory.JobHistoryEvent;
+ import org.apache.hadoop.mapreduce.jobhistory.TaskAttemptUnsuccessfulCompletion;
+ import org.apache.hadoop.mapreduce.split.JobSplit.TaskSplitMetaInfo;
+@@ -86,6 +94,7 @@
+ import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.Event;
+@@ -254,22 +263,21 @@ public void testHostResolveAttempt() throws Exception {
+ 
+   @Test
+   public void testMillisCountersUpdate() throws Exception {
+-    verifyMillisCounters(2048, 2048, 1024);
+-    verifyMillisCounters(2048, 1024, 1024);
+-    verifyMillisCounters(10240, 1024, 2048);
++    verifyMillisCounters(Resource.newInstance(1024, 1), 512);
++    verifyMillisCounters(Resource.newInstance(2048, 4), 1024);
++    verifyMillisCounters(Resource.newInstance(10240, 8), 2048);
+   }
+ 
+-  public void verifyMillisCounters(int mapMemMb, int reduceMemMb,
++  public void verifyMillisCounters(Resource containerResource,
+       int minContainerSize) throws Exception {
+     Clock actualClock = new SystemClock();
+     ControlledClock clock = new ControlledClock(actualClock);
+     clock.setTime(10);
+     MRApp app =
+         new MRApp(1, 1, false, "testSlotMillisCounterUpdate", true, clock);
++    app.setAllocatedContainerResource(containerResource);
+     Configuration conf = new Configuration();
+-    conf.setInt(MRJobConfig.MAP_MEMORY_MB, mapMemMb);
+-    conf.setInt(MRJobConfig.REDUCE_MEMORY_MB, reduceMemMb);
+-    conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 
++    conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB,
+       minContainerSize);
+     app.setClusterInfo(new ClusterInfo(Resource.newInstance(10240, 1)));
+ 
+@@ -304,21 +312,24 @@ public void verifyMillisCounters(int mapMemMb, int reduceMemMb,
+     Assert.assertEquals(rta.getFinishTime(), 11);
+     Assert.assertEquals(rta.getLaunchTime(), 10);
+     Counters counters = job.getAllCounters();
+-    Assert.assertEquals((int) Math.ceil((float) mapMemMb / minContainerSize),
++
++    int memoryMb = containerResource.getMemory();
++    int vcores = containerResource.getVirtualCores();
++    Assert.assertEquals((int) Math.ceil((float) memoryMb / minContainerSize),
+         counters.findCounter(JobCounter.SLOTS_MILLIS_MAPS).getValue());
+-    Assert.assertEquals((int) Math.ceil((float) reduceMemMb / minContainerSize),
++    Assert.assertEquals((int) Math.ceil((float) memoryMb / minContainerSize),
+         counters.findCounter(JobCounter.SLOTS_MILLIS_REDUCES).getValue());
+     Assert.assertEquals(1,
+         counters.findCounter(JobCounter.MILLIS_MAPS).getValue());
+     Assert.assertEquals(1,
+         counters.findCounter(JobCounter.MILLIS_REDUCES).getValue());
+-    Assert.assertEquals(mapMemMb,
++    Assert.assertEquals(memoryMb,
+         counters.findCounter(JobCounter.MB_MILLIS_MAPS).getValue());
+-    Assert.assertEquals(reduceMemMb,
++    Assert.assertEquals(memoryMb,
+         counters.findCounter(JobCounter.MB_MILLIS_REDUCES).getValue());
+-    Assert.assertEquals(1,
++    Assert.assertEquals(vcores,
+         counters.findCounter(JobCounter.VCORES_MILLIS_MAPS).getValue());
+-    Assert.assertEquals(1,
++    Assert.assertEquals(vcores,
+         counters.findCounter(JobCounter.VCORES_MILLIS_REDUCES).getValue());
+   }
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,190 @@
+From 6827ab24326b8cafbd5794e941ef59e0f77addbc Mon Sep 17 00:00:00 2001
+From: Vinod Kumar Vavilapalli <vinodkv@apache.org>
+Date: Tue, 23 Jun 2015 11:39:55 -0700
+Subject: [PATCH 1355/2848] MAPREDUCE-6410. Fixed MapReduce JobHistory server
+ to use the right (login) UGI to refresh log and
+ cleaner settings. Contributed by Varun Saxena.
+
+(cherry picked from commit d481684c7c9293a94f54ef622a92753531c6acc7)
+
+Change-Id: I0d4e581abd43b27208133266efb1db588eb0f3a9
+---
+ .../mapreduce/v2/hs/server/HSAdminServer.java      |   43 ++++++++++++++-
+ .../mapreduce/v2/hs/server/TestHSAdminServer.java  |   55 ++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/server/HSAdminServer.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/server/HSAdminServer.java
+index ef79bf8..3fef5e2 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/server/HSAdminServer.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/server/HSAdminServer.java
+@@ -20,6 +20,7 @@
+ 
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.security.PrivilegedExceptionAction;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -52,6 +53,7 @@
+ import org.apache.hadoop.mapreduce.v2.hs.proto.HSAdminRefreshProtocolProtos.HSAdminRefreshProtocolService;
+ import org.apache.hadoop.mapreduce.v2.hs.protocolPB.HSAdminRefreshProtocolServerSideTranslatorPB;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.BlockingService;
+ 
+ @Private
+@@ -67,6 +69,8 @@
+   private static final String HISTORY_ADMIN_SERVER = "HSAdminServer";
+   private JobHistory jobHistoryService = null;
+ 
++  private UserGroupInformation loginUGI;
++
+   public HSAdminServer(AggregatedLogDeletionService aggLogDelService,
+       JobHistory jobHistoryService) {
+     super(HSAdminServer.class.getName());
+@@ -125,9 +129,24 @@ public void serviceInit(Configuration conf) throws Exception {
+ 
+   @Override
+   protected void serviceStart() throws Exception {
++    if (UserGroupInformation.isSecurityEnabled()) {
++      loginUGI = UserGroupInformation.getLoginUser();
++    } else {
++      loginUGI = UserGroupInformation.getCurrentUser();
++    }
+     clientRpcServer.start();
+   }
+ 
++  @VisibleForTesting
++  UserGroupInformation getLoginUGI() {
++    return loginUGI;
++  }
++
++  @VisibleForTesting
++  void setLoginUGI(UserGroupInformation ugi) {
++    loginUGI = ugi;
++  }
++
+   @Override
+   protected void serviceStop() throws Exception {
+     if (clientRpcServer != null) {
+@@ -233,7 +252,17 @@ public void refreshLoadedJobCache() throws IOException {
+   public void refreshLogRetentionSettings() throws IOException {
+     UserGroupInformation user = checkAcls("refreshLogRetentionSettings");
+ 
+-    aggLogDelService.refreshLogRetentionSettings();
++    try {
++      loginUGI.doAs(new PrivilegedExceptionAction<Void>() {
++        @Override
++        public Void run() throws IOException {
++          aggLogDelService.refreshLogRetentionSettings();
++          return null;
++        }
++      });
++    } catch (InterruptedException e) {
++      throw new IOException(e);
++    }
+ 
+     HSAuditLogger.logSuccess(user.getShortUserName(),
+         "refreshLogRetentionSettings", "HSAdminServer");
+@@ -243,7 +272,17 @@ public void refreshLogRetentionSettings() throws IOException {
+   public void refreshJobRetentionSettings() throws IOException {
+     UserGroupInformation user = checkAcls("refreshJobRetentionSettings");
+ 
+-    jobHistoryService.refreshJobRetentionSettings();
++    try {
++      loginUGI.doAs(new PrivilegedExceptionAction<Void>() {
++        @Override
++        public Void run() throws IOException {
++          jobHistoryService.refreshJobRetentionSettings();
++          return null;
++        }
++      });
++    } catch (InterruptedException e) {
++      throw new IOException(e);
++    }
+ 
+     HSAuditLogger.logSuccess(user.getShortUserName(),
+         "refreshJobRetentionSettings", HISTORY_ADMIN_SERVER);
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/server/TestHSAdminServer.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/server/TestHSAdminServer.java
+index 7ab90f0..d831347 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/server/TestHSAdminServer.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/server/TestHSAdminServer.java
+@@ -21,6 +21,8 @@
+ import static org.junit.Assert.*;
+ 
+ import java.io.IOException;
++import java.security.PrivilegedAction;
++import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -45,6 +47,9 @@
+ import org.junit.runners.Parameterized;
+ import org.junit.runners.Parameterized.Parameters;
+ 
++import static org.mockito.Mockito.any;
++import static org.mockito.Mockito.reset;
++import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.when;
+ import static org.mockito.Mockito.verify;
+@@ -286,6 +291,56 @@ public void testRefreshJobRetentionSettings() throws Exception {
+     verify(jobHistoryService).refreshJobRetentionSettings();
+   }
+ 
++  @SuppressWarnings("unchecked")
++  @Test
++  public void testUGIForLogAndJobRefresh() throws Exception {
++    UserGroupInformation ugi =
++        UserGroupInformation.createUserForTesting("test", new String[] {"grp"});
++    UserGroupInformation loginUGI = spy(hsAdminServer.getLoginUGI());
++    hsAdminServer.setLoginUGI(loginUGI);
++
++    // Run refresh log retention settings with test user
++    ugi.doAs(new PrivilegedAction<Void>() {
++      @Override
++      public Void run() {
++        String[] args = new String[1];
++        args[0] = "-refreshLogRetentionSettings";
++        try {
++          hsAdminClient.run(args);
++        } catch (Exception e) {
++          fail("refreshLogRetentionSettings should have been successful");
++        }
++        return null;
++      }
++    });
++    // Verify if AggregatedLogDeletionService#refreshLogRetentionSettings was
++    // called with login UGI, instead of the UGI command was run with.
++    verify(loginUGI).doAs(any(PrivilegedExceptionAction.class));
++    verify(alds).refreshLogRetentionSettings();
++
++    // Reset for refresh job retention settings
++    reset(loginUGI);
++
++    // Run refresh job retention settings with test user
++    ugi.doAs(new PrivilegedAction<Void>() {
++      @Override
++      public Void run() {
++        String[] args = new String[1];
++        args[0] = "-refreshJobRetentionSettings";
++        try {
++          hsAdminClient.run(args);
++        } catch (Exception e) {
++          fail("refreshJobRetentionSettings should have been successful");
++        }
++        return null;
++      }
++    });
++    // Verify if JobHistory#refreshJobRetentionSettings was called with
++    // login UGI, instead of the UGI command was run with.
++    verify(loginUGI).doAs(any(PrivilegedExceptionAction.class));
++    verify(jobHistoryService).refreshJobRetentionSettings();
++  }
++
+   @After
+   public void cleanUp() {
+     if (hsAdminServer != null)
+-- 
+1.7.9.5
+

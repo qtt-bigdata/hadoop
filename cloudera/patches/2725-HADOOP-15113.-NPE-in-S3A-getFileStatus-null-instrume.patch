@@ -1,0 +1,379 @@
+From d03b77a724880bce5cd548496eed5589cb452f93 Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Thu, 21 Dec 2017 14:15:53 +0000
+Subject: [PATCH 2725/2848] HADOOP-15113. NPE in S3A getFileStatus: null
+ instrumentation on using closed instance.
+ Contributed by Steve Loughran.
+
+Commit also includes CDH-specific changes for Java 7 to ITestS3AClosedFS.
+
+(cherry picked from commit ef450df443f1dea1c52082cf281f25db7141972f)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+
+Change-Id: I08761027206c460f445594ee3d63ce547f0ef235
+---
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   59 ++++++---
+ .../java/org/apache/hadoop/fs/s3a/S3AUtils.java    |    3 +
+ .../org/apache/hadoop/fs/s3a/ITestS3AClosedFS.java |  133 ++++++++++++++++++++
+ 3 files changed, 180 insertions(+), 15 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AClosedFS.java
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 6affe32..c2fe167 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -161,6 +161,7 @@
+   private static final AtomicBoolean warnedOfCoreThreadDeprecation =
+       new AtomicBoolean(false);
+   private final AtomicBoolean closed = new AtomicBoolean(false);
++  private volatile boolean isClosed = false;
+   private MetadataStore metadataStore;
+   private boolean allowAuthoritative;
+ 
+@@ -587,8 +588,8 @@ protected URI canonicalizeUri(URI rawUri) {
+    */
+   public FSDataInputStream open(Path f, int bufferSize)
+       throws IOException {
+-
+-    LOG.debug("Opening '{}' for reading.", f);
++    checkNotClosed();
++    LOG.debug("Opening '{}' for reading; input policy = {}", f, inputPolicy);
+     final FileStatus fileStatus = getFileStatus(f);
+     if (fileStatus.isDirectory()) {
+       throw new FileNotFoundException("Can't open " + f
+@@ -628,7 +629,9 @@ public FSDataInputStream open(Path f, int bufferSize)
+   public FSDataOutputStream create(Path f, FsPermission permission,
+       boolean overwrite, int bufferSize, short replication, long blockSize,
+       Progressable progress) throws IOException {
+-    String key = pathToKey(f);
++    checkNotClosed();
++    final Path path = qualify(f);
++    String key = pathToKey(path);
+     FileStatus status = null;
+     try {
+       // get the status or throw an FNFE
+@@ -767,7 +770,7 @@ private boolean innerRename(Path source, Path dest)
+     Path dst = qualify(dest);
+ 
+     LOG.debug("Rename path {} to {}", src, dst);
+-    incrementStatistic(INVOCATION_RENAME);
++    entryPoint(INVOCATION_RENAME);
+ 
+     String srcKey = pathToKey(src);
+     String dstKey = pathToKey(dst);
+@@ -985,6 +988,17 @@ void setMetadataStore(MetadataStore ms) {
+   }
+ 
+   /**
++   * Entry point to an operation.
++   * Increments the statistic; verifies the FS is active.
++   * @param operation The operation to increment
++   * @throws IOException if the
++   */
++  protected void entryPoint(Statistic operation) throws IOException {
++    checkNotClosed();
++    incrementStatistic(operation);
++  }
++
++  /**
+    * Increment a statistic by 1.
+    * @param statistic The operation to increment
+    */
+@@ -1393,6 +1407,7 @@ void removeKeys(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+    */
+   public boolean delete(Path f, boolean recursive) throws IOException {
+     try {
++      checkNotClosed();
+       return innerDelete(innerGetFileStatus(f, true), recursive);
+     } catch (FileNotFoundException e) {
+       LOG.debug("Couldn't delete {} - does not exist", f);
+@@ -1558,7 +1573,7 @@ private void createFakeDirectoryIfNecessary(Path f)
+     Path path = qualify(f);
+     String key = pathToKey(path);
+     LOG.debug("List status for path: {}", path);
+-    incrementStatistic(INVOCATION_LIST_STATUS);
++    entryPoint(INVOCATION_LIST_STATUS);
+ 
+     List<FileStatus> result;
+     final FileStatus fileStatus =  getFileStatus(path);
+@@ -1716,7 +1731,8 @@ private boolean innerMkdirs(Path p, FsPermission permission)
+     boolean createOnS3 = false;
+     Path f = qualify(p);
+     LOG.debug("Making directory: {}", f);
+-    incrementStatistic(INVOCATION_MKDIRS);
++    entryPoint(INVOCATION_MKDIRS);
++    FileStatus fileStatus;
+     List<Path> metadataStoreDirs = null;
+     if (hasMetadataStore()) {
+       metadataStoreDirs = new ArrayList<>();
+@@ -1794,7 +1810,7 @@ public FileStatus getFileStatus(final Path f) throws IOException {
+   @VisibleForTesting
+   S3AFileStatus innerGetFileStatus(final Path f,
+       boolean needEmptyDirectoryFlag) throws IOException {
+-    incrementStatistic(INVOCATION_GET_FILE_STATUS);
++    entryPoint(INVOCATION_GET_FILE_STATUS);
+     final Path path = qualify(f);
+     String key = pathToKey(path);
+     LOG.debug("Getting path status for {}  ({})", path, key);
+@@ -2049,12 +2065,12 @@ public void copyFromLocalFile(boolean delSrc, boolean overwrite, Path src,
+   private void innerCopyFromLocalFile(boolean delSrc, boolean overwrite,
+       Path src, Path dst)
+       throws IOException, FileAlreadyExistsException, AmazonClientException {
+-    incrementStatistic(INVOCATION_COPY_FROM_LOCAL_FILE);
+     final String key = pathToKey(dst);
+ 
+     if (!overwrite && exists(dst)) {
+       throw new FileAlreadyExistsException(dst + " already exists");
+     }
++    entryPoint(INVOCATION_COPY_FROM_LOCAL_FILE);
+     LOG.debug("Copying local file from {} to {}", src, dst);
+ 
+     // Since we have a local file, we don't need to stream into a temporary file
+@@ -2094,6 +2110,8 @@ public void close() throws IOException {
+       // already closed
+       return;
+     }
++    isClosed = true;
++    LOG.debug("Filesystem {} is closed", uri);
+     try {
+       super.close();
+     } finally {
+@@ -2111,6 +2129,17 @@ public void close() throws IOException {
+   }
+ 
+   /**
++   * Verify that the input stream is open. Non blocking; this gives
++   * the last state of the volatile {@link #closed} field.
++   * @throws IOException if the connection is closed.
++   */
++  private void checkNotClosed() throws IOException {
++    if (isClosed) {
++      throw new IOException(uri + ": " + E_FS_CLOSED);
++    }
++  }
++
++  /**
+    * Override getCanonicalServiceName because we don't support token in S3A.
+    */
+   @Override
+@@ -2474,7 +2503,7 @@ int getMaxKeys() {
+    */
+   @Override
+   public FileStatus[] globStatus(Path pathPattern) throws IOException {
+-    incrementStatistic(INVOCATION_GLOB_STATUS);
++    entryPoint(INVOCATION_GLOB_STATUS);
+     return super.globStatus(pathPattern);
+   }
+ 
+@@ -2485,7 +2514,7 @@ int getMaxKeys() {
+   @Override
+   public FileStatus[] globStatus(Path pathPattern, PathFilter filter)
+       throws IOException {
+-    incrementStatistic(INVOCATION_GLOB_STATUS);
++    entryPoint(INVOCATION_GLOB_STATUS);
+     return super.globStatus(pathPattern, filter);
+   }
+ 
+@@ -2495,7 +2524,7 @@ int getMaxKeys() {
+    */
+   @Override
+   public boolean exists(Path f) throws IOException {
+-    incrementStatistic(INVOCATION_EXISTS);
++    entryPoint(INVOCATION_EXISTS);
+     return super.exists(f);
+   }
+ 
+@@ -2505,7 +2534,7 @@ public boolean exists(Path f) throws IOException {
+    */
+   @Override
+   public boolean isDirectory(Path f) throws IOException {
+-    incrementStatistic(INVOCATION_IS_DIRECTORY);
++    entryPoint(INVOCATION_IS_DIRECTORY);
+     return super.isDirectory(f);
+   }
+ 
+@@ -2515,7 +2544,7 @@ public boolean isDirectory(Path f) throws IOException {
+    */
+   @Override
+   public boolean isFile(Path f) throws IOException {
+-    incrementStatistic(INVOCATION_IS_FILE);
++    entryPoint(INVOCATION_IS_FILE);
+     return super.isFile(f);
+   }
+ 
+@@ -2560,7 +2589,7 @@ public boolean isFile(Path f) throws IOException {
+ 
+   private RemoteIterator<LocatedFileStatus> innerListFiles(Path f, boolean
+       recursive, Listing.FileStatusAcceptor acceptor) throws IOException {
+-    incrementStatistic(INVOCATION_LIST_FILES);
++    entryPoint(INVOCATION_LIST_FILES);
+     Path path = qualify(f);
+     LOG.debug("listFiles({}, {})", path, recursive);
+     try {
+@@ -2644,7 +2673,7 @@ public boolean isFile(Path f) throws IOException {
+   public RemoteIterator<LocatedFileStatus> listLocatedStatus(final Path f,
+       final PathFilter filter)
+       throws FileNotFoundException, IOException {
+-    incrementStatistic(INVOCATION_LIST_LOCATED_STATUS);
++    entryPoint(INVOCATION_LIST_LOCATED_STATUS);
+     Path path = qualify(f);
+     LOG.debug("listLocatedStatus({}, {}", path, filter);
+     try {
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+index d25722f..7734f5f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+@@ -74,6 +74,9 @@
+       "is abstract and therefore cannot be created";
+   static final String ENDPOINT_KEY = "Endpoint";
+ 
++  /** Filesystem is closed; kept here to keep the errors close. */
++  static final String E_FS_CLOSED = "FileSystem is closed!";
++
+   /**
+    * Core property for provider path. Duplicated here for consistent
+    * code across Hadoop version: {@value}.
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AClosedFS.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AClosedFS.java
+new file mode 100644
+index 0000000..dd38317
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AClosedFS.java
+@@ -0,0 +1,133 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import java.io.IOException;
++
++import org.junit.Test;
++
++import org.apache.hadoop.fs.Path;
++
++import static org.apache.hadoop.fs.s3a.S3AUtils.E_FS_CLOSED;
++
++/**
++ * Tests of the S3A FileSystem which is closed; just make sure
++ * that that basic file Ops fail meaningfully.
++ */
++public class ITestS3AClosedFS extends AbstractS3ATestBase {
++
++  private Path root = new Path("/");
++
++  @Override
++  public void setup() throws Exception {
++    super.setup();
++    root = getFileSystem().makeQualified(new Path("/"));
++    getFileSystem().close();
++  }
++
++  @Override
++  public void teardown()  {
++    // no op, as the FS is closed
++  }
++
++  @Test
++  public void testClosedGetFileStatus() throws Exception {
++    try {
++      getFileSystem().getFileStatus(root);
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedListStatus() throws Exception {
++    try {
++      getFileSystem().listStatus(root);
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedListFile() throws Exception {
++    try {
++      getFileSystem().listFiles(root, false);
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedListLocatedStatus() throws Exception {
++    try {
++      getFileSystem().listLocatedStatus(root);
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedCreate() throws Exception {
++    try {
++      getFileSystem().create(path("to-create")).close();
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedDelete() throws Exception {
++    try {
++      getFileSystem().delete(path("to-delete"), false);
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++  @Test
++  public void testClosedOpen() throws Exception {
++    try {
++      getFileSystem().open(path("to-open"));
++    } catch (IOException e) {
++      assertTrue("Exception did not contain expected text",
++          e.getMessage().contains(E_FS_CLOSED));
++      return;
++    }
++    fail("Expected exception was not thrown");
++  }
++
++}
+-- 
+1.7.9.5
+

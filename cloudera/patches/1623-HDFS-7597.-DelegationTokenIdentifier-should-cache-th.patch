@@ -1,0 +1,183 @@
+From 65ed2edecd5be9e1b1fb81984c9148fd529de7a1 Mon Sep 17 00:00:00 2001
+From: Akira Ajisaka <aajisaka@apache.org>
+Date: Wed, 22 Jun 2016 11:00:16 +0900
+Subject: [PATCH 1623/2848] HDFS-7597. DelegationTokenIdentifier should cache
+ the TokenIdentifier to UGI mapping. Contributed
+ by Daryn Sharp, Bob Hansen, and Xiao Chen.
+
+(cherry picked from commit d433b16ce6d74f1a44bc29446c74b1cb5f8a10fa)
+(cherry picked from commit ad50a64ded1ba0c32d7bc89e5100f3b4d86a790c)
+(cherry picked from commit 700dacf8c4e81fb33f4c3e695eeb34878a058da0)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenIdentifier.java
+
+Change-Id: I0b6a491930a02b49e410241ac80d9eaa4d07ebb7
+---
+ .../delegation/DelegationTokenIdentifier.java      |   26 ++++++++++++++++
+ .../datanode/web/webhdfs/DataNodeUGIProvider.java  |    7 +++++
+ .../hadoop/hdfs/security/TestDelegationToken.java  |   31 +++++++++++++++++++-
+ .../hadoop/hdfs/server/common/TestJspHelper.java   |    8 ++++-
+ .../web/webhdfs/TestDataNodeUGIProvider.java       |    1 +
+ 5 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenIdentifier.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenIdentifier.java
+index b7e1bc7..efd548d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenIdentifier.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenIdentifier.java
+@@ -21,14 +21,21 @@
+ import java.io.ByteArrayInputStream;
+ import java.io.DataInputStream;
+ import java.io.IOException;
++import java.util.Collections;
++import java.util.Map;
+ 
++import org.apache.commons.collections.map.LRUMap;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.hdfs.web.SWebHdfsFileSystem;
+ import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
+ import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ /**
+  * A delegation token identifier that is specific to HDFS.
+  */
+@@ -37,6 +44,15 @@
+     extends AbstractDelegationTokenIdentifier {
+   public static final Text HDFS_DELEGATION_KIND = new Text("HDFS_DELEGATION_TOKEN");
+ 
++  @SuppressWarnings("unchecked")
++  private static Map<TokenIdentifier, UserGroupInformation> ugiCache =
++      Collections.synchronizedMap(new LRUMap(64));
++
++  @VisibleForTesting
++  public void clearCache() {
++    ugiCache.clear();
++  }
++
+   /**
+    * Create an empty delegation token identifier for reading into.
+    */
+@@ -59,6 +75,16 @@ public Text getKind() {
+   }
+ 
+   @Override
++  public UserGroupInformation getUser() {
++    UserGroupInformation ugi = ugiCache.get(this);
++    if (ugi == null) {
++      ugi = super.getUser();
++      ugiCache.put(this, ugi);
++    }
++    return ugi;
++  }
++
++  @Override
+   public String toString() {
+     StringBuilder sbld = new StringBuilder();
+     sbld
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+index 233ba69..fa6f676 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+@@ -61,6 +61,13 @@ public static synchronized void init(Configuration conf) {
+     }
+   }
+ 
++  @VisibleForTesting
++  void clearCache() throws IOException {
++    if (UserGroupInformation.isSecurityEnabled()) {
++      params.delegationToken().decodeIdentifier().clearCache();
++    }
++  }
++
+   UserGroupInformation ugi() throws IOException {
+     UserGroupInformation ugi;
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/TestDelegationToken.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/TestDelegationToken.java
+index b3079ab..2c5a36e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/TestDelegationToken.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/TestDelegationToken.java
+@@ -239,7 +239,36 @@ public Object run() throws IOException {
+       }
+     });
+   }
+-  
++
++  @Test
++  public void testDelegationTokenUgi() throws Exception {
++    final DistributedFileSystem dfs = cluster.getFileSystem();
++    Token<?>[] tokens = dfs.addDelegationTokens("renewer", null);
++    Assert.assertEquals(1, tokens.length);
++    Token<?> token1 = tokens[0];
++    DelegationTokenIdentifier ident =
++        (DelegationTokenIdentifier) token1.decodeIdentifier();
++    UserGroupInformation expectedUgi = ident.getUser();
++
++    // get 2 new instances (clones) of the identifier, query their ugi
++    // twice each, all ugi instances should be equivalent
++    for (int i=0; i<2; i++) {
++      DelegationTokenIdentifier identClone =
++          (DelegationTokenIdentifier)token1.decodeIdentifier();
++      Assert.assertEquals(ident, identClone);
++      Assert.assertNotSame(ident, identClone);
++      Assert.assertSame(expectedUgi, identClone.getUser());
++      Assert.assertSame(expectedUgi, identClone.getUser());
++    }
++
++    // a new token must decode to a different ugi instance than the first token
++    tokens = dfs.addDelegationTokens("renewer", null);
++    Assert.assertEquals(1, tokens.length);
++    Token<?> token2 = tokens[0];
++    Assert.assertNotEquals(token1, token2);
++    Assert.assertNotSame(expectedUgi, token2.decodeIdentifier().getUser());
++  }
++
+   /**
+    * Test that the delegation token secret manager only runs when the
+    * NN is out of safe mode. This is because the secret manager
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+index 229879a..66c4df3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+@@ -133,6 +133,7 @@ public void testGetUgi() throws IOException {
+     
+     //Test attribute name.node.address 
+     //Set the nnaddr url parameter to null.
++    token.decodeIdentifier().clearCache();
+     when(request.getParameter(JspHelper.NAMENODE_ADDRESS)).thenReturn(null);
+     InetSocketAddress addr = new InetSocketAddress("localhost", 2222);
+     when(context.getAttribute(NameNodeHttpServer.NAMENODE_ADDRESS_ATTRIBUTE_KEY))
+@@ -140,7 +141,12 @@ public void testGetUgi() throws IOException {
+     verifyServiceInToken(context, request, addr.getAddress().getHostAddress()
+         + ":2222");
+     
+-    //Test service already set in the token
++    //Test service already set in the token and DN doesn't change service
++    //when it doesn't know the NN service addr
++    userText = new Text(user+"2");
++    dtId = new DelegationTokenIdentifier(userText, userText, null);
++    token = new Token<DelegationTokenIdentifier>(
++        dtId, new DummySecretManager(0, 0, 0, 0));
+     token.setService(new Text("3.3.3.3:3333"));
+     tokenString = token.encodeToUrlString();
+     //Set the name.node.address attribute in Servlet context to null
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+index ad7eb09..fc22d92 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+@@ -121,6 +121,7 @@ public void testUGICacheSecure() throws Exception {
+         "With UGI cache, two UGIs for the different token should not be same",
+         ugi11, url22);
+ 
++    ugiProvider2.clearCache();
+     awaitCacheEmptyDueToExpiration();
+     ugi12 = ugiProvider1.ugi();
+     url22 = ugiProvider2.ugi();
+-- 
+1.7.9.5
+

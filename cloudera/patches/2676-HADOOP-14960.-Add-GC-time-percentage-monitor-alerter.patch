@@ -1,0 +1,479 @@
+From e1bce88ab4fd39ea144ca56acd13054590509a51 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 9 Nov 2017 21:05:34 -0800
+Subject: [PATCH 2676/2848] HADOOP-14960. Add GC time percentage
+ monitor/alerter. Contributed by Misha Dmitriev.
+
+(cherry picked from commit 3c6adda291745c592741b87cd613214ae11887e4)
+(cherry picked from commit 39fb402da41b79ab000c1509dd7a375ff1503277)
+
+Change-Id: Id0450a2458afbdf3e9b90d254651cc9fb8165417
+---
+ .../apache/hadoop/metrics2/source/JvmMetrics.java  |   15 ++
+ .../hadoop/metrics2/source/JvmMetricsInfo.java     |    3 +-
+ .../java/org/apache/hadoop/util/GcTimeMonitor.java |  242 ++++++++++++++++++++
+ .../hadoop/metrics2/source/TestJvmMetrics.java     |   92 +++++++-
+ 4 files changed, 345 insertions(+), 7 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
+index e18f46d..31eb7c7 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetrics.java
+@@ -28,6 +28,8 @@
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
++
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.log.metrics.EventCounter;
+ import org.apache.hadoop.metrics2.MetricsCollector;
+@@ -39,6 +41,8 @@
+ import org.apache.hadoop.metrics2.lib.Interns;
+ import static org.apache.hadoop.metrics2.source.JvmMetricsInfo.*;
+ import static org.apache.hadoop.metrics2.impl.MsInfo.*;
++
++import org.apache.hadoop.util.GcTimeMonitor;
+ import org.apache.hadoop.util.JvmPauseMonitor;
+ 
+ /**
+@@ -76,6 +80,7 @@ synchronized void shutdown() {
+   private JvmPauseMonitor pauseMonitor = null;
+   final ConcurrentHashMap<String, MetricsInfo[]> gcInfoCache =
+       new ConcurrentHashMap<String, MetricsInfo[]>();
++  private GcTimeMonitor gcTimeMonitor = null;
+ 
+   @VisibleForTesting
+   JvmMetrics(String processName, String sessionId) {
+@@ -87,6 +92,11 @@ public void setPauseMonitor(final JvmPauseMonitor pauseMonitor) {
+     this.pauseMonitor = pauseMonitor;
+   }
+ 
++  public void setGcTimeMonitor(GcTimeMonitor gcTimeMonitor) {
++    Preconditions.checkNotNull(gcTimeMonitor);
++    this.gcTimeMonitor = gcTimeMonitor;
++  }
++
+   public static JvmMetrics create(String processName, String sessionId,
+                                   MetricsSystem ms) {
+     return ms.register(JvmMetrics.name(), JvmMetrics.description(),
+@@ -163,6 +173,11 @@ private void getGcUsage(MetricsRecordBuilder rb) {
+       rb.addCounter(GcTotalExtraSleepTime,
+           pauseMonitor.getTotalGcExtraSleepTime());
+     }
++
++    if (gcTimeMonitor != null) {
++      rb.addCounter(GcTimePercentage,
++          gcTimeMonitor.getLatestGcData().getGcTimePercentage());
++    }
+   }
+ 
+   private MetricsInfo[] getGcInfo(String gcName) {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetricsInfo.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetricsInfo.java
+index 55bb417..010ff64 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetricsInfo.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/source/JvmMetricsInfo.java
+@@ -51,7 +51,8 @@
+   LogInfo("Total number of info log events"),
+   GcNumWarnThresholdExceeded("Number of times that the GC warn threshold is exceeded"),
+   GcNumInfoThresholdExceeded("Number of times that the GC info threshold is exceeded"),
+-  GcTotalExtraSleepTime("Total GC extra sleep time in milliseconds");
++  GcTotalExtraSleepTime("Total GC extra sleep time in milliseconds"),
++  GcTimePercentage("Percentage of time the JVM was paused in GC");
+ 
+   private final String desc;
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
+new file mode 100644
+index 0000000..0640fc0
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/GcTimeMonitor.java
+@@ -0,0 +1,242 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import com.google.common.base.Preconditions;
++
++import java.lang.management.GarbageCollectorMXBean;
++import java.lang.management.ManagementFactory;
++import java.util.List;
++
++/**
++ * This class monitors the percentage of time the JVM is paused in GC within
++ * the specified observation window, say 1 minute. The user can provide a
++ * hook which will be called whenever this percentage exceeds the specified
++ * threshold.
++ */
++public class GcTimeMonitor extends Thread {
++
++  private final long maxGcTimePercentage;
++  private final long observationWindowMs, sleepIntervalMs;
++  private final GcTimeAlertHandler alertHandler;
++
++  private final List<GarbageCollectorMXBean> gcBeans =
++      ManagementFactory.getGarbageCollectorMXBeans();
++  // Ring buffers containing GC timings and timestamps when timings were taken
++  private final TsAndData[] gcDataBuf;
++  private int bufSize, startIdx, endIdx;
++
++  private long startTime;
++  private final GcData curData = new GcData();
++  private volatile boolean shouldRun = true;
++
++  /**
++   * Create an instance of GCTimeMonitor. Once it's started, it will stay alive
++   * and monitor GC time percentage until shutdown() is called. If you don't
++   * put a limit on the number of GCTimeMonitor instances that you create, and
++   * alertHandler != null, you should necessarily call shutdown() once the given
++   * instance is not needed. Otherwise, you may create a memory leak, because
++   * each running GCTimeMonitor will keep its alertHandler object in memory,
++   * which in turn may reference and keep in memory many more other objects.
++   *
++   * @param observationWindowMs the interval over which the percentage
++   *   of GC time should be calculated. A practical value would be somewhere
++   *   between 30 sec and several minutes.
++   * @param sleepIntervalMs how frequently this thread should wake up to check
++   *   GC timings. This is also a frequency with which alertHandler will be
++   *   invoked if GC time percentage exceeds the specified limit. A practical
++   *   value would likely be 500..1000 ms.
++   * @param maxGcTimePercentage A GC time percentage limit (0..100) within
++   *   observationWindowMs. Once this is exceeded, alertHandler will be
++   *   invoked every sleepIntervalMs milliseconds until GC time percentage
++   *   falls below this limit.
++   * @param alertHandler a single method in this interface is invoked when GC
++   *   time percentage exceeds the specified limit.
++   */
++  public GcTimeMonitor(long observationWindowMs, long sleepIntervalMs,
++      int maxGcTimePercentage, GcTimeAlertHandler alertHandler) {
++    Preconditions.checkArgument(observationWindowMs > 0);
++    Preconditions.checkArgument(
++        sleepIntervalMs > 0 && sleepIntervalMs < observationWindowMs);
++    Preconditions.checkArgument(
++        maxGcTimePercentage >= 0 && maxGcTimePercentage <= 100);
++
++    this.observationWindowMs = observationWindowMs;
++    this.sleepIntervalMs = sleepIntervalMs;
++    this.maxGcTimePercentage = maxGcTimePercentage;
++    this.alertHandler = alertHandler;
++
++    bufSize = (int) (observationWindowMs / sleepIntervalMs + 2);
++    // Prevent the user from accidentally creating an abnormally big buffer,
++    // which will result in slow calculations and likely inaccuracy.
++    Preconditions.checkArgument(bufSize <= 128 * 1024);
++    gcDataBuf = new TsAndData[bufSize];
++    for (int i = 0; i < bufSize; i++) {
++      gcDataBuf[i] = new TsAndData();
++    }
++
++    this.setDaemon(true);
++    this.setName("GcTimeMonitor obsWindow = " + observationWindowMs +
++        ", sleepInterval = " + sleepIntervalMs +
++        ", maxGcTimePerc = " + maxGcTimePercentage);
++  }
++
++  @Override
++  public void run() {
++    startTime = System.currentTimeMillis();
++    curData.timestamp = startTime;
++    gcDataBuf[startIdx].setValues(startTime, 0);
++
++    while (shouldRun) {
++      try {
++        Thread.sleep(sleepIntervalMs);
++      } catch (InterruptedException ie) {
++        return;
++      }
++
++      calculateGCTimePercentageWithinObservedInterval();
++      if (alertHandler != null &&
++          curData.gcTimePercentage > maxGcTimePercentage) {
++        alertHandler.alert(curData.clone());
++      }
++    }
++  }
++
++  public void shutdown() {
++    shouldRun = false;
++  }
++
++  /** Returns a copy of the most recent data measured by this monitor. */
++  public GcData getLatestGcData() {
++    return curData.clone();
++  }
++
++  private void calculateGCTimePercentageWithinObservedInterval() {
++    long prevTotalGcTime = curData.totalGcTime;
++    long totalGcTime = 0;
++    long totalGcCount = 0;
++    for (GarbageCollectorMXBean gcBean : gcBeans) {
++      totalGcTime += gcBean.getCollectionTime();
++      totalGcCount += gcBean.getCollectionCount();
++    }
++    long gcTimeWithinSleepInterval = totalGcTime - prevTotalGcTime;
++
++    long ts = System.currentTimeMillis();
++    long gcMonitorRunTime = ts - startTime;
++
++    endIdx = (endIdx + 1) % bufSize;
++    gcDataBuf[endIdx].setValues(ts, gcTimeWithinSleepInterval);
++
++    // Move startIdx forward until we reach the first buffer entry with
++    // timestamp within the observation window.
++    long startObsWindowTs = ts - observationWindowMs;
++    while (gcDataBuf[startIdx].ts < startObsWindowTs && startIdx != endIdx) {
++      startIdx = (startIdx + 1) % bufSize;
++    }
++
++    // Calculate total GC time within observationWindowMs.
++    // We should be careful about GC time that passed before the first timestamp
++    // in our observation window.
++    long gcTimeWithinObservationWindow = Math.min(
++        gcDataBuf[startIdx].gcPause, gcDataBuf[startIdx].ts - startObsWindowTs);
++    if (startIdx != endIdx) {
++      for (int i = (startIdx + 1) % bufSize; i != endIdx;
++           i = (i + 1) % bufSize) {
++        gcTimeWithinObservationWindow += gcDataBuf[i].gcPause;
++      }
++    }
++
++    curData.update(ts, gcMonitorRunTime, totalGcTime, totalGcCount,
++        (int) (gcTimeWithinObservationWindow * 100 /
++          Math.min(observationWindowMs, gcMonitorRunTime)));
++  }
++
++  /**
++   * The user can provide an instance of a class implementing this interface
++   * when initializing a GcTimeMonitor to receive alerts when GC time
++   * percentage exceeds the specified threshold.
++   */
++  public interface GcTimeAlertHandler {
++    void alert(GcData gcData);
++  }
++
++  /** Encapsulates data about GC pauses measured at the specific timestamp. */
++  public static class GcData implements Cloneable {
++    private long timestamp;
++    private long gcMonitorRunTime, totalGcTime, totalGcCount;
++    private int gcTimePercentage;
++
++    /** Returns the absolute timestamp when this measurement was taken. */
++    public long getTimestamp() {
++      return timestamp;
++    }
++
++    /** Returns the time since the start of the associated GcTimeMonitor. */
++    public long getGcMonitorRunTime() {
++      return gcMonitorRunTime;
++    }
++
++    /** Returns accumulated GC time since this JVM started. */
++    public long getAccumulatedGcTime() {
++      return totalGcTime;
++    }
++
++    /** Returns the accumulated number of GC pauses since this JVM started. */
++    public long getAccumulatedGcCount() {
++      return totalGcCount;
++    }
++
++    /**
++     * Returns the percentage (0..100) of time that the JVM spent in GC pauses
++     * within the observation window of the associated GcTimeMonitor.
++     */
++    public int getGcTimePercentage() {
++      return gcTimePercentage;
++    }
++
++    private synchronized void update(long inTimestamp, long inGcMonitorRunTime,
++        long inTotalGcTime, long inTotalGcCount, int inGcTimePercentage) {
++      this.timestamp = inTimestamp;
++      this.gcMonitorRunTime = inGcMonitorRunTime;
++      this.totalGcTime = inTotalGcTime;
++      this.totalGcCount = inTotalGcCount;
++      this.gcTimePercentage = inGcTimePercentage;
++    }
++
++    @Override
++    public synchronized GcData clone() {
++      try {
++        return (GcData) super.clone();
++      } catch (CloneNotSupportedException e) {
++        throw new RuntimeException(e);
++      }
++    }
++  }
++
++  private static class TsAndData {
++    private long ts;      // Timestamp when this measurement was taken
++    private long gcPause; // Total GC pause time within the interval between ts
++                          // and the timestamp of the previous measurement.
++
++    void setValues(long inTs, long inGcPause) {
++      this.ts = inTs;
++      this.gcPause = inGcPause;
++    }
++  }
++}
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
+index 69e7565..5320b6e 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/source/TestJvmMetrics.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.metrics2.source;
+ 
++import org.apache.hadoop.util.GcTimeMonitor;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Rule;
+@@ -35,6 +36,9 @@
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.JvmPauseMonitor;
+ 
++import java.util.ArrayList;
++import java.util.List;
++
+ import static org.apache.hadoop.metrics2.source.JvmMetricsInfo.*;
+ import static org.apache.hadoop.metrics2.impl.MsInfo.*;
+ 
+@@ -43,17 +47,21 @@
+   @Rule
+   public Timeout timeout = new Timeout(30000);
+   private JvmPauseMonitor pauseMonitor;
++  private GcTimeMonitor gcTimeMonitor;
+ 
+   /**
+-   * Robust shutdown of the pause monitor if it hasn't been stopped already.
++   * Robust shutdown of the monitors if they haven't been stopped already.
+    */
+   @After
+   public void teardown() {
+     ServiceOperations.stop(pauseMonitor);
++    if (gcTimeMonitor != null) {
++      gcTimeMonitor.shutdown();
++    }
+   }
+ 
+   @Test
+-  public void testPresence() {
++  public void testJvmPauseMonitorPresence() {
+     pauseMonitor = new JvmPauseMonitor();
+     pauseMonitor.init(new Configuration());
+     pauseMonitor.start();
+@@ -66,14 +74,35 @@ public void testPresence() {
+     verify(rb).tag(ProcessName, "test");
+     verify(rb).tag(SessionId, "test");
+     for (JvmMetricsInfo info : JvmMetricsInfo.values()) {
+-      if (info.name().startsWith("Mem"))
++      if (info.name().startsWith("Mem")) {
+         verify(rb).addGauge(eq(info), anyFloat());
+-      else if (info.name().startsWith("Gc"))
++      } else if (info.name().startsWith("Gc") &&
++          !info.name().equals("GcTimePercentage")) {
+         verify(rb).addCounter(eq(info), anyLong());
+-      else if (info.name().startsWith("Threads"))
++      } else if (info.name().startsWith("Threads")) {
+         verify(rb).addGauge(eq(info), anyInt());
+-      else if (info.name().startsWith("Log"))
++      } else if (info.name().startsWith("Log")) {
+         verify(rb).addCounter(eq(info), anyLong());
++      }
++    }
++  }
++
++  @Test
++  public void testGcTimeMonitorPresence() {
++    gcTimeMonitor = new GcTimeMonitor(60000, 1000, 70, null);
++    gcTimeMonitor.start();
++    JvmMetrics jvmMetrics = new JvmMetrics("test", "test");
++    jvmMetrics.setGcTimeMonitor(gcTimeMonitor);
++    MetricsRecordBuilder rb = getMetrics(jvmMetrics);
++    MetricsCollector mc = rb.parent();
++
++    verify(mc).addRecord(JvmMetrics);
++    verify(rb).tag(ProcessName, "test");
++    verify(rb).tag(SessionId, "test");
++    for (JvmMetricsInfo info : JvmMetricsInfo.values()) {
++      if (info.name().equals("GcTimePercentage")) {
++        verify(rb).addCounter(eq(info), anyInt());
++      }
+     }
+   }
+ 
+@@ -120,4 +149,55 @@ public void testStopBeforeInit() throws Throwable {
+     }
+   }
+ 
++  @Test
++  public void testGcTimeMonitor() {
++    class Alerter implements GcTimeMonitor.GcTimeAlertHandler {
++      private volatile int numAlerts;
++      private volatile int maxGcTimePercentage;
++      @Override
++      public void alert(GcTimeMonitor.GcData gcData) {
++        numAlerts++;
++        if (gcData.getGcTimePercentage() > maxGcTimePercentage) {
++          maxGcTimePercentage = gcData.getGcTimePercentage();
++        }
++      }
++    }
++    Alerter alerter = new Alerter();
++
++    int alertGcPerc = 10;  // Alerter should be called if GC takes >= 10%
++    gcTimeMonitor = new GcTimeMonitor(60*1000, 100, alertGcPerc, alerter);
++    gcTimeMonitor.start();
++
++    int maxGcTimePercentage = 0;
++    long gcCount = 0;
++
++    // Generate a lot of garbage for some time and verify that the monitor
++    // reports at least some percentage of time in GC pauses, and that the
++    // alerter is invoked at least once.
++
++    List<String> garbageStrings = new ArrayList<>();
++
++    long startTime = System.currentTimeMillis();
++    // Run this for at least 1 sec for our monitor to collect enough data
++    while (System.currentTimeMillis() - startTime < 1000) {
++      for (int j = 0; j < 100000; j++) {
++        garbageStrings.add(
++            "Long string prefix just to fill memory with garbage " + j);
++      }
++      garbageStrings.clear();
++      System.gc();
++
++      GcTimeMonitor.GcData gcData = gcTimeMonitor.getLatestGcData();
++      int gcTimePercentage = gcData.getGcTimePercentage();
++      if (gcTimePercentage > maxGcTimePercentage) {
++        maxGcTimePercentage = gcTimePercentage;
++      }
++      gcCount = gcData.getAccumulatedGcCount();
++    }
++
++    Assert.assertTrue(maxGcTimePercentage > 0);
++    Assert.assertTrue(gcCount > 0);
++    Assert.assertTrue(alerter.numAlerts > 0);
++    Assert.assertTrue(alerter.maxGcTimePercentage >= alertGcPerc);
++  }
+ }
+-- 
+1.7.9.5
+

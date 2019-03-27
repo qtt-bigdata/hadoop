@@ -1,0 +1,379 @@
+From 219abdb49a72960c8e2f6c4691f0c63164d0d23b Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Thu, 4 Aug 2016 10:45:55 -0500
+Subject: [PATCH 1907/2848] HADOOP-13442. Optimize UGI group lookups.
+ Contributed by Daryn Sharp.
+
+(cherry picked from commit 94225152399e6e89fa7b4cff6d17d33e544329a3)
+
+HDFS-10738. Fix TestRefreshUserMappings.testRefreshSuperUserGroupsConfiguration test failure. Contributed by Rakesh R.
+
+(cherry picked from commit 0f701f433dd3be233bf53e856864c82349e8274e)
+
+Change-Id: Ide5a759781058dd847f5e0bac1c3a14eaedf0bbb
+---
+ .../main/java/org/apache/hadoop/fs/FileSystem.java |    4 +--
+ .../apache/hadoop/fs/viewfs/ViewFileSystem.java    |    6 ++---
+ .../java/org/apache/hadoop/fs/viewfs/ViewFs.java   |   12 ++++-----
+ .../java/org/apache/hadoop/io/SecureIOUtils.java   |    3 +--
+ .../java/org/apache/hadoop/security/Groups.java    |   24 ++++++++++++-----
+ .../hadoop/security/UserGroupInformation.java      |   28 +++++++++++++-------
+ .../security/authorize/AccessControlList.java      |    2 +-
+ .../hadoop/security/TestUserGroupInformation.java  |    6 +++--
+ .../hadoop/security/TestRefreshUserMappings.java   |   20 ++++++++------
+ 9 files changed, 64 insertions(+), 41 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+index 0a292ff..80f9a18 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+@@ -26,7 +26,6 @@
+ import java.net.URISyntaxException;
+ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.EnumSet;
+ import java.util.HashMap;
+@@ -2168,12 +2167,11 @@ static void checkAccessPermissions(FileStatus stat, FsAction mode)
+     FsPermission perm = stat.getPermission();
+     UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+     String user = ugi.getShortUserName();
+-    List<String> groups = Arrays.asList(ugi.getGroupNames());
+     if (user.equals(stat.getOwner())) {
+       if (perm.getUserAction().implies(mode)) {
+         return;
+       }
+-    } else if (groups.contains(stat.getGroup())) {
++    } else if (ugi.getGroups().contains(stat.getGroup())) {
+       if (perm.getGroupAction().implies(mode)) {
+         return;
+       }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index 963289f..0da1784 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -769,7 +769,7 @@ public FileChecksum getFileChecksum(final Path f)
+     public FileStatus getFileStatus(Path f) throws IOException {
+       checkPathIsSlash(f);
+       return new FileStatus(0, true, 0, 0, creationTime, creationTime,
+-          PERMISSION_555, ugi.getUserName(), ugi.getGroupNames()[0],
++          PERMISSION_555, ugi.getUserName(), ugi.getPrimaryGroupName(),
+ 
+           new Path(theInternalDir.fullPath).makeQualified(
+               myUri, ROOT_PATH));
+@@ -790,7 +790,7 @@ public FileStatus getFileStatus(Path f) throws IOException {
+ 
+           result[i++] = new FileStatus(0, false, 0, 0,
+             creationTime, creationTime, PERMISSION_555,
+-            ugi.getUserName(), ugi.getGroupNames()[0],
++            ugi.getUserName(), ugi.getPrimaryGroupName(),
+             link.getTargetLink(),
+             new Path(inode.fullPath).makeQualified(
+                 myUri, null));
+@@ -917,7 +917,7 @@ public void setAcl(Path path, List<AclEntry> aclSpec) throws IOException {
+     public AclStatus getAclStatus(Path path) throws IOException {
+       checkPathIsSlash(path);
+       return new AclStatus.Builder().owner(ugi.getUserName())
+-          .group(ugi.getGroupNames()[0])
++          .group(ugi.getPrimaryGroupName())
+           .addEntries(AclUtil.getMinimalAcl(PERMISSION_555))
+           .stickyBit(false).build();
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index 014f488..4610e33 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -780,14 +780,14 @@ public FileChecksum getFileChecksum(final Path f)
+     public FileStatus getFileStatus(final Path f) throws IOException {
+       checkPathIsSlash(f);
+       return new FileStatus(0, true, 0, 0, creationTime, creationTime,
+-          PERMISSION_555, ugi.getUserName(), ugi.getGroupNames()[0],
++          PERMISSION_555, ugi.getUserName(), ugi.getPrimaryGroupName(),
+           new Path(theInternalDir.fullPath).makeQualified(
+               myUri, null));
+     }
+     
+     @Override
+     public FileStatus getFileLinkStatus(final Path f)
+-        throws FileNotFoundException {
++        throws IOException {
+       // look up i internalDirs children - ignore first Slash
+       INode<AbstractFileSystem> inode =
+         theInternalDir.children.get(f.toUri().toString().substring(1)); 
+@@ -800,13 +800,13 @@ public FileStatus getFileLinkStatus(final Path f)
+         INodeLink<AbstractFileSystem> inodelink = 
+           (INodeLink<AbstractFileSystem>) inode;
+         result = new FileStatus(0, false, 0, 0, creationTime, creationTime,
+-            PERMISSION_555, ugi.getUserName(), ugi.getGroupNames()[0],
++            PERMISSION_555, ugi.getUserName(), ugi.getPrimaryGroupName(),
+             inodelink.getTargetLink(),
+             new Path(inode.fullPath).makeQualified(
+                 myUri, null));
+       } else {
+         result = new FileStatus(0, true, 0, 0, creationTime, creationTime,
+-          PERMISSION_555, ugi.getUserName(), ugi.getGroupNames()[0],
++          PERMISSION_555, ugi.getUserName(), ugi.getPrimaryGroupName(),
+           new Path(inode.fullPath).makeQualified(
+               myUri, null));
+       }
+@@ -845,7 +845,7 @@ public int getUriDefaultPort() {
+ 
+           result[i++] = new FileStatus(0, false, 0, 0,
+             creationTime, creationTime,
+-            PERMISSION_555, ugi.getUserName(), ugi.getGroupNames()[0],
++            PERMISSION_555, ugi.getUserName(), ugi.getPrimaryGroupName(),
+             link.getTargetLink(),
+             new Path(inode.fullPath).makeQualified(
+                 myUri, null));
+@@ -972,7 +972,7 @@ public void setAcl(Path path, List<AclEntry> aclSpec) throws IOException {
+     public AclStatus getAclStatus(Path path) throws IOException {
+       checkPathIsSlash(path);
+       return new AclStatus.Builder().owner(ugi.getUserName())
+-          .group(ugi.getGroupNames()[0])
++          .group(ugi.getPrimaryGroupName())
+           .addEntries(AclUtil.getMinimalAcl(PERMISSION_555))
+           .stickyBit(false).build();
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
+index 1b092ec..ad238e6 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
+@@ -23,7 +23,6 @@
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
+-import java.util.Arrays;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+@@ -276,7 +275,7 @@ private static void checkStat(File f, String owner, String group,
+             UserGroupInformation.createRemoteUser(expectedOwner);
+         final String adminsGroupString = "Administrators";
+         success = owner.equals(adminsGroupString)
+-            && Arrays.asList(ugi.getGroupNames()).contains(adminsGroupString);
++            && ugi.getGroups().contains(adminsGroupString);
+       } else {
+         success = false;
+       }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
+index 6815ab4..c0e0fe0 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
+@@ -18,9 +18,11 @@
+ package org.apache.hadoop.security;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -31,6 +33,7 @@
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Ticker;
+@@ -72,8 +75,8 @@
+   private final GroupMappingServiceProvider impl;
+ 
+   private final LoadingCache<String, List<String>> cache;
+-  private final Map<String, List<String>> staticUserToGroupsMap =
+-      new HashMap<String, List<String>>();
++  private final AtomicReference<Map<String, List<String>>> staticMapRef =
++      new AtomicReference<>();
+   private final long cacheTimeout;
+   private final long negativeCacheTimeout;
+   private final long warningDeltaMs;
+@@ -162,6 +165,8 @@ private void parseStaticMapping(Configuration conf) {
+         CommonConfigurationKeys.HADOOP_USER_GROUP_STATIC_OVERRIDES_DEFAULT);
+     Collection<String> mappings = StringUtils.getStringCollection(
+         staticMapping, ";");
++    Map<String, List<String>> staticUserToGroupsMap =
++        new HashMap<String, List<String>>();
+     for (String users : mappings) {
+       Collection<String> userToGroups = StringUtils.getStringCollection(users,
+           "=");
+@@ -180,6 +185,8 @@ private void parseStaticMapping(Configuration conf) {
+       }
+       staticUserToGroupsMap.put(user, groups);
+     }
++    staticMapRef.set(
++        staticUserToGroupsMap.isEmpty() ? null : staticUserToGroupsMap);
+   }
+ 
+   private boolean isNegativeCacheEnabled() {
+@@ -199,9 +206,12 @@ private IOException noGroupsForUser(String user) {
+    */
+   public List<String> getGroups(final String user) throws IOException {
+     // No need to lookup for groups of static users
+-    List<String> staticMapping = staticUserToGroupsMap.get(user);
+-    if (staticMapping != null) {
+-      return staticMapping;
++    Map<String, List<String>> staticUserToGroupsMap = staticMapRef.get();
++    if (staticUserToGroupsMap != null) {
++      List<String> staticMapping = staticUserToGroupsMap.get(user);
++      if (staticMapping != null) {
++        return staticMapping;
++      }
+     }
+ 
+     // Check the negative cache first
+@@ -307,7 +317,9 @@ public long read() {
+         throw noGroupsForUser(user);
+       }
+ 
+-      return groups;
++      // return immutable de-duped list
++      return Collections.unmodifiableList(
++          new ArrayList<>(new LinkedHashSet<>(groups)));
+     }
+ 
+     /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+index a6bfca5..9aec745 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+@@ -35,7 +35,6 @@
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+-import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -1443,11 +1442,11 @@ public String getShortUserName() {
+   }
+ 
+   public String getPrimaryGroupName() throws IOException {
+-    String[] groups = getGroupNames();
+-    if (groups.length == 0) {
++    List<String> groups = getGroups();
++    if (groups.isEmpty()) {
+       throw new IOException("There is no primary group for UGI " + this);
+     }
+-    return groups[0];
++    return groups.get(0);
+   }
+ 
+   /**
+@@ -1560,26 +1559,35 @@ private synchronized Credentials getCredentialsInternal() {
+   }
+ 
+   /**
++   * Get the group names for this user. {@ #getGroups(String)} is less
++   * expensive alternative when checking for a contained element.
++   * @return the list of users with the primary group first. If the command
++   *    fails, it returns an empty list.
++   */
++  public String[] getGroupNames() {
++    List<String> groups = getGroups();
++    return groups.toArray(new String[groups.size()]);
++  }
++
++  /**
+    * Get the group names for this user.
+    * @return the list of users with the primary group first. If the command
+    *    fails, it returns an empty list.
+    */
+-  public synchronized String[] getGroupNames() {
++  public List<String> getGroups() {
+     ensureInitialized();
+     try {
+-      Set<String> result = new LinkedHashSet<String>
+-        (groups.getGroups(getShortUserName()));
+-      return result.toArray(new String[result.size()]);
++      return groups.getGroups(getShortUserName());
+     } catch (IOException ie) {
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("Failed to get groups for user " + getShortUserName()
+             + " by " + ie);
+         LOG.trace("TRACE", ie);
+       }
+-      return StringUtils.emptyStringArray;
++      return Collections.emptyList();
+     }
+   }
+-  
++
+   /**
+    * Return the username.
+    */
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/AccessControlList.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/AccessControlList.java
+index b1b474b..a32a5fe 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/AccessControlList.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/AccessControlList.java
+@@ -231,7 +231,7 @@ public final boolean isUserInList(UserGroupInformation ugi) {
+     if (allAllowed || users.contains(ugi.getShortUserName())) {
+       return true;
+     } else if (!groups.isEmpty()) {
+-      for(String group: ugi.getGroupNames()) {
++      for (String group : ugi.getGroups()) {
+         if (groups.contains(group)) {
+           return true;
+         }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestUserGroupInformation.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestUserGroupInformation.java
+index 91ff7da..331d291 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestUserGroupInformation.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestUserGroupInformation.java
+@@ -430,8 +430,10 @@ public void testGettingGroups() throws Exception {
+     UserGroupInformation uugi = 
+       UserGroupInformation.createUserForTesting(USER_NAME, GROUP_NAMES);
+     assertEquals(USER_NAME, uugi.getUserName());
+-    assertArrayEquals(new String[]{GROUP1_NAME, GROUP2_NAME, GROUP3_NAME},
+-                      uugi.getGroupNames());
++    String[] expected = new String[]{GROUP1_NAME, GROUP2_NAME, GROUP3_NAME};
++    assertArrayEquals(expected, uugi.getGroupNames());
++    assertArrayEquals(expected, uugi.getGroups().toArray(new String[0]));
++    assertEquals(GROUP1_NAME, uugi.getPrimaryGroupName());
+   }
+ 
+   @SuppressWarnings("unchecked") // from Mockito mocks
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/security/TestRefreshUserMappings.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/security/TestRefreshUserMappings.java
+index ca67245..a924de7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/security/TestRefreshUserMappings.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/security/TestRefreshUserMappings.java
+@@ -149,9 +149,13 @@ public void testGroupMappingRefresh() throws Exception {
+   @Test
+   public void testRefreshSuperUserGroupsConfiguration() throws Exception {
+     final String SUPER_USER = "super_user";
+-    final String [] GROUP_NAMES1 = new String [] {"gr1" , "gr2"};
+-    final String [] GROUP_NAMES2 = new String [] {"gr3" , "gr4"};
+-    
++    final List<String> groupNames1 = new ArrayList<>();
++    groupNames1.add("gr1");
++    groupNames1.add("gr2");
++    final List<String> groupNames2 = new ArrayList<>();
++    groupNames2.add("gr3");
++    groupNames2.add("gr4");
++
+     //keys in conf
+     String userKeyGroups = DefaultImpersonationProvider.getTestProvider().
+         getProxySuperuserGroupConfKey(SUPER_USER);
+@@ -176,12 +180,12 @@ public void testRefreshSuperUserGroupsConfiguration() throws Exception {
+     
+     when(ugi1.getUserName()).thenReturn("userL1");
+     when(ugi2.getUserName()).thenReturn("userL2");
+-   
++
+     // set groups for users
+-    when(ugi1.getGroupNames()).thenReturn(GROUP_NAMES1);
+-    when(ugi2.getGroupNames()).thenReturn(GROUP_NAMES2);
+-   
+-    
++    when(ugi1.getGroups()).thenReturn(groupNames1);
++    when(ugi2.getGroups()).thenReturn(groupNames2);
++
++
+     // check before
+     try {
+       ProxyUsers.authorize(ugi1, "127.0.0.1");
+-- 
+1.7.9.5
+

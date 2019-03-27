@@ -1,0 +1,203 @@
+From 7f6e63f6c24030a91adc43f2bf3e85a1cc10b1ee Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Fri, 18 Mar 2016 10:38:33 -0500
+Subject: [PATCH 1512/2848] HDFS-9874. Long living DataXceiver threads cause
+ volume shutdown to block. Contributed by Rushabh
+ Shah.
+
+(cherry picked from commit 63c966a3fbeb675959fc4101e65de9f57aecd17d)
+(cherry picked from commit 242c7f1fee664b4d609a6c72e899f10816430f65)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+
+(cherry picked from commit a66d2a2a85e0db9ef164dfcf3a50d3970b51f175)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+
+Change-Id: I86b0b149d7ce37ef1fb926d3ba8286ebd5f62696
+---
+ .../hdfs/server/datanode/ReplicaInPipeline.java    |    8 +++
+ .../datanode/fsdataset/impl/FsDatasetImpl.java     |   13 ++++
+ .../datanode/fsdataset/impl/FsVolumeImpl.java      |    6 ++
+ .../datanode/fsdataset/impl/TestFsDatasetImpl.java |   69 +++++++++++++++++++-
+ 4 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java
+index 4b76c02..c8e5e0a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java
+@@ -166,6 +166,14 @@ public synchronized ChunkChecksum getLastChecksumAndDataLen() {
+     return new ChunkChecksum(getBytesOnDisk(), lastChecksum);
+   }
+ 
++  public void interruptThread() {
++    Thread thread = writer.get();
++    if (thread != null && thread != Thread.currentThread()
++        && thread.isAlive()) {
++      thread.interrupt();
++    }
++  }
++
+   @Override  // Object
+   public boolean equals(Object o) {
+     return super.equals(o);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+index dfb8d76..e74c1da 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+@@ -3052,5 +3052,18 @@ private void addDeletingBlock(String bpid, Long blockId) {
+       s.add(blockId);
+     }
+   }
++
++  synchronized void stopAllDataxceiverThreads(FsVolumeImpl volume) {
++    for (String blockPoolId : volumeMap.getBlockPoolList()) {
++      Collection<ReplicaInfo> replicas = volumeMap.replicas(blockPoolId);
++      for (ReplicaInfo replicaInfo : replicas) {
++        if (replicaInfo instanceof ReplicaInPipeline
++            && replicaInfo.getVolume().equals(volume)) {
++          ReplicaInPipeline replicaInPipeline = (ReplicaInPipeline) replicaInfo;
++          replicaInPipeline.interruptThread();
++        }
++      }
++    }
++  }
+ }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+index 1d109df..f0705e7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+@@ -232,6 +232,11 @@ private void checkReference() {
+     Preconditions.checkState(reference.getReferenceCount() > 0);
+   }
+ 
++  @VisibleForTesting
++  int getReferenceCount() {
++    return this.reference.getReferenceCount();
++  }
++
+   /**
+    * Close this volume.
+    * @throws IOException if the volume is closed.
+@@ -239,6 +244,7 @@ private void checkReference() {
+   void setClosed() throws IOException {
+     try {
+       this.reference.setClosed();
++      dataset.stopAllDataxceiverThreads(this);
+     } catch (ClosedChannelException e) {
+       throw new IOException("The volume has already closed.", e);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+index 7db6e9e..69a6386 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+@@ -21,13 +21,19 @@
+ 
+ import org.apache.commons.io.FileUtils;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileSystemTestHelper;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.protocol.Block;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.common.StorageInfo;
+@@ -49,6 +55,7 @@
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.DiskChecker;
+ import org.apache.hadoop.util.StringUtils;
++import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.Matchers;
+@@ -426,7 +433,7 @@ public void testDuplicateReplicaResolution() throws IOException {
+         BlockPoolSlice.selectReplicaToDelete(replicaOtherOlder, replica));
+     assertSame(replica,
+         BlockPoolSlice.selectReplicaToDelete(replicaOtherNewer, replica));
+-  }  
++  }
+ 
+   @Test
+   public void testDeletingBlocks() throws IOException {
+@@ -522,4 +529,64 @@ public void run() {
+     LOG.info("Volumes removed");
+     brReceivedLatch.await();
+   }
++
++  /**
++   * Tests stopping all the active DataXceiver thread on volume failure event.
++   * @throws Exception
++   */
++  @Test
++  public void testCleanShutdownOfVolume() throws Exception {
++    MiniDFSCluster cluster = null;
++    try {
++      Configuration config = new HdfsConfiguration();
++      config.setLong(
++          DFSConfigKeys.DFS_DATANODE_XCEIVER_STOP_TIMEOUT_MILLIS_KEY, 1000);
++      config.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY, 1);
++
++      cluster = new MiniDFSCluster.Builder(config).numDataNodes(1).build();
++      cluster.waitActive();
++      FileSystem fs = cluster.getFileSystem();
++      DataNode dataNode = cluster.getDataNodes().get(0);
++      Path filePath = new Path("test.dat");
++      // Create a file and keep the output stream unclosed.
++      FSDataOutputStream out = fs.create(filePath, (short) 1);
++      out.write(1);
++      out.hflush();
++
++      ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, filePath);
++      FsVolumeImpl volume = (FsVolumeImpl) dataNode.getFSDataset().getVolume(
++          block);
++      File finalizedDir = volume.getFinalizedDir(cluster.getNamesystem()
++          .getBlockPoolId());
++
++      if (finalizedDir.exists()) {
++        // Remove write and execute access so that checkDiskErrorThread detects
++        // this volume is bad.
++        finalizedDir.setExecutable(false);
++        finalizedDir.setWritable(false);
++      }
++      Assert.assertTrue("Reference count for the volume should be greater "
++          + "than 0", volume.getReferenceCount() > 0);
++      // Invoke the synchronous checkDiskError method
++      dataNode.getFSDataset().checkDataDir();
++      // Sleep for 1 second so that datanode can interrupt and cluster clean up
++      Thread.sleep(1000);
++      assertEquals("There are active threads still referencing volume: "
++          + volume.getBasePath(), 0, volume.getReferenceCount());
++      LocatedBlock lb = DFSTestUtil.getAllBlocks(fs, filePath).get(0);
++      DatanodeInfo info = lb.getLocations()[0];
++
++      try {
++        out.close();
++        Assert.fail("This is not a valid code path. "
++            + "out.close should have thrown an exception.");
++      } catch (IOException ioe) {
++        Assert.assertTrue(ioe.getMessage().contains(info.toString()));
++      }
++      finalizedDir.setWritable(true);
++      finalizedDir.setExecutable(true);
++    } finally {
++    cluster.shutdown();
++    }
++  }
+ }
+-- 
+1.7.9.5
+

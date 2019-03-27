@@ -1,0 +1,144 @@
+From a69e45fb0ea25a84c1e44b862a6ab397cdf04b0f Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Mon, 6 Jun 2016 15:52:39 -0700
+Subject: [PATCH 1774/2848] HDFS-10458. getFileEncryptionInfo should return
+ quickly for non-encrypted cluster.
+
+(cherry picked from commit 6de9213df111a9a4ed875db995d67af72d08a798)
+(cherry picked from commit 06e38c835d0ad9619d4bea662f2dd7d0f62007a9)
+(cherry picked from commit 0274636529cfac4d64582a7c21631aebbf4deb1b)
+(cherry picked from commit 9b68eda2746702246c7f4b4abe412c974ba56339)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+
+Change-Id: Ic06877632b7a1b17288f86ae93f6a454871892c8
+---
+ .../server/namenode/EncryptionZoneManager.java     |   36 +++++++++++++++++---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    2 +-
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+index fdad32a..016dc88 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+@@ -97,7 +97,7 @@ String getKeyName() {
+     }
+   }
+ 
+-  private final TreeMap<Long, EncryptionZoneInt> encryptionZones;
++  private TreeMap<Long, EncryptionZoneInt> encryptionZones = null;
+   private final FSDirectory dir;
+   private final int maxListEncryptionZonesResponses;
+ 
+@@ -108,7 +108,6 @@ String getKeyName() {
+    */
+   public EncryptionZoneManager(FSDirectory dir, Configuration conf) {
+     this.dir = dir;
+-    encryptionZones = new TreeMap<Long, EncryptionZoneInt>();
+     maxListEncryptionZonesResponses = conf.getInt(
+         DFSConfigKeys.DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES,
+         DFSConfigKeys.DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES_DEFAULT
+@@ -145,6 +144,9 @@ void unprotectedAddEncryptionZone(Long inodeId,
+       CipherSuite suite, CryptoProtocolVersion version, String keyName) {
+     final EncryptionZoneInt ez = new EncryptionZoneInt(
+         inodeId, suite, version, keyName);
++    if (encryptionZones == null) {
++      encryptionZones = new TreeMap<>();
++    }
+     encryptionZones.put(inodeId, ez);
+   }
+ 
+@@ -155,7 +157,9 @@ void unprotectedAddEncryptionZone(Long inodeId,
+    */
+   void removeEncryptionZone(Long inodeId) {
+     assert dir.hasWriteLock();
+-    encryptionZones.remove(inodeId);
++    if (hasCreatedEncryptionZone()) {
++      encryptionZones.remove(inodeId);
++    }
+   }
+ 
+   /**
+@@ -204,6 +208,9 @@ private EncryptionZoneInt getEncryptionZoneForPath(INodesInPath iip) {
+     assert dir.hasReadLock();
+     Preconditions.checkNotNull(iip);
+     final INode[] inodes = iip.getINodes();
++    if (!hasCreatedEncryptionZone()) {
++      return null;
++    }
+     for (int i = inodes.length - 1; i >= 0; i--) {
+       final INode inode = inodes[i];
+       if (inode != null) {
+@@ -228,6 +235,9 @@ private EncryptionZoneInt getParentEncryptionZoneForPath(INodesInPath iip) {
+     Preconditions.checkNotNull(iip);
+     List<INode> inodes = Collections.unmodifiableList(
+         Arrays.asList(iip.getINodes()));
++    if (!hasCreatedEncryptionZone()) {
++      return null;
++    }
+     for (int i = inodes.size() - 2; i >= 0; i--) {
+       final INode inode = inodes.get(i);
+       if (inode != null) {
+@@ -325,7 +335,8 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+       throw new IOException("Attempt to create an encryption zone for a file.");
+     }
+ 
+-    if (encryptionZones.get(srcINode.getId()) != null) {
++    if (hasCreatedEncryptionZone() && encryptionZones.
++        get(srcINode.getId()) != null) {
+       throw new IOException("Directory " + src + " is already an encryption " +
+           "zone.");
+     }
+@@ -351,6 +362,10 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+   BatchedListEntries<EncryptionZone> listEncryptionZones(long prevId)
+       throws IOException {
+     assert dir.hasReadLock();
++    if (!hasCreatedEncryptionZone()) {
++      final List<EncryptionZone> emptyZones = Lists.newArrayList();
++      return new BatchedListEntries<>(emptyZones, false);
++    }
+     NavigableMap<Long, EncryptionZoneInt> tailMap = encryptionZones.tailMap
+         (prevId, false);
+     final int numResponses = Math.min(maxListEncryptionZonesResponses,
+@@ -391,6 +406,9 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+    */
+   String[] getKeyNames() {
+     assert dir.hasReadLock();
++    if (!hasCreatedEncryptionZone()) {
++      return new String[] {};
++    }
+     String[] ret = new String[encryptionZones.size()];
+     int index = 0;
+     for (Map.Entry<Long, EncryptionZoneInt> entry : encryptionZones
+@@ -399,4 +417,14 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+     }
+     return ret;
+   }
++
++  /**
++   * @return Whether there has been any attempt to create an encryption zone in
++   * the cluster at all. If not, it is safe to quickly return null when
++   * checking the encryption information of any file or directory in the
++   * cluster.
++   */
++  public boolean hasCreatedEncryptionZone() {
++    return encryptionZones != null;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index b01ab81..11d22b2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -2945,7 +2945,7 @@ void setFileEncryptionInfo(String src, FileEncryptionInfo info)
+    */
+   FileEncryptionInfo getFileEncryptionInfo(INode inode, int snapshotId,
+       INodesInPath iip) throws IOException {
+-    if (!inode.isFile()) {
++    if (!inode.isFile() || !ezManager.hasCreatedEncryptionZone()) {
+       return null;
+     }
+     readLock();
+-- 
+1.7.9.5
+

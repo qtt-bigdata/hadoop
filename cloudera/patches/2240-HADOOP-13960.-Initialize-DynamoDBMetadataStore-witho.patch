@@ -1,0 +1,313 @@
+From f4a415df3c236fae29bc25282aee3c7673029a4f Mon Sep 17 00:00:00 2001
+From: Lei Xu <lei@apache.org>
+Date: Mon, 9 Jan 2017 16:48:57 +0800
+Subject: [PATCH 2240/2848] HADOOP-13960. Initialize DynamoDBMetadataStore
+ without associated S3AFileSystem. (Mingliang Liu
+ via Lei Xu)
+
+(cherry picked from commit e3f20027fef53c9a9f30764021af5725d900da07)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+
+Change-Id: Ia4ad15b360bd67b80cc65c189901ca13c845f581
+---
+ .../fs/s3a/s3guard/DynamoDBClientFactory.java      |   47 ++++++++++++---
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |   61 +++++++++-----------
+ .../s3guard/PathMetadataDynamoDBTranslation.java   |    4 +-
+ .../apache/hadoop/fs/s3native/S3xLoginHelper.java  |    4 ++
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |   21 ++++++-
+ 5 files changed, 93 insertions(+), 44 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+index 1cbf464..05b96dc 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+@@ -57,6 +57,18 @@ AmazonDynamoDBClient createDynamoDBClient(URI fsUri, String s3Region)
+       throws IOException;
+ 
+   /**
++   * To create a DynamoDB client against the given endpoint in config.
++   *
++   * This DynamoDB client does not relate to any S3 buckets so the region is
++   * determined implicitly by the endpoint.
++   *
++   * @return a new DynamoDB client
++   * @throws IOException if any IO error happens
++   */
++  AmazonDynamoDBClient createDynamoDBClient(Configuration conf)
++      throws IOException;
++
++  /**
+    * The default implementation for creating an AmazonDynamoDBClient.
+    */
+   class DefaultDynamoDBClientFactory extends Configured
+@@ -87,16 +99,37 @@ public AmazonDynamoDBClient createDynamoDBClient(URI fsUri, String s3Region)
+       ddb.withRegion(region.toAWSRegion());
+       final String endPoint = conf.getTrimmed(S3GUARD_DDB_ENDPOINT_KEY);
+       if (StringUtils.isNotEmpty(endPoint)) {
+-        try {
+-          ddb.withEndpoint(endPoint);
+-        } catch (IllegalArgumentException e) {
+-          final String msg = "Incorrect DynamoDB endpoint: "  + endPoint;
+-          LOG.error(msg, e);
+-          throw new IllegalArgumentException(msg, e);
+-        }
++        setEndPoint(ddb, endPoint);
+       }
+       return ddb;
+     }
++
++    @Override
++    public AmazonDynamoDBClient createDynamoDBClient(Configuration conf)
++        throws IOException {
++      final AWSCredentialsProvider credentials =
++          createAWSCredentialProviderSet(null, conf, null);
++      final ClientConfiguration awsConf =
++          DefaultS3ClientFactory.createAwsConf(conf);
++      AmazonDynamoDBClient ddb = new AmazonDynamoDBClient(credentials, awsConf);
++      setEndPoint(ddb, conf.getTrimmed(S3GUARD_DDB_ENDPOINT_KEY));
++
++      return ddb;
++    }
++
++    /**
++     * Helper method to set the endpoint for an AmazonDynamoDBClient.
++     */
++    private static void setEndPoint(AmazonDynamoDBClient ddb, String endPoint) {
++      assert ddb != null;
++      try {
++        ddb.withEndpoint(endPoint);
++      } catch (IllegalArgumentException e) {
++        final String msg = "Incorrect DynamoDB endpoint: " + endPoint;
++        LOG.error(msg, e);
++        throw new IllegalArgumentException(msg, e);
++      }
++    }
+   }
+ 
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index 42b89a1..ab083ae 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -20,6 +20,7 @@
+ 
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
++import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -46,10 +47,10 @@
+ import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
+ 
+ import com.amazonaws.services.dynamodbv2.model.WriteRequest;
+-import com.amazonaws.services.s3.AmazonS3;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+ 
++import org.apache.commons.lang.StringUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -60,7 +61,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
+-import org.apache.hadoop.fs.s3a.S3ClientFactory;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+ import static org.apache.hadoop.fs.s3a.s3guard.S3Guard.*;
+@@ -159,14 +160,15 @@
+   private String region;
+   private Table table;
+   private String tableName;
+-  private S3AFileSystem s3afs;
++  private Configuration conf;
++  private URI s3Uri;
+   private String username;
+ 
+   @Override
+   public void initialize(FileSystem fs) throws IOException {
+     Preconditions.checkArgument(fs instanceof S3AFileSystem,
+         "DynamoDBMetadataStore only supports S3A filesystem.");
+-    s3afs = (S3AFileSystem) fs;
++    final S3AFileSystem s3afs = (S3AFileSystem) fs;
+     final String bucket = s3afs.getBucket();
+     try {
+       region = s3afs.getAmazonS3Client().getBucketLocation(bucket);
+@@ -176,8 +178,8 @@ public void initialize(FileSystem fs) throws IOException {
+     }
+ 
+     username = s3afs.getUsername();
+-
+-    final Configuration conf = s3afs.getConf();
++    conf = s3afs.getConf();
++    s3Uri = s3afs.getUri();
+     Class<? extends DynamoDBClientFactory> cls = conf.getClass(
+         S3GUARD_DDB_CLIENT_FACTORY_IMPL,
+         S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT,
+@@ -198,36 +200,25 @@ public void initialize(FileSystem fs) throws IOException {
+   /**
+    * Performs one-time initialization of the metadata store via configuration.
+    *
+-   * This initialization depends on the configuration object to get DEFAULT
+-   * S3AFileSystem URI, AWS credentials, S3ClientFactory implementation class,
+-   * DynamoDBFactor implementation class, DynamoDB endpoints, metadata table
+-   * names etc. Generally you should use {@link #initialize(FileSystem)} instead
+-   * given an initialized S3 file system.
++   * This initialization depends on the configuration object to get AWS
++   * credentials, DynamoDBFactory implementation class, DynamoDB endpoints,
++   * DynamoDB table names etc. After initialization, this metadata store does
++   * not explicitly relate to any S3 bucket, which be nonexistent.
++   *
++   * This is used to operate the metadata store directly beyond the scope of the
++   * S3AFileSystem integration, e.g. command line tools. Generally you should
++   * use {@link #initialize(FileSystem)} if given an initialized S3 file system.
+    *
+    * @see #initialize(FileSystem)
+    * @throws IOException if there is an error
+    */
+-  void initialize(Configuration conf) throws IOException {
+-    final FileSystem defautFs = FileSystem.get(conf);
+-    Preconditions.checkArgument(defautFs instanceof S3AFileSystem,
+-        "DynamoDBMetadataStore only supports S3A filesystem.");
+-    s3afs = (S3AFileSystem) defautFs;
+-
++  void initialize(Configuration config) throws IOException {
++    conf = config;
+     // use the bucket as the DynamoDB table name if not specified in config
+     tableName = conf.getTrimmed(S3GUARD_DDB_TABLE_NAME_KEY);
+-    Preconditions.checkNotNull(tableName, "No DynamoDB table name configured!");
+-
+-    final Class<? extends S3ClientFactory> clsS3 = conf.getClass(
+-        S3_CLIENT_FACTORY_IMPL,
+-        DEFAULT_S3_CLIENT_FACTORY_IMPL,
+-        S3ClientFactory.class);
+-    final S3ClientFactory factory = ReflectionUtils.newInstance(clsS3, conf);
+-    AmazonS3 s3 = factory.createS3Client(s3afs.getUri(), s3afs.getUri());
+-    try {
+-      region = s3.getBucketLocation(tableName);
+-    } catch (AmazonClientException e) {
+-      throw new IOException("Can not find location for bucket " + tableName, e);
+-    }
++    Preconditions.checkArgument(!StringUtils.isEmpty(tableName),
++        "No DynamoDB table name configured!");
++    username = UserGroupInformation.getCurrentUser().getShortUserName();
+ 
+     Class<? extends DynamoDBClientFactory> clsDdb = conf.getClass(
+         S3GUARD_DDB_CLIENT_FACTORY_IMPL,
+@@ -236,8 +227,9 @@ void initialize(Configuration conf) throws IOException {
+     LOG.debug("Creating dynamo DB client {}", clsDdb);
+     AmazonDynamoDBClient dynamoDBClient =
+         ReflectionUtils.newInstance(clsDdb, conf)
+-            .createDynamoDBClient(s3afs.getUri(), region);
++            .createDynamoDBClient(conf);
+     dynamoDB = new DynamoDB(dynamoDBClient);
++    region = dynamoDBClient.getEndpointPrefix();
+ 
+     createTable();
+   }
+@@ -294,7 +286,7 @@ public PathMetadata get(Path path) throws IOException {
+             .withPrimaryKey(pathToKey(path))
+             .withConsistentRead(true); // strictly consistent read
+         final Item item = table.getItem(spec);
+-        meta = itemToPathMetadata(s3afs.getUri(), item, username);
++        meta = itemToPathMetadata(s3Uri, item, username);
+         LOG.debug("Get from table {} in region {} returning for {}: {}",
+             tableName, region, path, meta);
+       }
+@@ -332,7 +324,7 @@ public DirListingMetadata listChildren(Path path) throws IOException {
+ 
+       final List<PathMetadata> metas = new ArrayList<>();
+       for (Item item : items) {
+-        metas.add(itemToPathMetadata(s3afs.getUri(), item, username));
++        metas.add(itemToPathMetadata(s3Uri, item, username));
+       }
+       LOG.trace("Listing table {} in region {} for {} returning {}",
+           tableName, region, path, metas);
+@@ -529,7 +521,6 @@ public String toString() {
+    */
+   @VisibleForTesting
+   void createTable() throws IOException {
+-    final Configuration conf = s3afs.getConf();
+     final ProvisionedThroughput capacity = new ProvisionedThroughput(
+         conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
+             S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
+@@ -604,7 +595,7 @@ private Path checkPath(Path path) {
+     Preconditions.checkNotNull(path);
+     Preconditions.checkArgument(path.isAbsolute(),
+         "Path '" + path + "' is not absolute!");
+-    return path.makeQualified(s3afs.getUri(), null);
++    return s3Uri == null ? path : path.makeQualified(s3Uri, null);
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+index 76225f8..a0d88c5 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+@@ -101,7 +101,9 @@ static PathMetadata itemToPathMetadata(URI s3aUri, Item item, String username)
+       return null;
+     }
+ 
+-    path = path.makeQualified(s3aUri, null);
++    if (s3aUri != null) {
++      path = path.makeQualified(s3aUri, null);
++    }
+     boolean isDir = false;
+     try {
+       isDir = item.getBoolean(IS_DIR);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3native/S3xLoginHelper.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3native/S3xLoginHelper.java
+index 97ece37..9fb4138 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3native/S3xLoginHelper.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3native/S3xLoginHelper.java
+@@ -98,6 +98,10 @@ public static Login extractLoginDetailsWithWarnings(URI name) {
+    * @return a login tuple, possibly empty.
+    */
+   public static Login extractLoginDetails(URI name) {
++    if (name == null) {
++      return Login.EMPTY;
++    }
++
+     try {
+       String authority = name.getAuthority();
+       if (authority == null) {
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index 72144b7..f88137b 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -213,8 +213,27 @@ public void testInitialize() throws IOException {
+   @Test
+   public void testInitializeWithConfiguration() throws IOException {
+     final String tableName = "testInitializeWithConfiguration";
+-    final Configuration conf = createContract().getFileSystem().getConf();
++    final Configuration conf = new Configuration();
++    String a = conf.get(Constants.S3GUARD_DDB_ENDPOINT_KEY);
++    try {
++      DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore();
++      ddbms.initialize(conf);
++      fail("Should have failed because the table name is not set!");
++    } catch (IllegalArgumentException ignored) {
++    }
++    // config table name
+     conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
++    try {
++      DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore();
++      ddbms.initialize(conf);
++      fail("Should have failed because as the endpoint is not set!");
++    } catch (IllegalArgumentException ignored) {
++    }
++    // config endpoint
++    conf.set(Constants.S3GUARD_DDB_ENDPOINT_KEY, ddbEndpoint);
++    // config credentials
++    conf.set(Constants.ACCESS_KEY, "dummy-access-key");
++    conf.set(Constants.SECRET_KEY, "dummy-secret-key");
+     try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+       ddbms.initialize(conf);
+       verifyTableInitialized(tableName);
+-- 
+1.7.9.5
+

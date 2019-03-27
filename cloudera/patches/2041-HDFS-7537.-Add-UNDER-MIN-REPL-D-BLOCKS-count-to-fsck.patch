@@ -1,0 +1,185 @@
+From b6b86b24f8ae03f091d1a09d4713e3352686f17c Mon Sep 17 00:00:00 2001
+From: Tsz-Wo Nicholas Sze <szetszwo@hortonworks.com>
+Date: Thu, 26 Feb 2015 11:45:56 +0800
+Subject: [PATCH 2041/2848] HDFS-7537. Add "UNDER MIN REPL'D BLOCKS" count to
+ fsck.  Contributed by GAO Rui
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+
+(cherry picked from commit 22b13a0ddbf85c117a4ff45f7b933c68327ad75f)
+
+Change-Id: I78730351f795f8fcba9a440b71d1f31868fb4cfc
+---
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |   36 +++++++--
+ .../hadoop/hdfs/server/namenode/TestFsck.java      |   81 +++++++++++++++++++-
+ 2 files changed, 108 insertions(+), 9 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 5210ff6..2b5e1dc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -512,6 +512,9 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+       res.totalReplicas += liveReplicas;
+       short targetFileReplication = file.getReplication();
+       res.numExpectedReplicas += targetFileReplication;
++      if(liveReplicas<minReplication){
++        res.numUnderMinReplicatedBlocks++;
++      }
+       if (liveReplicas > targetFileReplication) {
+         res.excessiveReplicas += (liveReplicas - targetFileReplication);
+         res.numOverReplicatedBlocks += 1;
+@@ -857,6 +860,7 @@ private void lostFoundInit(DFSClient dfs) {
+     long corruptBlocks = 0L;
+     long excessiveReplicas = 0L;
+     long missingReplicas = 0L;
++    long numUnderMinReplicatedBlocks=0L;
+     long numOverReplicatedBlocks = 0L;
+     long numUnderReplicatedBlocks = 0L;
+     long numMisReplicatedBlocks = 0L;  // blocks that do not satisfy block placement policy
+@@ -873,10 +877,13 @@ private void lostFoundInit(DFSClient dfs) {
+     long totalReplicas = 0L;
+ 
+     final short replication;
++    final int minReplication;
+ 
+     Result(Configuration conf) {
+       this.replication = (short)conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY,
+                                             DFSConfigKeys.DFS_REPLICATION_DEFAULT);
++      this.minReplication = (short)conf.getInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY,
++                                            DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_DEFAULT);
+     }
+ 
+     /**
+@@ -924,15 +931,28 @@ public String toString() {
+         res.append(" (Total open file blocks (not validated): ").append(
+             totalOpenFilesBlocks).append(")");
+       }
+-      if (corruptFiles > 0) {
+-        res.append("\n  ********************************").append(
+-            "\n  CORRUPT FILES:\t").append(corruptFiles);
+-        if (missingSize > 0) {
+-          res.append("\n  MISSING BLOCKS:\t").append(missingIds.size()).append(
+-              "\n  MISSING SIZE:\t\t").append(missingSize).append(" B");
++      if (corruptFiles > 0 || numUnderMinReplicatedBlocks>0) {
++        res.append("\n  ********************************");
++        if(numUnderMinReplicatedBlocks>0){
++          res.append("\n  UNDER MIN REPL'D BLOCKS:\t").append(numUnderMinReplicatedBlocks);
++          if(totalBlocks>0){
++            res.append(" (").append(
++                ((float) (numUnderMinReplicatedBlocks * 100) / (float) totalBlocks))
++                .append(" %)");
++          }
++          res.append("\n  ").append("DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY:\t")
++             .append(minReplication);
+         }
+-        if (corruptBlocks > 0) {
+-          res.append("\n  CORRUPT BLOCKS: \t").append(corruptBlocks);
++        if(corruptFiles>0) {
++          res.append(
++              "\n  CORRUPT FILES:\t").append(corruptFiles);
++          if (missingSize > 0) {
++            res.append("\n  MISSING BLOCKS:\t").append(missingIds.size()).append(
++                "\n  MISSING SIZE:\t\t").append(missingSize).append(" B");
++          }
++          if (corruptBlocks > 0) {
++            res.append("\n  CORRUPT BLOCKS: \t").append(corruptBlocks);
++          }
+         }
+         res.append("\n  ********************************");
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index 06bc61f..d7b64fe 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -721,7 +721,86 @@ public void testCorruptBlock() throws Exception {
+       if (cluster != null) {cluster.shutdown();}
+     }
+   }
+-  
++
++  @Test
++  public void testUnderMinReplicatedBlock() throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY, 1000);
++    // Set short retry timeouts so this test runs faster
++    conf.setInt(DFSConfigKeys.DFS_CLIENT_RETRY_WINDOW_BASE, 10);
++    // Set minReplication to 2
++    short minReplication=2;
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY,minReplication);
++    FileSystem fs = null;
++    DFSClient dfsClient = null;
++    LocatedBlocks blocks = null;
++    int replicaCount = 0;
++    Random random = new Random();
++    String outStr = null;
++    short factor = 1;
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
++      cluster.waitActive();
++      fs = cluster.getFileSystem();
++      Path file1 = new Path("/testUnderMinReplicatedBlock");
++      DFSTestUtil.createFile(fs, file1, 1024, minReplication, 0);
++      // Wait until file replication has completed
++      DFSTestUtil.waitReplication(fs, file1, minReplication);
++      ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, file1);
++
++      // Make sure filesystem is in healthy state
++      outStr = runFsck(conf, 0, true, "/");
++      System.out.println(outStr);
++      assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
++
++      // corrupt the first replica
++      File blockFile = cluster.getBlockFile(0, block);
++      if (blockFile != null && blockFile.exists()) {
++        RandomAccessFile raFile = new RandomAccessFile(blockFile, "rw");
++        FileChannel channel = raFile.getChannel();
++        String badString = "BADBAD";
++        int rand = random.nextInt((int) channel.size()/2);
++        raFile.seek(rand);
++        raFile.write(badString.getBytes());
++        raFile.close();
++      }
++
++      dfsClient = new DFSClient(new InetSocketAddress("localhost",
++          cluster.getNameNodePort()), conf);
++      blocks = dfsClient.getNamenode().
++          getBlockLocations(file1.toString(), 0, Long.MAX_VALUE);
++      replicaCount = blocks.get(0).getLocations().length;
++      while (replicaCount != factor) {
++        try {
++          Thread.sleep(100);
++          // Read the file to trigger reportBadBlocks
++          try {
++            IOUtils.copyBytes(fs.open(file1), new IOUtils.NullOutputStream(), conf,
++                true);
++          } catch (IOException ie) {
++            // Ignore exception
++          }
++          System.out.println("sleep in try: replicaCount="+replicaCount+"  factor="+factor);
++        } catch (InterruptedException ignore) {
++        }
++        blocks = dfsClient.getNamenode().
++            getBlockLocations(file1.toString(), 0, Long.MAX_VALUE);
++        replicaCount = blocks.get(0).getLocations().length;
++      }
++
++      // Check if fsck reports the same
++      outStr = runFsck(conf, 0, true, "/");
++      System.out.println(outStr);
++      assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
++      assertTrue(outStr.contains("UNDER MIN REPL'D BLOCKS:\t1 (100.0 %)"));
++      assertTrue(outStr.contains("DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY:\t2"));
++    } finally {
++      if (cluster != null) {cluster.shutdown();}
++    }
++  }
++
++
+   /** Test if fsck can return -1 in case of failure
+    * 
+    * @throws Exception
+-- 
+1.7.9.5
+

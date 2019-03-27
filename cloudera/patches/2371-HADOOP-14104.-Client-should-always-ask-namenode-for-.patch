@@ -1,0 +1,848 @@
+From 5d2f02ff9406e1bc0cef48d26d1365a20e6da617 Mon Sep 17 00:00:00 2001
+From: Andrew Wang <wang@apache.org>
+Date: Thu, 6 Apr 2017 14:39:45 -0700
+Subject: [PATCH 2371/2848] HADOOP-14104. Client should always ask namenode
+ for kms provider path. Contributed by Rushabh S
+ Shah.
+
+(cherry picked from commit b1dfdea5b449622a393a96cb6bd44007d2c12760)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/KeyProviderCache.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
+	hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/TransparentEncryption.md
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
+
+Change-Id: Ia03005448cfab85a22b6633fb42b052370f75806
+---
+ .../hadoop/fs/CommonConfigurationKeysPublic.java   |    6 +
+ .../main/java/org/apache/hadoop/fs/FileSystem.java |    3 +-
+ .../org/apache/hadoop/fs/FsServerDefaults.java     |   13 +-
+ .../org/apache/hadoop/fs/ftp/FtpConfigKeys.java    |    4 +-
+ .../apache/hadoop/fs/local/LocalConfigKeys.java    |    5 +-
+ .../main/java/org/apache/hadoop/util/KMSUtil.java  |   20 +-
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |   78 +++++++-
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |   13 +-
+ .../org/apache/hadoop/hdfs/KeyProviderCache.java   |   20 +-
+ .../apache/hadoop/hdfs/protocolPB/PBHelper.java    |    4 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    8 +-
+ .../hadoop-hdfs/src/main/proto/hdfs.proto          |    1 +
+ .../src/site/apt/TransparentEncryption.apt.vm      |    1 +
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |  205 ++++++++++++++++++++
+ .../apache/hadoop/hdfs/TestKeyProviderCache.java   |   22 ++-
+ .../hadoop/hdfs/protocolPB/TestPBHelper.java       |   30 +++
+ 16 files changed, 392 insertions(+), 41 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+index 127eb21..3b0f0fb 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+@@ -362,6 +362,12 @@
+   public static final String  HADOOP_SECURITY_IMPERSONATION_PROVIDER_CLASS =
+     "hadoop.security.impersonation.provider.class";
+ 
++  // After backport HDFS-10489, we should replace 
++  //   "dfs.encryption.key.provider.uri" with "hadoop.security.key.provider.path"
++  // here
++  public static final String HADOOP_SECURITY_KEY_PROVIDER_PATH =
++    "dfs.encryption.key.provider.uri";
++
+   //  <!--- KMSClientProvider configurations —>
+   /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a> */
+   public static final String KMS_CLIENT_ENC_KEY_CACHE_SIZE =
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+index 26c55f7..4b12561 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+@@ -741,7 +741,8 @@ public FsServerDefaults getServerDefaults() throws IOException {
+         conf.getInt("io.file.buffer.size", 4096),
+         false,
+         CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_DEFAULT,
+-        DataChecksum.Type.CRC32);
++        DataChecksum.Type.CRC32,
++        "");
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsServerDefaults.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsServerDefaults.java
+index c1b9071..469243c 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsServerDefaults.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsServerDefaults.java
+@@ -54,6 +54,7 @@ public Writable newInstance() {
+   private boolean encryptDataTransfer;
+   private long trashInterval;
+   private DataChecksum.Type checksumType;
++  private String keyProviderUri;
+ 
+   public FsServerDefaults() {
+   }
+@@ -61,7 +62,8 @@ public FsServerDefaults() {
+   public FsServerDefaults(long blockSize, int bytesPerChecksum,
+       int writePacketSize, short replication, int fileBufferSize,
+       boolean encryptDataTransfer, long trashInterval,
+-      DataChecksum.Type checksumType) {
++      DataChecksum.Type checksumType,
++      String keyProviderUri) {
+     this.blockSize = blockSize;
+     this.bytesPerChecksum = bytesPerChecksum;
+     this.writePacketSize = writePacketSize;
+@@ -70,6 +72,7 @@ public FsServerDefaults(long blockSize, int bytesPerChecksum,
+     this.encryptDataTransfer = encryptDataTransfer;
+     this.trashInterval = trashInterval;
+     this.checksumType = checksumType;
++    this.keyProviderUri = keyProviderUri;
+   }
+ 
+   public long getBlockSize() {
+@@ -104,6 +107,14 @@ public long getTrashInterval() {
+     return checksumType;
+   }
+ 
++  /* null means old style namenode.
++   * "" (empty string) means namenode is upgraded but EZ is not supported.
++   * some string means that value is the key provider.
++   */
++  public String getKeyProviderUri() {
++    return keyProviderUri;
++  }
++
+   // /////////////////////////////////////////
+   // Writable
+   // /////////////////////////////////////////
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FtpConfigKeys.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FtpConfigKeys.java
+index 2313a14..e59efa5 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FtpConfigKeys.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FtpConfigKeys.java
+@@ -54,6 +54,7 @@
+   public static final long    FS_TRASH_INTERVAL_DEFAULT = 0;
+   public static final DataChecksum.Type CHECKSUM_TYPE_DEFAULT =
+       DataChecksum.Type.CRC32;
++  public static final String KEY_PROVIDER_URI_DEFAULT = "";
+   
+   protected static FsServerDefaults getServerDefaults() throws IOException {
+     return new FsServerDefaults(
+@@ -64,7 +65,8 @@ protected static FsServerDefaults getServerDefaults() throws IOException {
+         STREAM_BUFFER_SIZE_DEFAULT,
+         ENCRYPT_DATA_TRANSFER_DEFAULT,
+         FS_TRASH_INTERVAL_DEFAULT,
+-        CHECKSUM_TYPE_DEFAULT);
++        CHECKSUM_TYPE_DEFAULT,
++        KEY_PROVIDER_URI_DEFAULT);
+   }
+ }
+   
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/LocalConfigKeys.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/LocalConfigKeys.java
+index d1ebca2..0b9e7455 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/LocalConfigKeys.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/LocalConfigKeys.java
+@@ -54,6 +54,8 @@
+   public static final long FS_TRASH_INTERVAL_DEFAULT = 0;
+   public static final DataChecksum.Type CHECKSUM_TYPE_DEFAULT =
+       DataChecksum.Type.CRC32;
++  public static final String KEY_PROVIDER_URI_DEFAULT = "";
++
+   public static FsServerDefaults getServerDefaults() throws IOException {
+     return new FsServerDefaults(
+         BLOCK_SIZE_DEFAULT,
+@@ -63,7 +65,8 @@ public static FsServerDefaults getServerDefaults() throws IOException {
+         STREAM_BUFFER_SIZE_DEFAULT,
+         ENCRYPT_DATA_TRANSFER_DEFAULT,
+         FS_TRASH_INTERVAL_DEFAULT,
+-        CHECKSUM_TYPE_DEFAULT);
++        CHECKSUM_TYPE_DEFAULT,
++        KEY_PROVIDER_URI_DEFAULT);
+   }
+ }
+   
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/KMSUtil.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/KMSUtil.java
+index bd6b460..5f783a9 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/KMSUtil.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/KMSUtil.java
+@@ -26,7 +26,6 @@
+ 
+ import java.io.IOException;
+ import java.net.URI;
+-import java.net.URISyntaxException;
+ 
+ /**
+  * Utils for KMS.
+@@ -51,21 +50,20 @@ private KMSUtil() { /* Hidden constructor */ }
+   public static KeyProvider createKeyProvider(final Configuration conf,
+       final String configKeyName) throws IOException {
+     LOG.debug("Creating key provider with config key {}", configKeyName);
+-    final String providerUriStr = conf.getTrimmed(configKeyName, "");
++    final String providerUriStr = conf.getTrimmed(configKeyName);
+     // No provider set in conf
+-    if (providerUriStr.isEmpty()) {
++    if (providerUriStr == null || providerUriStr.isEmpty()) {
+       return null;
+     }
+-    final URI providerUri;
+-    try {
+-      providerUri = new URI(providerUriStr);
+-    } catch (URISyntaxException e) {
+-      throw new IOException(e);
+-    }
++    return createKeyProviderFromUri(conf, URI.create(providerUriStr));
++  }
++
++  public static KeyProvider createKeyProviderFromUri(final Configuration conf,
++      final URI providerUri) throws IOException {
+     KeyProvider keyProvider = KeyProviderFactory.get(providerUri, conf);
+     if (keyProvider == null) {
+-      throw new IOException("Could not instantiate KeyProvider from " +
+-          configKeyName + " setting of '" + providerUriStr + "'");
++      throw new IOException("Could not instantiate KeyProvider for uri: " +
++          providerUri);
+     }
+     if (keyProvider.isTransient()) {
+       throw new IOException("KeyProvider " + keyProvider.toString()
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 060d4f8..bcf93c4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -214,6 +214,7 @@
+ import org.apache.hadoop.net.DNS;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.Token;
+@@ -248,6 +249,7 @@
+     DataEncryptionKeyFactory {
+   public static final Log LOG = LogFactory.getLog(DFSClient.class);
+   public static final long SERVER_DEFAULTS_VALIDITY_PERIOD = 60 * 60 * 1000L; // 1 hour
++  private static final String DFS_KMS_PREFIX = "dfs-kms-";
+   static final int TCP_WINDOW_SIZE = 128 * 1024; // 128 KB
+ 
+   private final Configuration conf;
+@@ -266,7 +268,7 @@
+   final SocketFactory socketFactory;
+   final ReplaceDatanodeOnFailure dtpReplaceDatanodeOnFailure;
+   final FileSystem.Statistics stats;
+-  private final String authority;
++  private final URI namenodeUri;
+   private final Random r = new Random();
+   private SocketAddress[] localInterfaceAddrs;
+   private DataEncryptionKey encryptionKey;
+@@ -278,6 +280,7 @@
+   private static final DFSHedgedReadMetrics HEDGED_READ_METRIC =
+       new DFSHedgedReadMetrics();
+   private static ThreadPoolExecutor HEDGED_READ_THREAD_POOL;
++  private URI keyProviderUri = null;
+ 
+   @VisibleForTesting
+   KeyProvider provider;
+@@ -696,7 +699,7 @@ public DFSClient(URI nameNodeUri, ClientProtocol rpcNamenode,
+ 
+     this.ugi = UserGroupInformation.getCurrentUser();
+     
+-    this.authority = nameNodeUri == null? "null": nameNodeUri.getAuthority();
++    this.namenodeUri = nameNodeUri;
+     this.clientName = "DFSClient_" + dfsClientConf.taskId + "_" + 
+         DFSUtil.getRandom().nextInt()  + "_" + Thread.currentThread().getId();
+     int numResponseToDrop = conf.getInt(
+@@ -865,7 +868,8 @@ void checkOpen() throws IOException {
+    *  be returned until all output streams are closed.
+    */
+   public LeaseRenewer getLeaseRenewer() throws IOException {
+-      return LeaseRenewer.getInstance(authority, ugi, this);
++    return LeaseRenewer.getInstance(
++        namenodeUri != null ? namenodeUri.getAuthority() : "null", ugi, this);
+   }
+ 
+   /** Get a lease and start automatic renewal */
+@@ -3599,8 +3603,66 @@ DFSHedgedReadMetrics getHedgedReadMetrics() {
+     return HEDGED_READ_METRIC;
+   }
+ 
+-  public KeyProvider getKeyProvider() {
+-    return clientContext.getKeyProviderCache().get(conf);
++  /**
++   * Returns a key to map namenode uri to key provider uri.
++   * Tasks will lookup this key to find key Provider.
++   */
++  public Text getKeyProviderMapKey() {
++    return new Text(DFS_KMS_PREFIX + namenodeUri.getScheme()
++        +"://" + namenodeUri.getAuthority());
++  }
++
++  /**
++   * The key provider uri is searched in the following order.
++   * 1. If there is a mapping in Credential's secrets map for namenode uri.
++   * 2. From namenode getServerDefaults rpc.
++   * 3. Finally fallback to local conf.
++   * @return keyProviderUri if found from either of above 3 cases,
++   * null otherwise
++   * @throws IOException
++   */
++  URI getKeyProviderUri() throws IOException {
++    if (keyProviderUri != null) {
++      return keyProviderUri;
++    }
++
++    // Lookup the secret in credentials object for namenodeuri.
++    Credentials credentials = ugi.getCredentials();
++    byte[] keyProviderUriBytes = credentials.getSecretKey(getKeyProviderMapKey());
++    if(keyProviderUriBytes != null) {
++      keyProviderUri =
++          URI.create(DFSUtil.bytes2String(keyProviderUriBytes));
++      return keyProviderUri;
++    }
++
++    // Query the namenode for the key provider uri.
++    FsServerDefaults serverDefaults = getServerDefaults();
++    if (serverDefaults.getKeyProviderUri() != null) {
++      if (!serverDefaults.getKeyProviderUri().isEmpty()) {
++        keyProviderUri = URI.create(serverDefaults.getKeyProviderUri());
++      }
++      return keyProviderUri;
++    }
++
++    // Last thing is to trust its own conf to be backwards compatible.
++    String keyProviderUriStr = conf.getTrimmed(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH);
++    if (keyProviderUriStr != null && !keyProviderUriStr.isEmpty()) {
++      keyProviderUri = URI.create(keyProviderUriStr);
++    }
++    return keyProviderUri;
++  }
++
++  public KeyProvider getKeyProvider() throws IOException {
++    return clientContext.getKeyProviderCache().get(conf, getKeyProviderUri());
++  }
++
++  /*
++   * Should be used only for testing.
++   */
++  @VisibleForTesting
++  public void setKeyProviderUri(URI providerUri) {
++    this.keyProviderUri = providerUri;
+   }
+ 
+   @VisibleForTesting
+@@ -3614,11 +3676,11 @@ public void setKeyProvider(KeyProvider provider) {
+ 
+   /**
+    * Probe for encryption enabled on this filesystem.
+-   * See {@link DFSUtil#isHDFSEncryptionEnabled(Configuration)}
+    * @return true if encryption is enabled
++   * @throws IOException 
+    */
+-  public boolean isHDFSEncryptionEnabled() {
+-    return DFSUtil.isHDFSEncryptionEnabled(this.conf);
++  public boolean isHDFSEncryptionEnabled() throws IOException {
++    return getKeyProviderUri() != null;
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index 9aa960d..7db2152 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -2281,12 +2281,15 @@ public Void next(final FileSystem fs, final Path p)
+   public Token<?>[] addDelegationTokens(
+       final String renewer, Credentials credentials) throws IOException {
+     Token<?>[] tokens = super.addDelegationTokens(renewer, credentials);
+-    if (dfs.isHDFSEncryptionEnabled()) {
++    URI keyProviderUri = dfs.getKeyProviderUri();
++    if (keyProviderUri != null) {
+       KeyProviderDelegationTokenExtension keyProviderDelegationTokenExtension =
+           KeyProviderDelegationTokenExtension.
+               createKeyProviderDelegationTokenExtension(dfs.getKeyProvider());
+       Token<?>[] kpTokens = keyProviderDelegationTokenExtension.
+           addDelegationTokens(renewer, credentials);
++      credentials.addSecretKey(dfs.getKeyProviderMapKey(),
++          DFSUtil.string2Bytes(keyProviderUri.toString()));
+       if (tokens != null && kpTokens != null) {
+         Token<?>[] all = new Token<?>[tokens.length + kpTokens.length];
+         System.arraycopy(tokens, 0, all, 0, tokens.length);
+@@ -2319,7 +2322,13 @@ public DFSInotifyEventInputStream getInotifyEventStream(long lastReadTxid)
+    */
+   @Override
+   public Path getTrashRoot(Path path) {
+-    if ((path == null) || !dfs.isHDFSEncryptionEnabled()) {
++    try {
++      if ((path == null) || !dfs.isHDFSEncryptionEnabled()) {
++        return super.getTrashRoot(path);
++      }
++    } catch (IOException ioe) {
++      DFSClient.LOG.warn("Exception while checking whether encryption zone is "
++          + "supported", ioe);
+       return super.getTrashRoot(path);
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/KeyProviderCache.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/KeyProviderCache.java
+index ca4c30c..7361965 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/KeyProviderCache.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/KeyProviderCache.java
+@@ -28,6 +28,8 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.crypto.key.KeyProvider;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.util.KMSUtil;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.cache.Cache;
+@@ -61,29 +63,29 @@ public void onRemoval(
+         .build();
+   }
+ 
+-  public KeyProvider get(final Configuration conf) {
+-    URI kpURI = createKeyProviderURI(conf);
+-    if (kpURI == null) {
++  public KeyProvider get(final Configuration conf,
++      final URI serverProviderUri) {
++    if (serverProviderUri == null) {
+       return null;
+     }
+     try {
+-      return cache.get(kpURI, new Callable<KeyProvider>() {
++      return cache.get(serverProviderUri, new Callable<KeyProvider>() {
+         @Override
+         public KeyProvider call() throws Exception {
+-          return DFSUtil.createKeyProvider(conf);
++          return KMSUtil.createKeyProviderFromUri(conf, serverProviderUri);
+         }
+       });
+     } catch (Exception e) {
+-      LOG.error("Could not create KeyProvider for DFSClient !!", e.getCause());
++      LOG.error("Could not create KeyProvider for DFSClient !!", e);
+       return null;
+     }
+   }
+ 
+   private URI createKeyProviderURI(Configuration conf) {
+-    final String providerUriStr =
+-        conf.getTrimmed(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI, "");
++    final String providerUriStr = conf.getTrimmed(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH);
+     // No provider set in conf
+-    if (providerUriStr.isEmpty()) {
++    if (providerUriStr == null || providerUriStr.isEmpty()) {
+       LOG.error("Could not find uri with key ["
+           + DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI
+           + "] to create a keyProvider !!");
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+index 13ebf6b..20871ab 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+@@ -1357,7 +1357,8 @@ public static FsServerDefaults convert(FsServerDefaultsProto fs) {
+         fs.getFileBufferSize(),
+         fs.getEncryptDataTransfer(),
+         fs.getTrashInterval(),
+-        PBHelper.convert(fs.getChecksumType()));
++        PBHelper.convert(fs.getChecksumType()),
++        fs.hasKeyProviderUri() ? fs.getKeyProviderUri() : null);
+   }
+   
+   public static FsServerDefaultsProto convert(FsServerDefaults fs) {
+@@ -1371,6 +1372,7 @@ public static FsServerDefaultsProto convert(FsServerDefaults fs) {
+       .setEncryptDataTransfer(fs.getEncryptDataTransfer())
+       .setTrashInterval(fs.getTrashInterval())
+       .setChecksumType(PBHelper.convert(fs.getChecksumType()))
++      .setKeyProviderUri(fs.getKeyProviderUri())
+       .build();
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index dee943b..c0ffa28 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -151,6 +151,7 @@
+ import org.apache.hadoop.hdfs.AddBlockFlag;
+ import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedListEntries;
+ import org.apache.hadoop.fs.CacheFlag;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.CreateFlag;
+ import org.apache.hadoop.fs.DirectoryListingStartAfterNotFoundException;
+@@ -884,8 +885,11 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+           conf.getInt(IO_FILE_BUFFER_SIZE_KEY, IO_FILE_BUFFER_SIZE_DEFAULT),
+           conf.getBoolean(DFS_ENCRYPT_DATA_TRANSFER_KEY, DFS_ENCRYPT_DATA_TRANSFER_DEFAULT),
+           conf.getLong(FS_TRASH_INTERVAL_KEY, FS_TRASH_INTERVAL_DEFAULT),
+-          checksumType);
+-      
++          checksumType,
++          conf.getTrimmed(
++          CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH,
++          ""));
++
+       this.maxFsObjects = conf.getLong(DFS_NAMENODE_MAX_OBJECTS_KEY, 
+                                        DFS_NAMENODE_MAX_OBJECTS_DEFAULT);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+index 094ed10..64b7b47 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+@@ -369,6 +369,7 @@ message FsServerDefaultsProto {
+   optional bool encryptDataTransfer = 6 [default = false];
+   optional uint64 trashInterval = 7 [default = 0];
+   optional ChecksumTypeProto checksumType = 8 [default = CHECKSUM_CRC32];
++  optional string keyProviderUri = 9;
+ }
+ 
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/TransparentEncryption.apt.vm b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/TransparentEncryption.apt.vm
+index 83561f6..7d63d18 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/TransparentEncryption.apt.vm
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/TransparentEncryption.apt.vm
+@@ -125,6 +125,7 @@ Transparent Encryption in HDFS
+ *** dfs.encryption.key.provider.uri
+ 
+   The KeyProvider to use when interacting with encryption keys used when reading and writing to an encryption zone.
++  HDFS clients will use the provider path returned from Namenode via getServerDefaults. If namenode doesn't support returning key provider uri then client's conf will be used.
+ 
+ ** Selecting an encryption algorithm and codec
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index aaf6063..1d2ef8f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -60,6 +60,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileSystemTestHelper;
+ import org.apache.hadoop.fs.FileSystemTestWrapper;
++import org.apache.hadoop.fs.FsServerDefaults;
+ import org.apache.hadoop.fs.FsShell;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.RemoteIterator;
+@@ -86,6 +87,7 @@
+ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.util.DataChecksum;
+ import org.apache.hadoop.util.ToolRunner;
+ import org.apache.hadoop.crypto.key.KeyProviderDelegationTokenExtension.DelegationTokenExtension;
+ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.CryptoExtension;
+@@ -107,8 +109,21 @@
+ import static org.mockito.Mockito.withSettings;
+ import static org.mockito.Mockito.any;
+ import static org.mockito.Mockito.anyString;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_DEFAULT;
+ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_KEY;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_SIZE_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_REPLICATION_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_REPLICATION_KEY;
+ import static org.apache.hadoop.hdfs.DFSTestUtil.verifyFilesEqual;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_KEY;
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+ import static org.apache.hadoop.test.MetricsAsserts.assertGauge;
+ import static org.apache.hadoop.test.MetricsAsserts.getMetrics;
+@@ -1648,4 +1663,194 @@ private void verifyShellDeleteWithTrash(FsShell shell, Path path)
+       }
+     }
+   }
++
++  /** This test tests that client will first lookup secrets map
++   * for key provider uri from {@link Credentials} in
++   * {@link UserGroupInformation}
++   * @throws Exception
++   */
++  @Test
++  public void testProviderUriInCredentials() throws Exception {
++    String dummyKeyProvider = "dummy://foo:bar@test_provider1";
++    DFSClient client = cluster.getFileSystem().getClient();
++    Credentials credentials = new Credentials();
++    // Key provider uri should be in the secret map of credentials object with
++    // namenode uri as key
++    Text lookUpKey = client.getKeyProviderMapKey();
++    credentials.addSecretKey(lookUpKey,
++        DFSUtil.string2Bytes(dummyKeyProvider));
++    client.ugi.addCredentials(credentials);
++    client.setKeyProviderUri(null);
++    Assert.assertEquals("Client Key provider is different from provider in "
++        + "credentials map", dummyKeyProvider,
++        client.getKeyProviderUri().toString());
++  }
++
++
++ /**
++  * Testing the fallback behavior of keyProviderUri.
++  * This test tests first the key provider uri is used from conf
++  * and then used from serverDefaults.
++  * @throws IOException
++  */
++  @Test
++  public void testKeyProviderFallBackBehavior() throws IOException {
++    Configuration clusterConf = cluster.getConfiguration(0);
++    String dummyKeyProviderUri1 = "dummy://foo:bar@test_provider1";
++    // set the key provider uri in conf.
++    clusterConf.set(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH,
++        dummyKeyProviderUri1);
++    DFSClient mockClient = Mockito.spy(cluster.getFileSystem().getClient());
++    mockClient.setKeyProviderUri(null);
++    // Namenode returning null as keyProviderUri in FSServerDefaults.
++    FsServerDefaults serverDefaultsWithKeyProviderNull =
++        getTestServerDefaults(null);
++    Mockito.doReturn(serverDefaultsWithKeyProviderNull)
++        .when(mockClient).getServerDefaults();
++    Assert.assertEquals(
++        "Key provider uri from client doesn't match with uri from conf",
++        dummyKeyProviderUri1, mockClient.getKeyProviderUri().toString());
++    Mockito.verify(mockClient, Mockito.times(1)).getServerDefaults();
++
++    String dummyKeyProviderUri2 = "dummy://foo:bar@test_provider2";
++    mockClient.setKeyProviderUri(null);
++    FsServerDefaults serverDefaultsWithDummyKeyProvider =
++        getTestServerDefaults(dummyKeyProviderUri2);
++    // Namenode returning dummyKeyProvider2 in serverDefaults.
++    Mockito.doReturn(serverDefaultsWithDummyKeyProvider)
++    .when(mockClient).getServerDefaults();
++    Assert.assertEquals(
++        "Key provider uri from client doesn't match with uri from namenode",
++        dummyKeyProviderUri2, mockClient.getKeyProviderUri().toString());
++    Mockito.verify(mockClient, Mockito.times(2)).getServerDefaults();
++  }
++
++  /**
++   * This test makes sure the client gets the key provider uri from namenode
++   * instead of its own conf.
++   * This test assumes both the namenode and client are upgraded.
++   * @throws Exception
++   */
++  @Test
++  public void testDifferentKMSProviderOnUpgradedNamenode() throws Exception {
++    Configuration clusterConf = cluster.getConfiguration(0);
++    URI namenodeKeyProviderUri = URI.create(getKeyProviderURI());
++    Assert.assertEquals("Key Provider for client and namenode are different",
++        namenodeKeyProviderUri, cluster.getFileSystem().getClient()
++        .getKeyProviderUri());
++
++    // Unset the provider path in conf
++    clusterConf.unset(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH);
++    // Nullify the cached value for key provider uri on client
++    cluster.getFileSystem().getClient().setKeyProviderUri(null);
++    // Even after unsetting the local conf, the client key provider should be
++    // the same as namenode's provider.
++    Assert.assertEquals("Key Provider for client and namenode are different",
++        namenodeKeyProviderUri, cluster.getFileSystem().getClient()
++        .getKeyProviderUri());
++
++    // Set the provider path to some dummy scheme.
++    clusterConf.set(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH,
++        "dummy://foo:bar@test_provider1");
++    // Nullify the cached value for key provider uri on client
++    cluster.getFileSystem().getClient().setKeyProviderUri(null);
++    // Even after pointing the conf to some dummy provider, the client key
++    // provider should be the same as namenode's provider.
++    Assert.assertEquals("Key Provider for client and namenode are different",
++        namenodeKeyProviderUri, cluster.getFileSystem().getClient()
++        .getKeyProviderUri());
++  }
++
++  /**
++   * This test makes sure the client trusts its local conf
++   * This test assumes the client is upgraded but the namenode is not.
++   * @throws Exception
++   */
++  @Test
++  public void testDifferentKMSProviderOnUnUpgradedNamenode()
++      throws Exception {
++    Configuration clusterConf = cluster.getConfiguration(0);
++    URI namenodeKeyProviderUri = URI.create(getKeyProviderURI());
++    URI clientKeyProviderUri =
++        cluster.getFileSystem().getClient().getKeyProviderUri();
++    Assert.assertNotNull(clientKeyProviderUri);
++    // Since the client and the namenode share the same conf, they will have
++    // identical key provider.
++    Assert.assertEquals("Key Provider for client and namenode are different",
++        namenodeKeyProviderUri, clientKeyProviderUri);
++
++    String dummyKeyProviderUri = "dummy://foo:bar@test_provider";
++    // Unset the provider path in conf.
++    clusterConf.set(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH,
++        dummyKeyProviderUri);
++    FsServerDefaults spyServerDefaults = getTestServerDefaults(null);
++    // Creating a fake serverdefaults so that we can simulate namenode not
++    // being upgraded.
++    DFSClient spyClient = Mockito.spy(cluster.getFileSystem().getClient());
++    // Clear the cache value of keyProviderUri on client side.
++    spyClient.setKeyProviderUri(null);
++    Mockito.doReturn(spyServerDefaults).when(spyClient).getServerDefaults();
++
++    // Since FsServerDefaults#keyProviderUri is null, the client
++    // will fallback to local conf which is null.
++    clientKeyProviderUri = spyClient.getKeyProviderUri();
++    Assert.assertEquals("Client keyProvider should be " + dummyKeyProviderUri,
++        dummyKeyProviderUri, clientKeyProviderUri.toString());
++    Mockito.verify(spyClient, Mockito.times(1)).getServerDefaults();
++  }
++
++  // Given a provider uri return serverdefaults.
++  // provider uri == null means the namenode does not support returning
++  // provider uri in FSServerDefaults object.
++  private FsServerDefaults getTestServerDefaults(String providerPath) {
++    FsServerDefaults serverDefaults = new FsServerDefaults(
++        conf.getLongBytes(DFS_BLOCK_SIZE_KEY, DFS_BLOCK_SIZE_DEFAULT),
++        conf.getInt(DFS_BYTES_PER_CHECKSUM_KEY, DFS_BYTES_PER_CHECKSUM_DEFAULT),
++        conf.getInt(DFS_CLIENT_WRITE_PACKET_SIZE_KEY,
++        DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT),
++        (short) conf.getInt(DFS_REPLICATION_KEY, DFS_REPLICATION_DEFAULT),
++        conf.getInt(IO_FILE_BUFFER_SIZE_KEY, IO_FILE_BUFFER_SIZE_DEFAULT),
++        conf.getBoolean(
++        DFS_ENCRYPT_DATA_TRANSFER_KEY, DFS_ENCRYPT_DATA_TRANSFER_DEFAULT),
++        conf.getLong(FS_TRASH_INTERVAL_KEY, FS_TRASH_INTERVAL_DEFAULT),
++        DataChecksum.Type.valueOf(DFSConfigKeys.DFS_CHECKSUM_TYPE_DEFAULT),
++        providerPath);
++    return serverDefaults;
++  }
++
++  /**
++   * This test performs encrypted read/write and picks up the key provider uri
++   * from the credentials and not the conf.
++   * @throws Exception
++   */
++  @Test
++  public void testEncryptedReadWriteUsingDiffKeyProvider() throws Exception {
++    final HdfsAdmin dfsAdmin =
++        new HdfsAdmin(FileSystem.getDefaultUri(conf), conf);
++    Configuration clusterConf = cluster.getConfiguration(0);
++    clusterConf.unset(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH);
++    DFSClient client = cluster.getFileSystem().getClient();
++    Credentials credentials = new Credentials();
++    Text lookUpKey = client.getKeyProviderMapKey();
++    credentials.addSecretKey(lookUpKey,
++        DFSUtil.string2Bytes(getKeyProviderURI()));
++    client.ugi.addCredentials(credentials);
++    // Create a base file for comparison
++    final Path baseFile = new Path("/base");
++    final int len = 8192;
++    DFSTestUtil.createFile(fs, baseFile, len, (short) 1, 0xFEED);
++    // Create the first enc file
++    final Path zone = new Path("/zone");
++    fs.mkdirs(zone);
++    dfsAdmin.createEncryptionZone(zone, TEST_KEY, NO_TRASH);
++    final Path encFile1 = new Path(zone, "myfile");
++    DFSTestUtil.createFile(fs, encFile1, len, (short) 1, 0xFEED);
++    // Read them back in and compare byte-by-byte
++    verifyFilesEqual(fs, baseFile, encFile1, len);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestKeyProviderCache.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestKeyProviderCache.java
+index 4cbe871..b9be45e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestKeyProviderCache.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestKeyProviderCache.java
+@@ -25,6 +25,7 @@
+ import org.apache.hadoop.crypto.key.KeyProvider;
+ import org.apache.hadoop.crypto.key.KeyProviderFactory;
+ import org.apache.hadoop.crypto.key.kms.KMSClientProvider;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+@@ -96,29 +97,42 @@ public void testCache() throws Exception {
+     Configuration conf = new Configuration();
+     conf.set(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI,
+         "dummy://foo:bar@test_provider1");
+-    KeyProvider keyProvider1 = kpCache.get(conf);
++    KeyProvider keyProvider1 = kpCache.get(conf,
++        getKeyProviderUriFromConf(conf));
+     Assert.assertNotNull("Returned Key Provider is null !!", keyProvider1);
+ 
+     conf.set(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI,
+         "dummy://foo:bar@test_provider1");
+-    KeyProvider keyProvider2 = kpCache.get(conf);
++    KeyProvider keyProvider2 = kpCache.get(conf,
++        getKeyProviderUriFromConf(conf));
+ 
+     Assert.assertTrue("Different KeyProviders returned !!",
+         keyProvider1 == keyProvider2);
+ 
+     conf.set(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI,
+         "dummy://test_provider3");
+-    KeyProvider keyProvider3 = kpCache.get(conf);
++    KeyProvider keyProvider3 = kpCache.get(conf,
++        getKeyProviderUriFromConf(conf));
+ 
+     Assert.assertFalse("Same KeyProviders returned !!",
+         keyProvider1 == keyProvider3);
+ 
+     conf.set(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI,
+         "dummy://hello:there@test_provider1");
+-    KeyProvider keyProvider4 = kpCache.get(conf);
++    KeyProvider keyProvider4 = kpCache.get(conf,
++        getKeyProviderUriFromConf(conf));
+ 
+     Assert.assertFalse("Same KeyProviders returned !!",
+         keyProvider1 == keyProvider4);
+ 
+   }
++
++  private URI getKeyProviderUriFromConf(Configuration conf) {
++    String providerUriStr = conf.get(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH);
++    if (providerUriStr == null || providerUriStr.isEmpty()) {
++      return null;
++    }
++    return URI.create(providerUriStr);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
+index e1e2d32..73f2760 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
+@@ -31,6 +31,8 @@
+ import org.apache.hadoop.fs.permission.AclEntryType;
+ import org.apache.hadoop.fs.permission.AclStatus;
+ import org.apache.hadoop.fs.permission.FsAction;
++import org.apache.hadoop.fs.FsServerDefaults;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.protocol.Block;
+@@ -660,4 +662,32 @@ public void testDataNodeInfoPBHelper() {
+     DatanodeInfo dnInfos3 = PBHelper.convert(b.build());
+     assertEquals(dnInfos0.getNonDfsUsed(), dnInfos3.getNonDfsUsed());
+   }
++
++  /**
++   * Test case for old namenode where the namenode doesn't support returning
++   * keyProviderUri.
++   */
++  @Test
++  public void testFSServerDefaultsHelper() {
++    HdfsProtos.FsServerDefaultsProto.Builder b =
++        HdfsProtos.FsServerDefaultsProto.newBuilder();
++    b.setBlockSize(DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
++    b.setBytesPerChecksum(DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_DEFAULT);
++    b.setWritePacketSize(
++        DFSConfigKeys.DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT);
++    b.setReplication(DFSConfigKeys.DFS_REPLICATION_DEFAULT);
++    b.setFileBufferSize(DFSConfigKeys.IO_FILE_BUFFER_SIZE_DEFAULT);
++    b.setEncryptDataTransfer(DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT);
++    b.setTrashInterval(DFSConfigKeys.FS_TRASH_INTERVAL_DEFAULT);
++    b.setChecksumType(HdfsProtos.ChecksumTypeProto.valueOf(DataChecksum.Type
++        .valueOf(DFSConfigKeys.DFS_CHECKSUM_TYPE_DEFAULT).id));
++    HdfsProtos.FsServerDefaultsProto proto = b.build();
++
++    Assert.assertFalse("KeyProvider uri is not supported",
++        proto.hasKeyProviderUri());
++    FsServerDefaults fsServerDefaults = PBHelper.convert(proto);
++    Assert.assertNotNull("FsServerDefaults is null", fsServerDefaults);
++    Assert.assertNull("KeyProviderUri should be null",
++        fsServerDefaults.getKeyProviderUri());
++  }
+ }
+-- 
+1.7.9.5
+

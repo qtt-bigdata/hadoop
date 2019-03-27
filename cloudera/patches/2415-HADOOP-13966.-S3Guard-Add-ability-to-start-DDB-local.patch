@@ -1,0 +1,525 @@
+From 22dd31d0aa1937181c413f9be1111c89afe9f79f Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Mon, 20 Mar 2017 22:38:04 -0700
+Subject: [PATCH 2415/2848] HADOOP-13966. S3Guard: Add ability to start DDB
+ local server in every test. Contributed by
+ Mingliang Liu
+
+Also applied HADOOP-14135 to DynamoDBLocalClientFactory.
+
+(cherry picked from commit ed15abaf377b868bd37eb0214651e214693404c7)
+
+Change-Id: I25f8311f721863fafb84754b1360e44993c92375
+---
+ hadoop-tools/hadoop-aws/pom.xml                    |   13 ++
+ .../fs/s3a/s3guard/DynamoDBClientFactory.java      |   35 +++--
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |    4 +-
+ .../src/site/markdown/tools/hadoop-aws/s3guard.md  |   18 ++-
+ .../org/apache/hadoop/fs/s3a/S3ATestConstants.java |    1 +
+ .../org/apache/hadoop/fs/s3a/S3ATestUtils.java     |    7 +
+ .../fs/s3a/s3guard/DynamoDBLocalClientFactory.java |  148 ++++++++++++++++++++
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |   73 ++--------
+ 8 files changed, 218 insertions(+), 81 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBLocalClientFactory.java
+
+diff --git a/hadoop-tools/hadoop-aws/pom.xml b/hadoop-tools/hadoop-aws/pom.xml
+index 8f7a431..8527a29 100644
+--- a/hadoop-tools/hadoop-aws/pom.xml
++++ b/hadoop-tools/hadoop-aws/pom.xml
+@@ -312,6 +312,19 @@
+       </properties>
+     </profile>
+ 
++    <!-- Switch to DynamoDBLocal for s3guard. Has no effect unless s3guard is enabled -->
++    <profile>
++      <id>dynamodblocal</id>
++      <activation>
++        <property>
++          <name>dynamodblocal</name>
++        </property>
++      </activation>
++      <properties>
++        <fs.s3a.s3guard.test.implementation>dynamodblocal</fs.s3a.s3guard.test.implementation>
++      </properties>
++    </profile>
++
+     <!-- Switch s3guard from Authoritative=false to true
+      Has no effect unless s3guard is enabled -->
+     <profile>
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+index 2aec70d..0c88230 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+@@ -30,6 +30,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configurable;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.conf.Configured;
+@@ -43,7 +44,8 @@
+  *
+  * Implementation should be configured for setting and getting configuration.
+  */
+-interface DynamoDBClientFactory extends Configurable {
++@InterfaceAudience.Private
++public interface DynamoDBClientFactory extends Configurable {
+   Logger LOG = LoggerFactory.getLogger(DynamoDBClientFactory.class);
+ 
+   /**
+@@ -77,6 +79,26 @@ public AmazonDynamoDB createDynamoDBClient(String defaultRegion)
+       final ClientConfiguration awsConf =
+           DefaultS3ClientFactory.createAwsConf(conf);
+ 
++      final String region = getRegion(conf, defaultRegion);
++      LOG.debug("Creating DynamoDB client in region {}", region);
++
++      return AmazonDynamoDBClientBuilder.standard()
++          .withCredentials(credentials)
++          .withClientConfiguration(awsConf)
++          .withRegion(region)
++          .build();
++    }
++
++    /**
++     * Helper method to get and validate the AWS region for DynamoDBClient.
++     *
++     * @param conf configuration
++     * @param defaultRegion the default region
++     * @return configured region or else the provided default region
++     * @throws IOException if the region is not valid
++     */
++    static String getRegion(Configuration conf, String defaultRegion)
++        throws IOException {
+       String region = conf.getTrimmed(S3GUARD_DDB_REGION_KEY);
+       if (StringUtils.isEmpty(region)) {
+         region = defaultRegion;
+@@ -85,17 +107,10 @@ public AmazonDynamoDB createDynamoDBClient(String defaultRegion)
+         Regions.fromName(region);
+       } catch (IllegalArgumentException | NullPointerException e) {
+         throw new IOException("Invalid region specified: " + region + "; " +
+-            "Region can be configured with " + S3GUARD_DDB_REGION_KEY +": " +
++            "Region can be configured with " + S3GUARD_DDB_REGION_KEY + ": " +
+             validRegionsString());
+       }
+-
+-      LOG.debug("Creating DynamoDB client in region {}", region);
+-
+-      return AmazonDynamoDBClientBuilder.standard()
+-          .withCredentials(credentials)
+-          .withClientConfiguration(awsConf)
+-          .withRegion(region)
+-          .build();
++      return region;
+     }
+ 
+     private static String validRegionsString() {
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index 9658ed9..cebc50e 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.fs.s3a.s3guard;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+@@ -50,7 +51,8 @@
+ 
+   @InterfaceAudience.Private
+   @InterfaceStability.Unstable
+-  static final String S3GUARD_DDB_CLIENT_FACTORY_IMPL =
++  @VisibleForTesting
++  public static final String S3GUARD_DDB_CLIENT_FACTORY_IMPL =
+       "fs.s3a.s3guard.ddb.client.factory.impl";
+ 
+   static final Class<? extends DynamoDBClientFactory>
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+index 7619b2a..d8c0768 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+@@ -16,6 +16,8 @@
+ 
+ **Experimental Feature**
+ 
++<!-- MACRO{toc|fromDepth=0|toDepth=5} -->
++
+ ## Overview
+ 
+ *S3Guard* is an experimental feature for the S3A client of the S3 Filesystem,
+@@ -424,17 +426,21 @@ The basic strategy for testing S3Guard correctness consists of:
+ 
+ All the S3A tests which work with a private repository can be configured to
+ run with S3Guard by using the `s3guard` profile. When set, this will run
+-all the tests with a local dynamo DB instance set to "non-authoritative" mode.
++all the tests with local memory for the metadata set to "non-authoritative" mode.
+ 
+ ```bash
+ mvn -T 1C verify -Dparallel-tests -DtestsThreadCount=6 -Ds3guard 
+ ```
+ 
+-When the `s3guard` profile is enabled, are two other profiles which can be
+-enabled
+- 
+-* `dynamo` : use an AWS-hosted dynamo DB table, instead of a local table; creating
+-the table if it does not exist.
++When the `s3guard` profile is enabled, following profiles can be specified:
++
++* `dynamo`: use an AWS-hosted DynamoDB table; creating the table if it does
++  not exist. You will have to pay the bills for DynamoDB web service.
++* `dynamodblocal`: use an in-memory DynamoDBLocal server instead of real AWS
++  DynamoDB web service; launch the server if it is not yet started; creating the
++  table if it does not exist. You won't be charged bills for using DynamoDB in
++  test. However, the DynamoDBLocal is a simulator of real AWS DynamoDB and is
++  maintained separately, so it may be stale.
+ * `non-auth`: treat the s3guard metadata as authorative
+ 
+ ```bash
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestConstants.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestConstants.java
+index 46bc9a6..ccc28de 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestConstants.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestConstants.java
+@@ -143,6 +143,7 @@
+   String TEST_S3GUARD_IMPLEMENTATION = TEST_S3GUARD_PREFIX + ".implementation";
+   String TEST_S3GUARD_IMPLEMENTATION_LOCAL = "local";
+   String TEST_S3GUARD_IMPLEMENTATION_DYNAMO = "dynamo";
++  String TEST_S3GUARD_IMPLEMENTATION_DYNAMODBLOCAL = "dynamodblocal";
+   String TEST_S3GUARD_IMPLEMENTATION_NONE = "none";
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+index 608c496..f1b5d97 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+@@ -25,6 +25,10 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.fs.s3a.s3guard.DynamoDBClientFactory;
++import org.apache.hadoop.fs.s3a.s3guard.DynamoDBLocalClientFactory;
++import org.apache.hadoop.fs.s3a.s3guard.S3Guard;
++
+ import org.hamcrest.core.Is;
+ import org.junit.Assert;
+ import org.junit.Assume;
+@@ -414,6 +418,9 @@ public static void maybeEnableS3Guard(Configuration conf) {
+       case TEST_S3GUARD_IMPLEMENTATION_LOCAL:
+         implClass = S3GUARD_METASTORE_LOCAL;
+         break;
++      case TEST_S3GUARD_IMPLEMENTATION_DYNAMODBLOCAL:
++        conf.setClass(S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL,
++            DynamoDBLocalClientFactory.class, DynamoDBClientFactory.class);
+       case TEST_S3GUARD_IMPLEMENTATION_DYNAMO:
+         implClass = S3GUARD_METASTORE_DYNAMO;
+         break;
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBLocalClientFactory.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBLocalClientFactory.java
+new file mode 100644
+index 0000000..750cfb3
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBLocalClientFactory.java
+@@ -0,0 +1,148 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.s3guard;
++
++import java.io.File;
++import java.io.IOException;
++
++import com.amazonaws.ClientConfiguration;
++import com.amazonaws.auth.AWSCredentialsProvider;
++import com.amazonaws.client.builder.AwsClientBuilder;
++import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
++import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
++import com.amazonaws.services.dynamodbv2.local.main.ServerRunner;
++import com.amazonaws.services.dynamodbv2.local.server.DynamoDBProxyServer;
++import org.apache.commons.lang3.StringUtils;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.fs.s3a.DefaultS3ClientFactory;
++import org.apache.hadoop.net.ServerSocketUtil;
++
++import static org.apache.hadoop.fs.s3a.S3AUtils.createAWSCredentialProviderSet;
++import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBClientFactory.DefaultDynamoDBClientFactory.getRegion;
++
++/**
++ * A DynamoDBClientFactory implementation that creates AmazonDynamoDB clients
++ * against an in-memory DynamoDBLocal server instance.
++ *
++ * You won't be charged bills for issuing any DynamoDB requests. However, the
++ * DynamoDBLocal is considered a simulator of the DynamoDB web service, so it
++ * may be stale or different. For example, the throttling is not yet supported
++ * in DynamoDBLocal. This is for testing purpose only.
++ *
++ * To use this for creating DynamoDB client in tests:
++ * 1. As all DynamoDBClientFactory implementations, this should be configured.
++ * 2. The singleton DynamoDBLocal server instance is started automatically when
++ *    creating the AmazonDynamoDB client for the first time. It still merits to
++ *    launch the server before all the tests and fail fast if error happens.
++ * 3. The sever can be stopped explicitly, which is not actually needed in tests
++ *    as JVM termination will do that.
++ *
++ * @see DefaultDynamoDBClientFactory
++ */
++public class DynamoDBLocalClientFactory extends Configured
++    implements DynamoDBClientFactory {
++
++  /** The DynamoDBLocal dynamoDBLocalServer instance for testing. */
++  private static DynamoDBProxyServer dynamoDBLocalServer;
++  private static String ddbEndpoint;
++
++  private static final String SYSPROP_SQLITE_LIB = "sqlite4java.library.path";
++
++  @Override
++  public AmazonDynamoDB createDynamoDBClient(String defaultRegion)
++      throws IOException {
++    startSingletonServer();
++
++    final Configuration conf = getConf();
++    final AWSCredentialsProvider credentials =
++        createAWSCredentialProviderSet(null, conf);
++    final ClientConfiguration awsConf =
++        DefaultS3ClientFactory.createAwsConf(conf);
++    // fail fast in case of service errors
++    awsConf.setMaxErrorRetry(3);
++
++    final String region = getRegion(conf, defaultRegion);
++    LOG.info("Creating DynamoDBLocal client using endpoint {} in region {}",
++        ddbEndpoint, region);
++
++    return AmazonDynamoDBClientBuilder.standard()
++        .withCredentials(credentials)
++        .withClientConfiguration(awsConf)
++        .withEndpointConfiguration(
++            new AwsClientBuilder.EndpointConfiguration(ddbEndpoint, region))
++        .build();
++  }
++
++  /**
++   * Start a singleton in-memory DynamoDBLocal server if not started yet.
++   * @throws IOException if any error occurs
++   */
++  public synchronized static void startSingletonServer() throws IOException {
++    if (dynamoDBLocalServer != null) {
++      return;
++    }
++
++    // Set this property if it has not been set elsewhere
++    if (StringUtils.isEmpty(System.getProperty(SYSPROP_SQLITE_LIB))) {
++      String projectBuildDir = System.getProperty("project.build.directory");
++      if (StringUtils.isEmpty(projectBuildDir)) {
++        projectBuildDir = "target";
++      }
++      // sqlite4java lib should have been copied to $projectBuildDir/native-libs
++      System.setProperty(SYSPROP_SQLITE_LIB,
++          projectBuildDir + File.separator + "native-libs");
++      LOG.info("Setting {} -> {}",
++          SYSPROP_SQLITE_LIB, System.getProperty(SYSPROP_SQLITE_LIB));
++    }
++
++    try {
++      // Start an in-memory local DynamoDB instance
++      final String port = String.valueOf(ServerSocketUtil.getPort(0, 100));
++      dynamoDBLocalServer = ServerRunner.createServerFromCommandLineArgs(
++          new String[]{"-inMemory", "-port", port});
++      dynamoDBLocalServer.start();
++      ddbEndpoint = "http://localhost:" + port;
++      LOG.info("DynamoDBLocal singleton server was started at {}", ddbEndpoint);
++    } catch (Throwable t) {
++      String msg = "Error starting DynamoDBLocal server at " + ddbEndpoint;
++      LOG.error(msg, t);
++      throw new IOException(msg, t);
++    }
++  }
++
++  /**
++   * Stop the in-memory DynamoDBLocal server if it is started.
++   * @throws IOException if any error occurs
++   */
++  public synchronized static void stopSingletonServer() throws IOException {
++    if (dynamoDBLocalServer != null) {
++      LOG.info("Shutting down the in-memory DynamoDBLocal server");
++      try {
++        dynamoDBLocalServer.stop();
++      } catch (Throwable t) {
++        String msg = "Error stopping DynamoDBLocal server at " + ddbEndpoint;
++        LOG.error(msg, t);
++        throw new IOException(msg, t);
++      }
++    }
++  }
++
++}
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index 84da174..f3ce1e4 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -24,24 +24,17 @@
+ import java.util.Collection;
+ 
+ import com.amazonaws.AmazonServiceException;
+-import com.amazonaws.ClientConfiguration;
+-import com.amazonaws.auth.AWSCredentialsProvider;
+-import com.amazonaws.client.builder.AwsClientBuilder;
+-import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
+-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
+ import com.amazonaws.services.dynamodbv2.document.DynamoDB;
+ import com.amazonaws.services.dynamodbv2.document.Item;
+ import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
+ import com.amazonaws.services.dynamodbv2.document.Table;
+-import com.amazonaws.services.dynamodbv2.local.main.ServerRunner;
+-import com.amazonaws.services.dynamodbv2.local.server.DynamoDBProxyServer;
+ import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughputDescription;
+ import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
+ import com.amazonaws.services.dynamodbv2.model.TableDescription;
+ 
+ import org.apache.commons.collections.CollectionUtils;
+ import org.apache.hadoop.fs.s3a.Tristate;
+-import org.apache.log4j.Level;
++
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ import org.junit.Rule;
+@@ -52,34 +45,29 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.conf.Configured;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.s3a.Constants;
+-import org.apache.hadoop.fs.s3a.DefaultS3ClientFactory;
+ import org.apache.hadoop.fs.s3a.MockS3ClientFactory;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.s3a.S3ClientFactory;
+-import org.apache.hadoop.net.ServerSocketUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+-import org.apache.hadoop.test.GenericTestUtils;
+ 
+ import static org.apache.hadoop.fs.s3a.Constants.*;
+-import static org.apache.hadoop.fs.s3a.S3AUtils.createAWSCredentialProviderSet;
+ import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.*;
+ import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.*;
+ 
+ /**
+  * Test that {@link DynamoDBMetadataStore} implements {@link MetadataStore}.
+  *
+- * In this unit test, we create an in-memory DynamoDBLocal server instance for
+- * all unit test cases.  You won't be charged bills for DynamoDB requests when
+- * you run this test.  An {@link S3AFileSystem} object is created and shared for
++ * In this unit test, we use an in-memory DynamoDBLocal server instead of real
++ * AWS DynamoDB. An {@link S3AFileSystem} object is created and shared for
+  * initializing {@link DynamoDBMetadataStore} objects.  There are no real S3
+- * request issued as the underlying AWS S3Client is mocked.
++ * request issued as the underlying AWS S3Client is mocked.  You won't be
++ * charged bills for AWS S3 or DynamoDB when you run this test.
+  *
+  * According to the base class, every test case will have independent contract
+  * to create a new {@link DynamoDBMetadataStore} instance and initializes it.
+@@ -96,9 +84,6 @@
+       VERSION_MARKER_PRIMARY_KEY = createVersionMarkerPrimaryKey(
+       DynamoDBMetadataStore.VERSION_MARKER);
+ 
+-  /** The DynamoDBLocal dynamoDBLocalServer instance for testing. */
+-  private static DynamoDBProxyServer dynamoDBLocalServer;
+-  private static String ddbEndpoint;
+   /** The DynamoDB instance that can issue requests directly to server. */
+   private static DynamoDB dynamoDB;
+ 
+@@ -106,22 +91,11 @@
+   public final Timeout timeout = new Timeout(60 * 1000);
+ 
+   /**
+-   * Sets up the in-memory DynamoDBLocal server and initializes s3 file system.
++   * Start the in-memory DynamoDBLocal server and initializes s3 file system.
+    */
+   @BeforeClass
+   public static void setUpBeforeClass() throws Exception {
+-    GenericTestUtils.setLogLevel(DynamoDBMetadataStore.LOG, Level.ALL);
+-    // sqlite4java library should have been copied to target/native-libs
+-    System.setProperty("sqlite4java.library.path", "target/native-libs");
+-
+-    // Set up the in-memory local DynamoDB instance for all test cases
+-    final String port = String.valueOf(ServerSocketUtil.getPort(0, 100));
+-    dynamoDBLocalServer = ServerRunner.createServerFromCommandLineArgs(
+-        new String[] {"-inMemory", "-port", port});
+-    dynamoDBLocalServer.start();
+-    ddbEndpoint = "http://localhost:" + port;
+-    LOG.info("DynamoDBLocal for test was started at {}", ddbEndpoint);
+-
++    DynamoDBLocalClientFactory.startSingletonServer();
+     try {
+       dynamoDB = new DynamoDBMSContract().getMetadataStore().getDynamoDB();
+     } catch (AmazonServiceException e) {
+@@ -139,36 +113,7 @@ public static void tearDownAfterClass() throws Exception {
+     if (dynamoDB != null) {
+       dynamoDB.shutdown();
+     }
+-    if (dynamoDBLocalServer != null) {
+-      LOG.info("Shutting down the in-memory local DynamoDB server");
+-      try {
+-        dynamoDBLocalServer.stop();
+-      } catch (Exception e) {
+-        final String msg = "Got exception to stop the DynamoDBLocal server. ";
+-        LOG.error(msg, e);
+-        fail(msg + e.getLocalizedMessage());
+-      }
+-    }
+-  }
+-
+-  static class LocalDynamoDBClientFactory extends Configured
+-      implements DynamoDBClientFactory {
+-    @Override
+-    public AmazonDynamoDB createDynamoDBClient(String region)
+-        throws IOException {
+-      final Configuration conf = getConf();
+-      final AWSCredentialsProvider credentials =
+-          createAWSCredentialProviderSet(null, conf);
+-      final ClientConfiguration awsConf =
+-          DefaultS3ClientFactory.createAwsConf(conf);
+-      LOG.info("Creating AmazonDynamoDB client using endpoint {}", ddbEndpoint);
+-      return AmazonDynamoDBClientBuilder.standard()
+-          .withCredentials(credentials)
+-          .withClientConfiguration(awsConf)
+-          .withEndpointConfiguration(
+-              new AwsClientBuilder.EndpointConfiguration(ddbEndpoint, region))
+-          .build();
+-    }
++    DynamoDBLocalClientFactory.stopSingletonServer();
+   }
+ 
+   /**
+@@ -189,7 +134,7 @@ public AmazonDynamoDB createDynamoDBClient(String region)
+       conf.set(Constants.SECRET_KEY, "dummy-secret-key");
+       conf.setBoolean(Constants.S3GUARD_DDB_TABLE_CREATE_KEY, true);
+       conf.setClass(S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL,
+-          LocalDynamoDBClientFactory.class, DynamoDBClientFactory.class);
++          DynamoDBLocalClientFactory.class, DynamoDBClientFactory.class);
+ 
+       // always create new file system object for a test contract
+       s3afs = (S3AFileSystem) FileSystem.newInstance(conf);
+-- 
+1.7.9.5
+

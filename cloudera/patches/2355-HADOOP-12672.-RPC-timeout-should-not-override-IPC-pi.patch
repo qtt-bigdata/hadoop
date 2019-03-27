@@ -1,0 +1,301 @@
+From 09ef4b8a72180fe637685c755cfa279a34e15272 Mon Sep 17 00:00:00 2001
+From: Masatake Iwasaki <iwasakims@apache.org>
+Date: Wed, 6 Apr 2016 03:22:48 +0900
+Subject: [PATCH 2355/2848] HADOOP-12672. RPC timeout should not override IPC
+ ping interval (iwasakims)
+
+(cherry picked from commit 85ec5573eb9fd746a9295ecc6fe1ae683073aaf5)
+(cherry picked from commit 886273e123c53addefbc6021bffcefa9c5b67a83)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/impl/DfsClientConf.java
+
+Change-Id: If14b8db2bd2bd1f4484c4499b007051f9b1eeb7d
+---
+ .../main/java/org/apache/hadoop/ipc/Client.java    |   57 ++++++++++----
+ .../src/main/resources/core-default.xml            |    9 +--
+ .../test/java/org/apache/hadoop/ipc/TestRPC.java   |   78 +++++++++++++++++---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |    2 +-
+ 4 files changed, 115 insertions(+), 31 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+index f3fcf87..2b17923 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+@@ -238,14 +238,33 @@ public static final int getPingInterval(Configuration conf) {
+    * 
+    * @param conf Configuration
+    * @return the timeout period in milliseconds. -1 if no timeout value is set
++   * @deprecated use {@link #getRpcTimeout(Configuration)} instead
+    */
++  @Deprecated
+   final public static int getTimeout(Configuration conf) {
++    int timeout = getRpcTimeout(conf);
++    if (timeout > 0)  {
++      return timeout;
++    }
+     if (!conf.getBoolean(CommonConfigurationKeys.IPC_CLIENT_PING_KEY,
+         CommonConfigurationKeys.IPC_CLIENT_PING_DEFAULT)) {
+       return getPingInterval(conf);
+     }
+     return -1;
+   }
++
++  /**
++   * The time after which a RPC will timeout.
++   *
++   * @param conf Configuration
++   * @return the timeout period in milliseconds.
++   */
++  public static final int getRpcTimeout(Configuration conf) {
++    int timeout =
++        conf.getInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY,
++            CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_DEFAULT);
++    return (timeout < 0) ? 0 : timeout;
++  }
+   /**
+    * set the connection timeout value in configuration
+    * 
+@@ -385,15 +404,16 @@ public synchronized Writable getRpcResponse() {
+     private Socket socket = null;                 // connected socket
+     private DataInputStream in;
+     private DataOutputStream out;
+-    private int rpcTimeout;
++    private final int rpcTimeout;
+     private int maxIdleTime; //connections will be culled if it was idle for 
+     //maxIdleTime msecs
+     private final RetryPolicy connectionRetryPolicy;
+     private final int maxRetriesOnSasl;
+     private int maxRetriesOnSocketTimeouts;
+     private boolean tcpNoDelay; // if T then disable Nagle's Algorithm
+-    private boolean doPing; //do we need to send ping message
+-    private int pingInterval; // how often sends ping to the server in msecs
++    private final boolean doPing; //do we need to send ping message
++    private final int pingInterval; // how often sends ping to the server
++    private final int soTimeout; // used by ipc ping and rpc timeout
+     private ByteArrayOutputStream pingRequest; // ping message
+     
+     // currently active calls
+@@ -431,6 +451,14 @@ public Connection(ConnectionId remoteId, int serviceClass) throws IOException {
+         pingHeader.writeDelimitedTo(pingRequest);
+       }
+       this.pingInterval = remoteId.getPingInterval();
++      if (rpcTimeout > 0) {
++        // effective rpc timeout is rounded up to multiple of pingInterval
++        // if pingInterval < rpcTimeout.
++        this.soTimeout = (doPing && pingInterval < rpcTimeout) ?
++            pingInterval : rpcTimeout;
++      } else {
++        this.soTimeout = pingInterval;
++      }
+       this.serviceClass = serviceClass;
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("The ping interval is " + this.pingInterval + " ms.");
+@@ -481,12 +509,12 @@ protected PingInputStream(InputStream in) {
+ 
+       /* Process timeout exception
+        * if the connection is not going to be closed or 
+-       * is not configured to have a RPC timeout, send a ping.
+-       * (if rpcTimeout is not set to be 0, then RPC should timeout.
+-       * otherwise, throw the timeout exception.
++       * the RPC is not timed out yet, send a ping.
+        */
+-      private void handleTimeout(SocketTimeoutException e) throws IOException {
+-        if (shouldCloseConnection.get() || !running.get() || rpcTimeout > 0) {
++      private void handleTimeout(SocketTimeoutException e, int waiting)
++          throws IOException {
++        if (shouldCloseConnection.get() || !running.get() ||
++            (0 < rpcTimeout && rpcTimeout <= waiting)) {
+           throw e;
+         } else {
+           sendPing();
+@@ -500,11 +528,13 @@ private void handleTimeout(SocketTimeoutException e) throws IOException {
+        */
+       @Override
+       public int read() throws IOException {
++        int waiting = 0;
+         do {
+           try {
+             return super.read();
+           } catch (SocketTimeoutException e) {
+-            handleTimeout(e);
++            waiting += soTimeout;
++            handleTimeout(e, waiting);
+           }
+         } while (true);
+       }
+@@ -517,11 +547,13 @@ public int read() throws IOException {
+        */
+       @Override
+       public int read(byte[] buf, int off, int len) throws IOException {
++        int waiting = 0;
+         do {
+           try {
+             return super.read(buf, off, len);
+           } catch (SocketTimeoutException e) {
+-            handleTimeout(e);
++            waiting += soTimeout;
++            handleTimeout(e, waiting);
+           }
+         } while (true);
+       }
+@@ -614,10 +646,7 @@ private synchronized void setupConnection() throws IOException {
+           }
+           
+           NetUtils.connect(this.socket, server, connectionTimeout);
+-          if (rpcTimeout > 0) {
+-            pingInterval = rpcTimeout;  // rpcTimeout overwrites pingInterval
+-          }
+-          this.socket.setSoTimeout(pingInterval);
++          this.socket.setSoTimeout(soTimeout);
+           return;
+         } catch (ConnectTimeoutException toe) {
+           /* Check for an address change and update the local reference.
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index bcac5c6..6259e32 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -1406,7 +1406,7 @@ for ldap providers in the same way as above does.
+   <value>true</value>
+   <description>Send a ping to the server when timeout on reading the response,
+   if set to true. If no failure is detected, the client retries until at least
+-  a byte is read.
++  a byte is read or the time given by ipc.client.rpc-timeout.ms is passed.
+   </description>
+ </property>
+ 
+@@ -1423,10 +1423,9 @@ for ldap providers in the same way as above does.
+   <name>ipc.client.rpc-timeout.ms</name>
+   <value>0</value>
+   <description>Timeout on waiting response from server, in milliseconds.
+-  Currently this timeout works only when ipc.client.ping is set to true
+-  because it uses the same facilities with IPC ping.
+-  The timeout overrides the ipc.ping.interval and client will throw exception
+-  instead of sending ping when the interval is passed.
++  If ipc.client.ping is set to true and this rpc-timeout is greater than
++  the value of ipc.ping.interval, the effective value of the rpc-timeout is
++  rounded up to multiple of ipc.ping.interval.
+   </description>
+ </property>
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+index 158cd58..d680a20 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+@@ -92,6 +92,7 @@
+ 
+ import com.google.protobuf.DescriptorProtos;
+ import com.google.protobuf.DescriptorProtos.EnumDescriptorProto;
++import com.google.protobuf.ServiceException;
+ 
+ /** Unit tests for RPC. */
+ @SuppressWarnings("deprecation")
+@@ -1181,24 +1182,79 @@ public Void call() throws IOException, InterruptedException {
+    */
+   @Test(timeout=30000)
+   public void testClientRpcTimeout() throws Exception {
+-    final Server server = new RPC.Builder(conf)
++    TestProtocol proxy = null;
++    Server server = new RPC.Builder(conf)
+         .setProtocol(TestProtocol.class).setInstance(new TestImpl())
+         .setBindAddress(ADDRESS).setPort(0)
+         .setQueueSizePerHandler(1).setNumHandlers(1).setVerbose(true)
+         .build();
+     server.start();
+ 
+-    final Configuration conf = new Configuration();
+-    conf.setInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY, 1000);
+-    final TestProtocol proxy =
+-        RPC.getProxy(TestProtocol.class, TestProtocol.versionID,
+-            NetUtils.getConnectAddress(server), conf);
+-
+     try {
+-      proxy.sleep(3000);
+-      fail("RPC should time out.");
+-    } catch (SocketTimeoutException e) {
+-      LOG.info("got expected timeout.", e);
++      // Test RPC timeout with default ipc.client.ping.
++      try {
++        Configuration c = new Configuration(conf);
++        c.setInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY, 1000);
++        proxy =
++            RPC.getProxy(TestProtocol.class, TestProtocol.versionID,
++                NetUtils.getConnectAddress(server), c);
++        proxy.sleep(3000);
++        fail("RPC should time out.");
++      } catch (SocketTimeoutException e) {
++        LOG.info("got expected timeout.", e);
++      }
++
++      // Test RPC timeout when ipc.client.ping is false.
++      try {
++        Configuration c = new Configuration(conf);
++        c.setBoolean(CommonConfigurationKeys.IPC_CLIENT_PING_KEY, false);
++        c.setInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY, 1000);
++        proxy =
++            RPC.getProxy(TestProtocol.class, TestProtocol.versionID,
++                NetUtils.getConnectAddress(server), c);
++        proxy.sleep(3000);
++        fail("RPC should time out.");
++      } catch (SocketTimeoutException e) {
++        LOG.info("got expected timeout.", e);
++      }
++
++      // Test negative timeout value.
++      try {
++        Configuration c = new Configuration(conf);
++        c.setInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY, -1);
++        proxy =
++            RPC.getProxy(TestProtocol.class, TestProtocol.versionID,
++                NetUtils.getConnectAddress(server), c);
++        proxy.sleep(2000);
++      } catch (SocketTimeoutException e) {
++        LOG.info("got unexpected exception.", e);
++        fail("RPC should not time out.");
++      }
++
++      // Test RPC timeout greater than ipc.ping.interval.
++      try {
++        Configuration c = new Configuration(conf);
++        c.setBoolean(CommonConfigurationKeys.IPC_CLIENT_PING_KEY, true);
++        c.setInt(CommonConfigurationKeys.IPC_PING_INTERVAL_KEY, 800);
++        c.setInt(CommonConfigurationKeys.IPC_CLIENT_RPC_TIMEOUT_KEY, 1000);
++        proxy =
++            RPC.getProxy(TestProtocol.class, TestProtocol.versionID,
++                NetUtils.getConnectAddress(server), c);
++        try {
++          // should not time out because effective rpc-timeout is
++          // multiple of ping interval: 1600 (= 800 * (1000 / 800 + 1))
++          proxy.sleep(1300);
++        } catch (SocketTimeoutException e) {
++          LOG.info("got unexpected exception.", e);
++          fail("RPC should not time out.");
++        }
++
++        proxy.sleep(2000);
++        fail("RPC should time out.");
++      } catch (SocketTimeoutException e) {
++        LOG.info("got expected timeout.", e);
++      }
++
+     } finally {
+       server.stop();
+       RPC.stopProxy(proxy);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index f7accd2..060d4f8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -350,7 +350,7 @@
+ 
+     public Conf(Configuration conf) {
+       // The hdfsTimeout is currently the same as the ipc timeout 
+-      hdfsTimeout = Client.getTimeout(conf);
++      hdfsTimeout = Client.getRpcTimeout(conf);
+       maxFailoverAttempts = conf.getInt(
+           DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_KEY,
+           DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_DEFAULT);
+-- 
+1.7.9.5
+

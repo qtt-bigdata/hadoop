@@ -1,0 +1,456 @@
+From b3f9412a327cb5c4f453e418b9a6530a146a8a5e Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Tue, 23 Feb 2016 20:49:09 +0000
+Subject: [PATCH 1398/2848] YARN-2046. Out of band heartbeats are sent only on
+ container kill and possibly too early.
+ Contributed by Ming Ma (cherry picked from commit
+ d284e187b8db43056236032ebc2114ee462c27f6)
+
+(cherry picked from commit acffe82353b0af878539bd189fc42033f80689ba)
+
+ Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/ContainerImpl.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/amrmproxy/BaseAMRMProxyTest.java
+
+Changes to be committed:
+	modified:   hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainerMemoryCapabilitiesAbsoluteMinimum.java
+
+Change-Id: I5d91c0c40026bd71f2f90f87360dad6e80ba92c8
+---
+ .../hadoop/yarn/server/nodemanager/Context.java    |    2 ++
+ .../yarn/server/nodemanager/NodeManager.java       |   10 +++++++
+ .../containermanager/ContainerManagerImpl.java     |   12 +++------
+ .../containermanager/container/ContainerImpl.java  |   24 ++++++++++-------
+ .../yarn/server/nodemanager/TestEventFlow.java     |    1 +
+ .../server/nodemanager/TestNodeStatusUpdater.java  |   28 +++++++++++++-------
+ .../containermanager/BaseContainerManagerTest.java |    1 +
+ .../containermanager/TestAuxServices.java          |    7 +++--
+ .../containermanager/container/TestContainer.java  |   16 ++++++++---
+ ...ContainerMemoryCapabilitiesAbsoluteMinimum.java |    9 +++++--
+ .../server/nodemanager/webapp/TestNMWebServer.java |    5 ++--
+ 11 files changed, 78 insertions(+), 37 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/Context.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/Context.java
+index 42a4234..910c718 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/Context.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/Context.java
+@@ -82,4 +82,6 @@
+ 
+   ConcurrentLinkedQueue<LogAggregationReport>
+       getLogAggregationStatusForApps();
++
++  NodeStatusUpdater getNodeStatusUpdater();
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+index cf54949..f7136aa 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+@@ -265,6 +265,7 @@ protected void serviceInit(Configuration conf) throws Exception {
+     // StatusUpdater should be added last so that it get started last 
+     // so that we make sure everything is up before registering with RM. 
+     addService(nodeStatusUpdater);
++    ((NMContext) context).setNodeStatusUpdater(nodeStatusUpdater);
+ 
+     super.serviceInit(conf);
+     // TODO add local dirs to del
+@@ -365,6 +366,7 @@ public void run() {
+     private boolean isDecommissioned = false;
+     private final ConcurrentLinkedQueue<LogAggregationReport>
+         logAggregationReportForApps;
++    private NodeStatusUpdater nodeStatusUpdater;
+ 
+     public NMContext(NMContainerTokenSecretManager containerTokenSecretManager,
+         NMTokenSecretManagerInNM nmTokenSecretManager,
+@@ -477,6 +479,14 @@ public void setSystemCrendentialsForApps(
+         getLogAggregationStatusForApps() {
+       return this.logAggregationReportForApps;
+     }
++
++    public NodeStatusUpdater getNodeStatusUpdater() {
++      return this.nodeStatusUpdater;
++    }
++
++    public void setNodeStatusUpdater(NodeStatusUpdater nodeStatusUpdater) {
++      this.nodeStatusUpdater = nodeStatusUpdater;
++    }
+   }
+ 
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+index 9024c6a..24458aa 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+@@ -307,9 +307,9 @@ private void recoverContainer(RecoveredContainerState rcs)
+     if (context.getApplications().containsKey(appId)) {
+       Credentials credentials = parseCredentials(launchContext);
+       Container container = new ContainerImpl(getConfig(), dispatcher,
+-          context.getNMStateStore(), req.getContainerLaunchContext(),
++          req.getContainerLaunchContext(),
+           credentials, metrics, token, rcs.getStatus(), rcs.getExitCode(),
+-          rcs.getDiagnostics(), rcs.getKilled());
++          rcs.getDiagnostics(), rcs.getKilled(), context);
+       context.getContainers().put(containerId, container);
+       dispatcher.getEventHandler().handle(
+           new ApplicationContainerInitEvent(container));
+@@ -820,8 +820,8 @@ private void startContainerInternal(NMTokenIdentifier nmTokenIdentifier,
+ 
+     Container container =
+         new ContainerImpl(getConfig(), this.dispatcher,
+-            context.getNMStateStore(), launchContext,
+-          credentials, metrics, containerTokenIdentifier);
++            launchContext, credentials, metrics, containerTokenIdentifier,
++            context);
+     ApplicationId applicationID =
+         containerId.getApplicationAttemptId().getApplicationId();
+     if (context.getContainers().putIfAbsent(containerId, container) != null) {
+@@ -969,10 +969,6 @@ private void stopContainerInternal(NMTokenIdentifier nmTokenIdentifier,
+       NMAuditLogger.logSuccess(container.getUser(),    
+         AuditConstants.STOP_CONTAINER, "ContainerManageImpl", containerID
+           .getApplicationAttemptId().getApplicationId(), containerID);
+-
+-      // TODO: Move this code to appropriate place once kill_container is
+-      // implemented.
+-      nodeStatusUpdater.sendOutofBandHeartBeat();
+     }
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/ContainerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/ContainerImpl.java
+index 3bb0241..7511ea5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/ContainerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/ContainerImpl.java
+@@ -64,6 +64,7 @@
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.event.LogHandlerContainerFinishedEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainerStartMonitoringEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainerStopMonitoringEvent;
++import org.apache.hadoop.yarn.server.nodemanager.Context;
+ import org.apache.hadoop.yarn.server.nodemanager.metrics.NodeManagerMetrics;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerStatus;
+@@ -117,14 +118,15 @@
+       RecoveredContainerStatus.REQUESTED;
+   // whether container was marked as killed after recovery
+   private boolean recoveredAsKilled = false;
++  private Context context;
+ 
+   public ContainerImpl(Configuration conf, Dispatcher dispatcher,
+-      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
+-      Credentials creds, NodeManagerMetrics metrics,
+-      ContainerTokenIdentifier containerTokenIdentifier) {
++      ContainerLaunchContext launchContext, Credentials creds,
++      NodeManagerMetrics metrics,
++      ContainerTokenIdentifier containerTokenIdentifier, Context context) {
+     this.daemonConf = conf;
+     this.dispatcher = dispatcher;
+-    this.stateStore = stateStore;
++    this.stateStore = context.getNMStateStore();
+     this.launchContext = launchContext;
+     this.containerTokenIdentifier = containerTokenIdentifier;
+     this.containerId = containerTokenIdentifier.getContainerID();
+@@ -136,19 +138,20 @@ public ContainerImpl(Configuration conf, Dispatcher dispatcher,
+     ReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+     this.readLock = readWriteLock.readLock();
+     this.writeLock = readWriteLock.writeLock();
++    this.context = context;
+ 
+     stateMachine = stateMachineFactory.make(this);
+   }
+ 
+   // constructor for a recovered container
+   public ContainerImpl(Configuration conf, Dispatcher dispatcher,
+-      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
+-      Credentials creds, NodeManagerMetrics metrics,
++      ContainerLaunchContext launchContext, Credentials creds,
++      NodeManagerMetrics metrics,
+       ContainerTokenIdentifier containerTokenIdentifier,
+       RecoveredContainerStatus recoveredStatus, int exitCode,
+-      String diagnostics, boolean wasKilled) {
+-    this(conf, dispatcher, stateStore, launchContext, creds, metrics,
+-        containerTokenIdentifier);
++      String diagnostics, boolean wasKilled, Context context) {
++    this(conf, dispatcher, launchContext, creds, metrics,
++        containerTokenIdentifier, context);
+     this.recoveredStatus = recoveredStatus;
+     this.exitCode = exitCode;
+     this.recoveredAsKilled = wasKilled;
+@@ -922,11 +925,12 @@ public void transition(ContainerImpl container, ContainerEvent event) {
+       container.sendFinishedEvents();
+       //if the current state is NEW it means the CONTAINER_INIT was never 
+       // sent for the event, thus no need to send the CONTAINER_STOP
+-      if (container.getCurrentState() 
++      if (container.getCurrentState()
+           != org.apache.hadoop.yarn.api.records.ContainerState.NEW) {
+         container.dispatcher.getEventHandler().handle(new AuxServicesEvent
+             (AuxServicesEventType.CONTAINER_STOP, container));
+       }
++      container.context.getNodeStatusUpdater().sendOutofBandHeartBeat();
+     }
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+index d2caefe..6962d59 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+@@ -131,6 +131,7 @@ public long getRMIdentifier() {
+     nodeStatusUpdater.init(conf);
+     ((NMContext)context).setContainerManager(containerManager);
+     nodeStatusUpdater.start();
++    ((NMContext)context).setNodeStatusUpdater(nodeStatusUpdater);
+     containerManager.init(conf);
+     containerManager.start();
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+index 16f6de5..aca5511 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+@@ -242,8 +242,10 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+                 firstContainerID, InetAddress.getByName("localhost")
+                     .getCanonicalHostName(), 1234, user, resource,
+                 currentTime + 10000, 123, "password".getBytes(), currentTime));
++        Context context = mock(Context.class);
++        when(context.getNMStateStore()).thenReturn(stateStore);
+         Container container = new ContainerImpl(conf, mockDispatcher,
+-            stateStore, launchContext, null, mockMetrics, containerToken);
++            launchContext, null, mockMetrics, containerToken, context);
+         this.context.getContainers().put(firstContainerID, container);
+       } else if (heartBeatID == 2) {
+         // Checks on the RM end
+@@ -272,8 +274,10 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+                 secondContainerID, InetAddress.getByName("localhost")
+                     .getCanonicalHostName(), 1234, user, resource,
+                 currentTime + 10000, 123, "password".getBytes(), currentTime));
++        Context context = mock(Context.class);
++        when(context.getNMStateStore()).thenReturn(stateStore);
+         Container container = new ContainerImpl(conf, mockDispatcher,
+-            stateStore, launchContext, null, mockMetrics, containerToken);
++            launchContext, null, mockMetrics, containerToken, context);
+         this.context.getContainers().put(secondContainerID, container);
+       } else if (heartBeatID == 3) {
+         // Checks on the RM end
+@@ -889,8 +893,9 @@ public void testRemovePreviousCompletedContainersFromContext() throws Exception
+             BuilderUtils.newResource(1024, 1), 0, 123,
+             "password".getBytes(), 0);
+     Container anyCompletedContainer = new ContainerImpl(conf, null,
+-        null, null, null, null,
+-        BuilderUtils.newContainerTokenIdentifier(containerToken)) {
++        null, null, null,
++        BuilderUtils.newContainerTokenIdentifier(containerToken),
++        nm.getNMContext()) {
+ 
+       @Override
+       public ContainerState getCurrentState() {
+@@ -910,8 +915,9 @@ public ContainerState getCurrentState() {
+           1234, "anyUser", BuilderUtils.newResource(1024, 1), 0, 123,
+           "password".getBytes(), 0);
+     Container runningContainer =
+-        new ContainerImpl(conf, null, null, null, null, null,
+-          BuilderUtils.newContainerTokenIdentifier(runningContainerToken)) {
++        new ContainerImpl(conf, null, null, null, null,
++          BuilderUtils.newContainerTokenIdentifier(runningContainerToken),
++          nm.getNMContext()) {
+           @Override
+           public ContainerState getCurrentState() {
+             return ContainerState.RUNNING;
+@@ -968,8 +974,9 @@ public void testCompletedContainersIsRecentlyStopped() throws Exception {
+             BuilderUtils.newResource(1024, 1), 0, 123,
+             "password".getBytes(), 0);
+     Container completedContainer = new ContainerImpl(conf, null,
+-        null, null, null, null,
+-        BuilderUtils.newContainerTokenIdentifier(containerToken)) {
++        null, null, null,
++        BuilderUtils.newContainerTokenIdentifier(containerToken),
++        nm.getNMContext()) {
+       @Override
+       public ContainerState getCurrentState() {
+         return ContainerState.COMPLETE;
+@@ -1005,8 +1012,9 @@ public void testCleanedupApplicationContainerCleanup() throws IOException {
+             BuilderUtils.newResource(1024, 1), 0, 123,
+             "password".getBytes(), 0);
+     Container anyCompletedContainer = new ContainerImpl(conf, null,
+-        null, null, null, null,
+-        BuilderUtils.newContainerTokenIdentifier(containerToken)) {
++        null, null, null,
++        BuilderUtils.newContainerTokenIdentifier(containerToken),
++        nm.getNMContext()) {
+ 
+       @Override
+       public ContainerState getCurrentState() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+index 73c709b..2541acc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+@@ -183,6 +183,7 @@ public void setup() throws IOException {
+     nodeStatusUpdater.init(conf);
+     containerManager.init(conf);
+     nodeStatusUpdater.start();
++    ((NMContext)context).setNodeStatusUpdater(nodeStatusUpdater);
+   }
+ 
+   protected ContainerManagerImpl
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestAuxServices.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestAuxServices.java
+index 757cdc8..7488278 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestAuxServices.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestAuxServices.java
+@@ -25,6 +25,7 @@
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
++import static org.mockito.Mockito.mock;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -53,6 +54,7 @@
+ import org.apache.hadoop.yarn.server.api.AuxiliaryService;
+ import org.apache.hadoop.yarn.server.api.ContainerInitializationContext;
+ import org.apache.hadoop.yarn.server.api.ContainerTerminationContext;
++import org.apache.hadoop.yarn.server.nodemanager.Context;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerImpl;
+ import org.junit.Assert;
+@@ -191,8 +193,9 @@ public void testAuxEventDispatch() {
+     ContainerTokenIdentifier cti = new ContainerTokenIdentifier(
+         ContainerId.newContainerId(attemptId, 1), "", "",
+         Resource.newInstance(1, 1), 0,0,0, Priority.newInstance(0), 0);
+-    Container container = new ContainerImpl(null, null, null, null, null,
+-        null, cti);
++    Context context = mock(Context.class);
++    Container container = new ContainerImpl(null, null, null, null,
++        null, cti, context);
+     ContainerId containerId = container.getContainerId();
+     Resource resource = container.getResource();
+     event = new AuxServicesEvent(AuxServicesEventType.CONTAINER_INIT,container);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainer.java
+index 34704e9..94e3c5d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainer.java
+@@ -88,6 +88,7 @@
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainersMonitorEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainersMonitorEventType;
+ import org.apache.hadoop.yarn.server.nodemanager.metrics.NodeManagerMetrics;
++import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdater;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMNullStateStoreService;
+ import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+ import org.junit.Assert;
+@@ -261,6 +262,7 @@ public void testInitWhileDone() throws Exception {
+       wc.containerSuccessful();
+       wc.containerResourcesCleanup();
+       assertEquals(ContainerState.DONE, wc.c.getContainerState());
++      verifyOutofBandHeartBeat(wc);
+       assertNull(wc.c.getLocalizedResources());
+       // Now in DONE, issue INIT
+       wc.initContainer();
+@@ -290,6 +292,7 @@ public void testLocalizationFailureAtDone() throws Exception {
+       wc.containerSuccessful();
+       wc.containerResourcesCleanup();
+       assertEquals(ContainerState.DONE, wc.c.getContainerState());
++      verifyOutofBandHeartBeat(wc);
+       assertNull(wc.c.getLocalizedResources());
+       // Now in DONE, issue RESOURCE_FAILED as done by LocalizeRunner
+       wc.resourceFailedContainer();
+@@ -336,6 +339,7 @@ public void testKillOnNew() throws Exception {
+       int killed = metrics.getKilledContainers();
+       wc.killContainer();
+       assertEquals(ContainerState.DONE, wc.c.getContainerState());
++      verifyOutofBandHeartBeat(wc);
+       assertEquals(ContainerExitStatus.KILLED_BY_RESOURCEMANAGER,
+           wc.c.cloneAndGetContainerStatus().getExitStatus());
+       assertTrue(wc.c.cloneAndGetContainerStatus().getDiagnostics()
+@@ -653,6 +657,10 @@ private void verifyCleanupCall(WrappedContainer wc) throws Exception {
+     verify(wc.localizerBus).handle(argThat(matchesReq));
+   }
+ 
++  private void verifyOutofBandHeartBeat(WrappedContainer wc) {
++    verify(wc.context.getNodeStatusUpdater()).sendOutofBandHeartBeat();
++  }
++
+   private static class ResourcesReleasedMatcher extends
+       ArgumentMatcher<LocalizationEvent> {
+     final HashSet<LocalResourceRequest> resources =
+@@ -779,6 +787,7 @@ public boolean matches(Object o) {
+     final Container c;
+     final Map<String, LocalResource> localResources;
+     final Map<String, ByteBuffer> serviceData;
++    final Context context = mock(Context.class);
+ 
+     WrappedContainer(int appId, long timestamp, int id, String user)
+         throws IOException {
+@@ -804,11 +813,12 @@ public boolean matches(Object o) {
+       dispatcher.register(ApplicationEventType.class, appBus);
+       dispatcher.register(LogHandlerEventType.class, LogBus);
+ 
+-      Context context = mock(Context.class);
+       when(context.getApplications()).thenReturn(
+           new ConcurrentHashMap<ApplicationId, Application>());
+       NMNullStateStoreService stateStore = new NMNullStateStoreService();
+       when(context.getNMStateStore()).thenReturn(stateStore);
++      NodeStatusUpdater nodeStatusUpdater = mock(NodeStatusUpdater.class);
++      when(context.getNodeStatusUpdater()).thenReturn(nodeStatusUpdater);
+       ContainerExecutor executor = mock(ContainerExecutor.class);
+       launcher =
+           new ContainersLauncher(context, dispatcher, executor, null, null);
+@@ -864,8 +874,8 @@ public boolean matches(Object o) {
+       }
+       when(ctxt.getServiceData()).thenReturn(serviceData);
+ 
+-      c = new ContainerImpl(conf, dispatcher, new NMNullStateStoreService(),
+-          ctxt, null, metrics, identifier);
++      c = new ContainerImpl(conf, dispatcher, ctxt, null, metrics, identifier,
++          context);
+       dispatcher.register(ContainerEventType.class,
+           new EventHandler<ContainerEvent>() {
+             @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainerMemoryCapabilitiesAbsoluteMinimum.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainerMemoryCapabilitiesAbsoluteMinimum.java
+index 674e9bb..deb41d8 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainerMemoryCapabilitiesAbsoluteMinimum.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/container/TestContainerMemoryCapabilitiesAbsoluteMinimum.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.yarn.event.Dispatcher;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
++import org.apache.hadoop.yarn.server.nodemanager.NodeManager;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainerStartMonitoringEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.metrics.NodeManagerMetrics;
+ import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+@@ -40,6 +41,10 @@
+   @SuppressWarnings("unchecked")
+   private void testMinimumMemory(int memoryMbSet, long memoryBytesExpected)
+       throws Exception {
++    NodeManager nm = new NodeManager();
++    YarnConfiguration conf = new YarnConfiguration();
++    nm.init(conf);
++
+     ContainerImpl.LaunchTransition lt = new ContainerImpl.LaunchTransition();
+ 
+     ArgumentCaptor<ContainerStartMonitoringEvent> captor =
+@@ -62,8 +67,8 @@ private void testMinimumMemory(int memoryMbSet, long memoryBytesExpected)
+             .getCanonicalHostName(), 1234, "u", resource,
+             System.currentTimeMillis() + 10000, 123, "password".getBytes(),
+             System.currentTimeMillis()));
+-    ContainerImpl container = new ContainerImpl(new YarnConfiguration(),
+-        mockDispatcher, null, null, null, mockMetrics, containerToken);
++    ContainerImpl container = new ContainerImpl(conf,
++        mockDispatcher, null, null, mockMetrics, containerToken, nm.getNMContext());
+     lt.transition(container, null);
+     Mockito.verify(mockEventHandler, Mockito.times(1)).handle(captor.capture());
+     Assert.assertEquals(memoryBytesExpected, captor.getValue().getPmemLimit());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
+index a7006e0..372e899 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
+@@ -208,10 +208,11 @@ public boolean isPmemCheckEnabled() {
+           BuilderUtils.newContainerToken(containerId, "127.0.0.1", 1234, user,
+             BuilderUtils.newResource(1024, 1), currentTime + 10000L, 123,
+             "password".getBytes(), currentTime);
++      Context context = mock(Context.class);
+       Container container =
+-          new ContainerImpl(conf, dispatcher, stateStore, launchContext,
++          new ContainerImpl(conf, dispatcher, launchContext,
+             null, metrics,
+-            BuilderUtils.newContainerTokenIdentifier(containerToken)) {
++            BuilderUtils.newContainerTokenIdentifier(containerToken), context) {
+ 
+             @Override
+             public ContainerState getContainerState() {
+-- 
+1.7.9.5
+

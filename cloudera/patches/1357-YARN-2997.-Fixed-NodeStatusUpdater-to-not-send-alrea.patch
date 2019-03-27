@@ -1,0 +1,252 @@
+From 62bb349f624cc77f588d61efbfe5acebb5ad324b Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Thu, 8 Jan 2015 11:12:54 -0800
+Subject: [PATCH 1357/2848] YARN-2997. Fixed NodeStatusUpdater to not send
+ alreay-sent completed container statuses on
+ heartbeat. Contributed by Chengbing Liu (cherry
+ picked from commit
+ cc2a745f7e82c9fa6de03242952347c54c52dccc)
+
+(cherry picked from commit e7e6173049adca2a2ae0e1231adcaca8168bec27)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java
+
+Change-Id: I265129b62a66fda8879146d54d916df61e0dbbe9
+---
+ .../server/nodemanager/NodeStatusUpdaterImpl.java  |   39 ++++++++++-----
+ .../server/nodemanager/TestNodeStatusUpdater.java  |   52 +++++++++++++-------
+ 2 files changed, 61 insertions(+), 30 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java
+index b531dc0..b450a51 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java
+@@ -109,6 +109,9 @@
+   // the AM finishes it informs the RM to stop the may-be-already-completed
+   // containers.
+   private final Map<ContainerId, Long> recentlyStoppedContainers;
++  // Save the reported completed containers in case of lost heartbeat responses.
++  // These completed containers will be sent again till a successful response.
++  private final Map<ContainerId, ContainerStatus> pendingCompletedContainers;
+   // Duration for which to track recently stopped container.
+   private long durationToTrackStoppedContainers;
+ 
+@@ -133,6 +136,8 @@ public NodeStatusUpdaterImpl(Context context, Dispatcher dispatcher,
+     this.metrics = metrics;
+     this.recentlyStoppedContainers =
+         new LinkedHashMap<ContainerId, Long>();
++    this.pendingCompletedContainers =
++        new HashMap<ContainerId, ContainerStatus>();
+     this.logAggregationReportForAppsTempList =
+         new ArrayList<LogAggregationReport>();
+   }
+@@ -371,11 +376,10 @@ private NodeStatus getNodeStatus(int responseId) throws IOException {
+     List<ContainerStatus> containerStatuses = new ArrayList<ContainerStatus>();
+     for (Container container : this.context.getContainers().values()) {
+       ContainerId containerId = container.getContainerId();
+-      ApplicationId applicationId = container.getContainerId()
+-          .getApplicationAttemptId().getApplicationId();
++      ApplicationId applicationId = containerId.getApplicationAttemptId()
++          .getApplicationId();
+       org.apache.hadoop.yarn.api.records.ContainerStatus containerStatus =
+           container.cloneAndGetContainerStatus();
+-      containerStatuses.add(containerStatus);
+       if (containerStatus.getState() == ContainerState.COMPLETE) {
+         if (isApplicationStopped(applicationId)) {
+           if (LOG.isDebugEnabled()) {
+@@ -383,14 +387,21 @@ private NodeStatus getNodeStatus(int responseId) throws IOException {
+                 + containerId + " from NM context.");
+           }
+           context.getContainers().remove(containerId);
++          pendingCompletedContainers.put(containerId, containerStatus);
+         } else {
+-          // Adding to finished containers cache. Cache will keep it around at
+-          // least for #durationToTrackStoppedContainers duration. In the
+-          // subsequent call to stop container it will get removed from cache.
+-          addCompletedContainer(container.getContainerId());
++          if (!isContainerRecentlyStopped(containerId)) {
++            pendingCompletedContainers.put(containerId, containerStatus);
++            // Adding to finished containers cache. Cache will keep it around at
++            // least for #durationToTrackStoppedContainers duration. In the
++            // subsequent call to stop container it will get removed from cache.
++            addCompletedContainer(containerId);
++          }
+         }
++      } else {
++        containerStatuses.add(containerStatus);
+       }
+     }
++    containerStatuses.addAll(pendingCompletedContainers.values());
+     if (LOG.isDebugEnabled()) {
+       LOG.debug("Sending out " + containerStatuses.size()
+           + " container statuses: " + containerStatuses);
+@@ -410,8 +421,8 @@ private NodeStatus getNodeStatus(int responseId) throws IOException {
+         new ArrayList<NMContainerStatus>();
+     for (Container container : this.context.getContainers().values()) {
+       ContainerId containerId = container.getContainerId();
+-      ApplicationId applicationId = container.getContainerId()
+-          .getApplicationAttemptId().getApplicationId();
++      ApplicationId applicationId = containerId.getApplicationAttemptId()
++          .getApplicationId();
+       if (!this.context.getApplications().containsKey(applicationId)) {
+         context.getContainers().remove(containerId);
+         continue;
+@@ -423,7 +434,7 @@ private NodeStatus getNodeStatus(int responseId) throws IOException {
+         // Adding to finished containers cache. Cache will keep it around at
+         // least for #durationToTrackStoppedContainers duration. In the
+         // subsequent call to stop container it will get removed from cache.
+-        addCompletedContainer(container.getContainerId());
++        addCompletedContainer(containerId);
+       }
+     }
+     LOG.info("Sending out " + containerStatuses.size()
+@@ -470,7 +481,9 @@ public void removeOrTrackCompletedContainersFromContext(
+       ContainerId containerId = iter.next();
+       // remove the container only if the container is at DONE state
+       Container nmContainer = context.getContainers().get(containerId);
+-      if (nmContainer != null && nmContainer.getContainerState().equals(
++      if (nmContainer == null) {
++        iter.remove();
++      } else if (nmContainer.getContainerState().equals(
+         org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerState.DONE)) {
+         context.getContainers().remove(containerId);
+         removedContainers.add(containerId);
+@@ -482,6 +495,7 @@ public void removeOrTrackCompletedContainersFromContext(
+       LOG.info("Removed completed containers from NM context: "
+           + removedContainers);
+     }
++    pendingCompletedContainers.clear();
+   }
+ 
+   private void trackAppsForKeepAlive(List<ApplicationId> appIds) {
+@@ -520,7 +534,7 @@ public void clearFinishedContainersFromCache() {
+       recentlyStoppedContainers.clear();
+     }
+   }
+-  
++
+   @Private
+   @VisibleForTesting
+   public void removeVeryOldStoppedContainersFromCache() {
+@@ -630,6 +644,7 @@ public void run() {
+                   ResourceManagerConstants.RM_INVALID_IDENTIFIER;
+               dispatcher.getEventHandler().handle(
+                   new NodeManagerEvent(NodeManagerEventType.RESYNC));
++              pendingCompletedContainers.clear();
+               break;
+             }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+index b418b9e..b5cae8d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+@@ -616,14 +616,14 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+           <ContainerId>();
+       try {
+         if (heartBeatID == 0) {
+-          Assert.assertEquals(request.getNodeStatus().getContainersStatuses()
+-            .size(), 0);
+-          Assert.assertEquals(context.getContainers().size(), 0);
++          Assert.assertEquals(0, request.getNodeStatus().getContainersStatuses()
++            .size());
++          Assert.assertEquals(0, context.getContainers().size());
+         } else if (heartBeatID == 1) {
+           List<ContainerStatus> statuses =
+               request.getNodeStatus().getContainersStatuses();
+-          Assert.assertEquals(statuses.size(), 2);
+-          Assert.assertEquals(context.getContainers().size(), 2);
++          Assert.assertEquals(2, statuses.size());
++          Assert.assertEquals(2, context.getContainers().size());
+ 
+           boolean container2Exist = false, container3Exist = false;
+           for (ContainerStatus status : statuses) {
+@@ -649,8 +649,16 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+         } else if (heartBeatID == 2 || heartBeatID == 3) {
+           List<ContainerStatus> statuses =
+               request.getNodeStatus().getContainersStatuses();
+-          Assert.assertEquals(statuses.size(), 4);
+-          Assert.assertEquals(context.getContainers().size(), 4);
++          if (heartBeatID == 2) {
++            // NM should send completed containers again, since the last
++            // heartbeat is lost.
++            Assert.assertEquals(4, statuses.size());
++          } else {
++            // NM should not send completed containers again, since the last
++            // heartbeat is successful.
++            Assert.assertEquals(2, statuses.size());
++          }
++          Assert.assertEquals(4, context.getContainers().size());
+ 
+           boolean container2Exist = false, container3Exist = false,
+               container4Exist = false, container5Exist = false;
+@@ -680,8 +688,14 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+               container5Exist = true;
+             }
+           }
+-          Assert.assertTrue(container2Exist && container3Exist
+-              && container4Exist && container5Exist);
++          if (heartBeatID == 2) {
++            Assert.assertTrue(container2Exist && container3Exist
++                && container4Exist && container5Exist);
++          } else {
++            // NM do not send completed containers again
++            Assert.assertTrue(container2Exist && !container3Exist
++                && container4Exist && !container5Exist);
++          }
+ 
+           if (heartBeatID == 3) {
+             finishedContainersPulledByAM.add(containerStatus3.getContainerId());
+@@ -689,8 +703,9 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+         } else if (heartBeatID == 4) {
+           List<ContainerStatus> statuses =
+               request.getNodeStatus().getContainersStatuses();
+-          Assert.assertEquals(statuses.size(), 3);
+-          Assert.assertEquals(context.getContainers().size(), 3);
++          Assert.assertEquals(2, statuses.size());
++          // Container 3 is acked by AM, hence removed from context
++          Assert.assertEquals(3, context.getContainers().size());
+ 
+           boolean container3Exist = false;
+           for (ContainerStatus status : statuses) {
+@@ -923,13 +938,14 @@ public ContainerState getCurrentState() {
+     nodeStatusUpdater.removeOrTrackCompletedContainersFromContext(ackedContainers);
+ 
+     Set<ContainerId> containerIdSet = new HashSet<ContainerId>();
+-    for (ContainerStatus status : nodeStatusUpdater.getContainerStatuses()) {
++    List<ContainerStatus> containerStatuses = nodeStatusUpdater.getContainerStatuses();
++    for (ContainerStatus status : containerStatuses) {
+       containerIdSet.add(status.getContainerId());
+     }
+ 
+-    Assert.assertTrue(nodeStatusUpdater.getContainerStatuses().size() == 1);
++    Assert.assertEquals(1, containerStatuses.size());
+     // completed container is removed;
+-    Assert.assertFalse(containerIdSet.contains(anyCompletedContainer));
++    Assert.assertFalse(containerIdSet.contains(cId));
+     // running container is not removed;
+     Assert.assertTrue(containerIdSet.contains(runningContainerId));
+   }
+@@ -973,15 +989,15 @@ public ContainerState getCurrentState() {
+ 
+     when(application.getApplicationState()).thenReturn(
+         ApplicationState.FINISHING_CONTAINERS_WAIT);
+-    // The completed container will be sent one time. Then we will delete it.
++    // The completed container will be saved in case of lost heartbeat.
++    Assert.assertEquals(1, nodeStatusUpdater.getContainerStatuses().size());
+     Assert.assertEquals(1, nodeStatusUpdater.getContainerStatuses().size());
+-    Assert.assertEquals(0, nodeStatusUpdater.getContainerStatuses().size());
+ 
+     nm.getNMContext().getContainers().put(cId, anyCompletedContainer);
+     nm.getNMContext().getApplications().remove(appId);
+-    // The completed container will be sent one time. Then we will delete it.
++    // The completed container will be saved in case of lost heartbeat.
++    Assert.assertEquals(1, nodeStatusUpdater.getContainerStatuses().size());
+     Assert.assertEquals(1, nodeStatusUpdater.getContainerStatuses().size());
+-    Assert.assertEquals(0, nodeStatusUpdater.getContainerStatuses().size());
+   }
+ 
+   @Test
+-- 
+1.7.9.5
+

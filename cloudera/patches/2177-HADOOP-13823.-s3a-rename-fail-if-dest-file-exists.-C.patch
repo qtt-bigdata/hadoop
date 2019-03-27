@@ -1,0 +1,281 @@
+From f8400c35c21f28a8d36300f8717b2fd8eeb1c13f Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Mon, 28 Nov 2016 16:30:29 -0800
+Subject: [PATCH 2177/2848] HADOOP-13823. s3a rename: fail if dest file
+ exists. Contributed by Steve Loughran
+
+(cherry picked from commit d60a60be8aa450c44d3be69d26c88025e253ac0c)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+
+Change-Id: I235a9893d33a64e652e9ba2d917746ff832ae740
+---
+ .../hadoop/fs/s3a/RenameFailedException.java       |   70 +++++++++++++++++
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   79 +++++++++++++-------
+ .../hadoop/fs/s3a/ITestS3AFileSystemContract.java  |   15 ----
+ .../hadoop-aws/src/test/resources/contract/s3a.xml |    2 +-
+ 4 files changed, 122 insertions(+), 44 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/RenameFailedException.java
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/RenameFailedException.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/RenameFailedException.java
+new file mode 100644
+index 0000000..6c88f3b
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/RenameFailedException.java
+@@ -0,0 +1,70 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.PathIOException;
++
++/**
++ * Error to indicate that a specific rename failed.
++ * The exit code defines the exit code to be returned in the {@code rename()}
++ * call.
++ * Target path is set to destination.
++ */
++public class RenameFailedException extends PathIOException {
++
++  /**
++   * Exit code to be returned.
++   */
++  private boolean exitCode = false;
++
++  public RenameFailedException(String src, String dest, Throwable cause) {
++    super(src, cause);
++    setOperation("rename");
++    setTargetPath(dest);
++  }
++
++  public RenameFailedException(String src, String dest, String error) {
++    super(src, error);
++    setOperation("rename");
++    setTargetPath(dest);
++  }
++
++  public RenameFailedException(Path src, Path optionalDest, String error) {
++    super(src.toString(), error);
++    setOperation("rename");
++    if (optionalDest != null) {
++      setTargetPath(optionalDest.toString());
++    }
++  }
++
++  public boolean getExitCode() {
++    return exitCode;
++  }
++
++  /**
++   * Set the exit code.
++   * @param code exit code to raise
++   * @return the exception
++   */
++  public RenameFailedException withExitCode(boolean code) {
++    this.exitCode = code;
++    return this;
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 49cf9f9..0681ecc 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -642,10 +642,12 @@ public FSDataOutputStream append(Path f, int bufferSize,
+    * there is no Progressable passed in, this can time out jobs.
+    *
+    * Note: This implementation differs with other S3 drivers. Specifically:
++   * <pre>
+    *       Fails if src is a file and dst is a directory.
+    *       Fails if src is a directory and dst is a file.
+    *       Fails if the parent of dst does not exist or is a file.
+    *       Fails if dst is a directory that is not empty.
++   * </pre>
+    *
+    * @param src path to be renamed
+    * @param dst new path after rename
+@@ -657,6 +659,12 @@ public boolean rename(Path src, Path dst) throws IOException {
+       return innerRename(src, dst);
+     } catch (AmazonClientException e) {
+       throw translateException("rename(" + src +", " + dst + ")", src, e);
++    } catch (RenameFailedException e) {
++      LOG.debug(e.getMessage());
++      return e.getExitCode();
++    } catch (FileNotFoundException e) {
++      LOG.debug(e.toString());
++      return false;
+     }
+   }
+ 
+@@ -669,7 +677,8 @@ public boolean rename(Path src, Path dst) throws IOException {
+    * @throws IOException on IO failure.
+    * @throws AmazonClientException on failures inside the AWS SDK
+    */
+-  private boolean innerRename(Path src, Path dst) throws IOException,
++  private boolean innerRename(Path src, Path dst)
++      throws RenameFailedException, FileNotFoundException, IOException,
+       AmazonClientException {
+     LOG.debug("Rename path {} to {}", src, dst);
+     incrementStatistic(INVOCATION_RENAME);
+@@ -677,38 +686,53 @@ private boolean innerRename(Path src, Path dst) throws IOException,
+     String srcKey = pathToKey(src);
+     String dstKey = pathToKey(dst);
+ 
+-    if (srcKey.isEmpty() || dstKey.isEmpty()) {
+-      LOG.debug("rename: source {} or dest {}, is empty", srcKey, dstKey);
+-      return false;
++    if (srcKey.isEmpty()) {
++      throw new RenameFailedException(src, dst, "source is root directory");
+     }
+-
+-    S3AFileStatus srcStatus;
+-    try {
+-      srcStatus = getFileStatus(src);
+-    } catch (FileNotFoundException e) {
+-      LOG.error("rename: src not found {}", src);
+-      return false;
++    if (dstKey.isEmpty()) {
++      throw new RenameFailedException(src, dst, "dest is root directory");
+     }
+ 
++    // get the source file status; this raises a FNFE if there is no source
++    // file.
++    S3AFileStatus srcStatus = getFileStatus(src);
++
+     if (srcKey.equals(dstKey)) {
+-      LOG.debug("rename: src and dst refer to the same file or directory: {}",
++      LOG.debug("rename: src and dest refer to the same file or directory: {}",
+           dst);
+-      return srcStatus.isFile();
++      throw new RenameFailedException(src, dst,
++          "source and dest refer to the same file or directory")
++          .withExitCode(srcStatus.isFile());
+     }
+ 
+     S3AFileStatus dstStatus = null;
+     try {
+       dstStatus = getFileStatus(dst);
+-
+-      if (srcStatus.isDirectory() && dstStatus.isFile()) {
+-        LOG.debug("rename: src {} is a directory and dst {} is a file",
+-            src, dst);
+-        return false;
++      // if there is no destination entry, an exception is raised.
++      // hence this code sequence can assume that there is something
++      // at the end of the path; the only detail being what it is and
++      // whether or not it can be the destination of the rename.
++      if (srcStatus.isDirectory()) {
++        if (dstStatus.isFile()) {
++          throw new RenameFailedException(src, dst,
++              "source is a directory and dest is a file")
++              .withExitCode(srcStatus.isFile());
++        } else if (!dstStatus.isEmptyDirectory()) {
++          throw new RenameFailedException(src, dst,
++              "Destination is a non-empty directory")
++              .withExitCode(false);
++        }
++        // at this point the destination is an empty directory
++      } else {
++        // source is a file. The destination must be a directory,
++        // empty or not
++        if (dstStatus.isFile()) {
++          throw new RenameFailedException(src, dst,
++              "Cannot rename onto an existing file")
++              .withExitCode(false);
++        }
+       }
+ 
+-      if (dstStatus.isDirectory() && !dstStatus.isEmptyDirectory()) {
+-        return false;
+-      }
+     } catch (FileNotFoundException e) {
+       LOG.debug("rename: destination path {} not found", dst);
+       // Parent must exist
+@@ -717,12 +741,12 @@ private boolean innerRename(Path src, Path dst) throws IOException,
+         try {
+           S3AFileStatus dstParentStatus = getFileStatus(dst.getParent());
+           if (!dstParentStatus.isDirectory()) {
+-            return false;
++            throw new RenameFailedException(src, dst,
++                "destination parent is not a directory");
+           }
+         } catch (FileNotFoundException e2) {
+-          LOG.debug("rename: destination path {} has no parent {}",
+-              dst, parent);
+-          return false;
++          throw new RenameFailedException(src, dst,
++              "destination has no parent ");
+         }
+       }
+     }
+@@ -757,9 +781,8 @@ private boolean innerRename(Path src, Path dst) throws IOException,
+ 
+       //Verify dest is not a child of the source directory
+       if (dstKey.startsWith(srcKey)) {
+-        LOG.debug("cannot rename a directory {}" +
+-              " to a subdirectory of self: {}", srcKey, dstKey);
+-        return false;
++        throw new RenameFailedException(srcKey, dstKey,
++            "cannot rename a directory to a subdirectory o fitself ");
+       }
+ 
+       List<DeleteObjectsRequest.KeyVersion> keysToDelete = new ArrayList<>();
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
+index 0eb601b..f39ec81 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java
+@@ -89,21 +89,6 @@ public void testMkdirsWithUmask() throws Exception {
+   }
+ 
+   @Override
+-  public void testRenameFileAsExistingFile() throws Exception {
+-    if (!renameSupported()) {
+-      return;
+-    }
+-
+-    Path src = path("/test/hadoop/file");
+-    createFile(src);
+-    Path dst = path("/test/new/newfile");
+-    createFile(dst);
+-    // s3 doesn't support rename option
+-    // rename-overwrites-dest is always allowed.
+-    rename(src, dst, true, false, true);
+-  }
+-
+-  @Override
+   public void testRenameDirectoryAsExistingDirectory() throws Exception {
+     if (!renameSupported()) {
+       return;
+diff --git a/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml b/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
+index a534f0a..fe0af66 100644
+--- a/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
++++ b/hadoop-tools/hadoop-aws/src/test/resources/contract/s3a.xml
+@@ -114,7 +114,7 @@
+ 
+   <property>
+     <name>fs.contract.rename-overwrites-dest</name>
+-    <value>true</value>
++    <value>false</value>
+   </property>
+ 
+ </configuration>
+-- 
+1.7.9.5
+

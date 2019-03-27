@@ -1,0 +1,360 @@
+From dac3a52eff5703dd9435c562fbdbcb4ba06b4a42 Mon Sep 17 00:00:00 2001
+From: Yongjun Zhang <yzhang@cloudera.com>
+Date: Thu, 7 Sep 2017 09:45:45 -0700
+Subject: [PATCH 2640/2848] HDFS-12357. Let NameNode to bypass external
+ attribute provider for configured users.
+ Contributed by Yongjun Zhang, Arun Suresh.
+
+(cherry picked from commit d77ed238a911fc85d6f4bbce606cac7ec44f557f)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+
+(cherry picked from commit 32e8c84614cb7b048e21c17cf527d6c4800058e2)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestINodeAttributeProvider.java
+
+Change-Id: If4e74e1c548aa9c119b297b757c15decb533262b
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    2 +
+ .../server/namenode/AuthorizationProvider.java     |   80 ++++++++++++++++-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    1 +
+ .../src/main/resources/hdfs-default.xml            |   20 +++++
+ .../server/namenode/TestAuthorizationProvider.java |   91 +++++++++++++++++++-
+ 5 files changed, 187 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index cb87108..c87059b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -485,6 +485,8 @@
+   public static final boolean DFS_NAMENODE_AUDIT_LOG_ASYNC_DEFAULT = false;
+   public static final String DFS_NAMENODE_AUTHORIZATION_PROVIDER_KEY = "dfs.namenode.authorization.provider.class";
+   public static final String  DFS_NAMENODE_AUDIT_LOG_DEBUG_CMDLIST = "dfs.namenode.audit.log.debug.cmdlist";
++  public static final String  DFS_NAMENODE_AUTHORIZATION_PROVIDER_BYPASS_USERS_KEY = "dfs.namenode.authorization.provider.bypass.users";
++  public static final String  DFS_NAMENODE_AUTHORIZATION_PROVIDER_BYPASS_USERS_DEFAULT = "";
+ 
+   // Much code in hdfs is not yet updated to use these keys.
+   public static final String  DFS_CLIENT_BLOCK_WRITE_LOCATEFOLLOWINGBLOCK_RETRIES_KEY = "dfs.client.block.write.locateFollowingBlock.retries";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuthorizationProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuthorizationProvider.java
+index 7b21b92..37e0a77 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuthorizationProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuthorizationProvider.java
+@@ -19,13 +19,19 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.UnresolvedLinkException;
+ import org.apache.hadoop.fs.permission.FsAction;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
++import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Set;
+ 
+@@ -50,6 +56,7 @@
+ @InterfaceAudience.Public
+ @InterfaceStability.Unstable
+ public abstract class AuthorizationProvider {
++  static final Logger LOG = LoggerFactory.getLogger(FSDirectory.class);
+ 
+   private static final ThreadLocal<Boolean> CLIENT_OP_TL =
+       new ThreadLocal<Boolean>() {
+@@ -67,8 +74,29 @@ static void endClientOp() {
+     CLIENT_OP_TL.set(Boolean.FALSE);
+   }
+ 
+-  private static AuthorizationProvider provider = 
++  private static AuthorizationProvider defaultProvider = 
+       new DefaultAuthorizationProvider();
++  
++  private static AuthorizationProvider provider = 
++      defaultProvider;
++
++  // A HashSet of principals of users for whom the external attribute provider
++  // will be bypassed
++  private static HashSet<String> usersToBypassExtAttrProvider = null;
++
++  /**
++   * Return attributeProvider or null if ugi is to bypass attributeProvider.
++   * @param ugi
++   * @return configured attributeProvider or null
++   */
++  private static AuthorizationProvider getUserFilteredAttributeProvider(
++      UserGroupInformation ugi) {
++    if (provider == null ||
++        (ugi != null && isUserBypassingExtAttrProvider(ugi.getUserName()))) {
++      return defaultProvider;
++    }
++    return provider;
++  }
+ 
+   /**
+    * Return the authorization provider singleton for the NameNode.
+@@ -76,7 +104,16 @@ static void endClientOp() {
+    * @return the authorization provider
+    */
+   public static AuthorizationProvider get() {
+-    return provider;  
++    if (!isUsersToBypassExtAttrProviderConfigured()) {
++      return provider;
++    }
++    UserGroupInformation ugi = null;
++    try {
++      ugi = NameNode.getRemoteUser();
++    } catch (IOException ioe) {
++      LOG.warn("Call to NameNode.getRemoteUser() failed.", ioe);
++    }
++    return getUserFilteredAttributeProvider(ugi);    
+   }
+ 
+   /**
+@@ -87,7 +124,44 @@ public static AuthorizationProvider get() {
+    */
+   static void set(AuthorizationProvider authzProvider) {
+     provider = (authzProvider != null) ? authzProvider 
+-                                       : new DefaultAuthorizationProvider();
++                                       : defaultProvider;
++  }
++
++  /*
++   * Init users to bypass external provider based on conf.
++   */
++  static void initUsersToBypassExtProvider(Configuration conf) {
++    String[] bypassUsers = conf.getTrimmedStrings(
++        DFSConfigKeys.DFS_NAMENODE_AUTHORIZATION_PROVIDER_BYPASS_USERS_KEY,
++        DFSConfigKeys.DFS_NAMENODE_AUTHORIZATION_PROVIDER_BYPASS_USERS_DEFAULT);
++    for(int i = 0; i < bypassUsers.length; i++) {
++      String tmp = bypassUsers[i].trim();
++      if (!tmp.isEmpty()) {
++        if (usersToBypassExtAttrProvider == null) {
++          usersToBypassExtAttrProvider = new HashSet<String>();
++        }
++        LOG.info("Add user " + tmp + " to the list that will bypass external"
++            + " attribute provider.");
++        usersToBypassExtAttrProvider.add(tmp);
++      }
++    }
++  }
++
++  /**
++   * Check if a usersToByPassExtAttrProvider is configured.
++   */
++  private static boolean isUsersToBypassExtAttrProviderConfigured() {
++    return (usersToBypassExtAttrProvider != null);
++  }
++
++  /**
++   * Check if a given user is configured to bypass external attribute provider.
++   * @param user user principal
++   * @return true if the user is to bypass external attribute provider
++   */
++  private static boolean isUserBypassingExtAttrProvider(final String user) {
++    return isUsersToBypassExtAttrProviderConfigured() &&
++          usersToBypassExtAttrProvider.contains(user);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 8b0d969..b3713a0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1246,6 +1246,7 @@ void startCommonServices(Configuration conf, HAContext haContext) throws IOExcep
+         DefaultAuthorizationProvider.class,
+         AuthorizationProvider.class), conf);
+     authzProvider.start();
++    AuthorizationProvider.initUsersToBypassExtProvider(conf);
+     AuthorizationProvider.set(authzProvider);
+     snapshotManager.initAuthorizationProvider();
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index c28ad53..ab7a902 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2778,6 +2778,26 @@
+   </description>
+ </property>
+ 
++<property>
++  <name>dfs.namenode.authorization.provider.class</name>
++  <value></value>
++  <description>
++    Name of class to use for delegating HDFS authorization.
++  </description>
++</property>
++
++<property>
++  <name>dfs.namenode.authorization.provider.bypass.users</name>
++  <value></value>
++  <description>
++    A list of user principals (in secure cluster) or user names (in insecure
++    cluster) for whom the external attribute provider will be bypassed for all
++    operations. This means file attributes stored in HDFS instead of the
++    external provider will be used for permission checking and be returned when
++    requested.
++  </description>
++</property>
++
+   <property>
+     <name>dfs.lock.suppress.warning.interval</name>
+     <value>10s</value>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
+index 1cafa4d..669ed45 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
+@@ -39,6 +39,8 @@
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
+ import java.security.PrivilegedExceptionAction;
+@@ -48,9 +50,13 @@
+ import java.util.Set;
+ 
+ public class TestAuthorizationProvider {
++	private static final Logger LOG =
++	    LoggerFactory.getLogger(TestAuthorizationProvider.class);
+   private MiniDFSCluster miniDFS;
+   private static final Set<String> CALLED = new HashSet<String>();
+-  
++  private static final short HDFS_PERMISSION = 0777;
++  private static final short PROVIDER_PERMISSION = 0775;
++
+   public static class MyAuthorizationProvider extends AuthorizationProvider {
+     private AuthorizationProvider defaultProvider;
+ 
+@@ -184,7 +190,7 @@ public FsPermission getFsPermission(
+       if (useDefault(node)) {
+         permission = defaultProvider.getFsPermission(node, snapshotId);
+       } else {
+-        permission = new FsPermission((short)0770);
++        permission = new FsPermission(PROVIDER_PERMISSION);
+       }
+       return permission;
+     }
+@@ -228,6 +234,9 @@ public void setUp() throws IOException {
+     conf.set(DFSConfigKeys.DFS_NAMENODE_AUTHORIZATION_PROVIDER_KEY, 
+         MyAuthorizationProvider.class.getName());
+     conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY, true);
++    conf.set(
++        DFSConfigKeys.DFS_NAMENODE_AUTHORIZATION_PROVIDER_BYPASS_USERS_KEY,
++        " u2,, ,u3, ");
+     EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
+     miniDFS = new MiniDFSCluster.Builder(conf).build();
+   }
+@@ -330,6 +339,78 @@ public Void run() throws Exception {
+ 
+   }
+ 
++  private class AssertHelper {
++    private boolean bypass = true;
++    AssertHelper(boolean bp) {
++      bypass = bp;
++    }
++    public void doAssert(boolean x) {
++      if (bypass) {
++        Assert.assertFalse(x);
++      } else {
++        Assert.assertTrue(x);
++      }
++    }
++  }
++
++  private void testBypassProviderHelper(final String[] users,
++      final short expectedPermission, final boolean bypass) throws Exception {
++    final AssertHelper asserter = new AssertHelper(bypass);
++
++    Assert.assertTrue(CALLED.contains("start"));
++
++    FileSystem fs = FileSystem.get(miniDFS.getConfiguration(0));
++    final Path userPath = new Path("/user");
++    final Path authz = new Path("/user/authz");
++    final Path authzChild = new Path("/user/authz/child2");
++
++    fs.mkdirs(userPath);
++    fs.setPermission(userPath, new FsPermission(HDFS_PERMISSION));
++    fs.mkdirs(authz);
++    fs.setPermission(authz, new FsPermission(HDFS_PERMISSION));
++    fs.mkdirs(authzChild);
++    fs.setPermission(authzChild, new FsPermission(HDFS_PERMISSION));
++    for(String user : users) {
++      UserGroupInformation ugiBypass =
++          UserGroupInformation.createUserForTesting(user,
++              new String[]{"g1"});
++      ugiBypass.doAs(new PrivilegedExceptionAction<Void>() {
++        @Override
++        public Void run() throws Exception {
++          FileSystem fs = FileSystem.get(miniDFS.getConfiguration(0));
++          Assert.assertEquals(expectedPermission,
++              fs.getFileStatus(authzChild).getPermission().toShort());
++          asserter.doAssert(CALLED.contains("checkPermission"));
++
++          CALLED.clear();
++          Assert.assertEquals(expectedPermission,
++              fs.listStatus(userPath)[0].getPermission().toShort());
++          asserter.doAssert(
++              CALLED.contains("checkPermission"));
++
++          CALLED.clear();
++          fs.getAclStatus(authzChild);
++          asserter.doAssert(CALLED.contains("checkPermission"));
++          return null;
++        }
++      });
++    }
++  }
++
++  @Test
++  public void testAuthzDelegationToProvider() throws Exception {
++    LOG.info("Test not bypassing provider");
++    String[] users = {"u1"};
++    testBypassProviderHelper(users, PROVIDER_PERMISSION, false);
++  }
++
++  @Test
++  public void testAuthzBypassingProvider() throws Exception {
++    LOG.info("Test bypassing provider");
++    String[] users = {"u2", "u3"};
++    testBypassProviderHelper(users, HDFS_PERMISSION, true);
++  }
++
+   @Test
+   public void testCustomProvider() throws Exception {
+     FileSystem fs = FileSystem.get(miniDFS.getConfiguration(0));
+@@ -342,7 +423,8 @@ public void testCustomProvider() throws Exception {
+     status = fs.getFileStatus(new Path("/user/authz"));
+     Assert.assertEquals("foo", status.getOwner());
+     Assert.assertEquals("bar", status.getGroup());
+-    Assert.assertEquals(new FsPermission((short) 0770), status.getPermission());
++    Assert.assertEquals(new FsPermission(PROVIDER_PERMISSION),
++        status.getPermission());
+     
+     // The following code test that the username/groupname supplied by 
+     // the customized authorization provider does not get saved to fsimage
+@@ -370,6 +452,7 @@ public void testCustomProvider() throws Exception {
+     status = fs.getFileStatus(new Path("/user/authz"));
+     Assert.assertEquals("foo", status.getOwner());
+     Assert.assertEquals("bar", status.getGroup());
+-    Assert.assertEquals(new FsPermission((short) 0770), status.getPermission());
++    Assert.assertEquals(new FsPermission(PROVIDER_PERMISSION),
++        status.getPermission());
+   }
+ }
+-- 
+1.7.9.5
+

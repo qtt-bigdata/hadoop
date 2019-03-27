@@ -1,0 +1,358 @@
+From 937eb844fc0ee9935f2c76004b18796674d030ad Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Sun, 13 Aug 2017 00:52:04 -0700
+Subject: [PATCH 2589/2848] HADOOP-14627. Support MSI and DeviceCode token
+ provider in ADLS. Contributed by Atul Sikaria.
+
+(cherry picked from commit 7769e9614956283a86eda9e4e69aaa592c0ca960)
+
+Change-Id: I0b22137662fd9e6e5f6b651b2d6d6bafed3f3669
+---
+ .../src/main/resources/core-default.xml            |   37 +++++++-
+ hadoop-tools/hadoop-azure-datalake/pom.xml         |    2 +-
+ .../java/org/apache/hadoop/fs/adl/AdlConfKeys.java |    8 ++
+ .../org/apache/hadoop/fs/adl/AdlFileSystem.java    |   21 +++++
+ .../apache/hadoop/fs/adl/TokenProviderType.java    |    2 +
+ .../src/site/markdown/index.md                     |   98 ++++++++++++++++++--
+ .../hadoop/fs/adl/TestAzureADTokenProvider.java    |   40 ++++++++
+ 7 files changed, 198 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 4377375..75efe61 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -2373,11 +2373,16 @@ for ldap providers in the same way as above does.
+     <value>ClientCredential</value>
+     <description>
+       Defines Azure Active Directory OAuth2 access token provider type.
+-      Supported types are ClientCredential, RefreshToken, and Custom.
++      Supported types are ClientCredential, RefreshToken, MSI, DeviceCode,
++      and Custom.
+       The ClientCredential type requires property fs.adl.oauth2.client.id,
+       fs.adl.oauth2.credential, and fs.adl.oauth2.refresh.url.
+       The RefreshToken type requires property fs.adl.oauth2.client.id and
+       fs.adl.oauth2.refresh.token.
++      The MSI type requires properties fs.adl.oauth2.msi.port and
++      fs.adl.oauth2.msi.tenantguid.
++      The DeviceCode type requires property
++      fs.adl.oauth2.devicecode.clientapp.id.
+       The Custom type requires property fs.adl.oauth2.access.token.provider.
+     </description>
+   </property>
+@@ -2414,6 +2419,36 @@ for ldap providers in the same way as above does.
+     </description>
+   </property>
+ 
++  <property>
++    <name>fs.adl.oauth2.msi.port</name>
++    <value></value>
++    <description>
++      The localhost port for the MSI token service. This is the port specified
++      when creating the Azure VM.
++      Used by MSI token provider.
++    </description>
++  </property>
++
++  <property>
++    <name>fs.adl.oauth2.msi.tenantguid</name>
++    <value></value>
++    <description>
++      The tenant guid for the Azure AAD tenant under which the azure data lake
++      store account is created.
++      Used by MSI token provider.
++    </description>
++  </property>
++
++  <property>
++    <name>fs.adl.oauth2.devicecode.clientapp.id</name>
++    <value></value>
++    <description>
++      The app id of the AAD native app in whose context the auth request
++      should be made.
++      Used by DeviceCode token provider.
++    </description>
++  </property>
++
+   <!-- Azure Data Lake File System Configurations Ends Here-->
+ 
+  <property>
+diff --git a/hadoop-tools/hadoop-azure-datalake/pom.xml b/hadoop-tools/hadoop-azure-datalake/pom.xml
+index 33f714ca..ff41eaf 100644
+--- a/hadoop-tools/hadoop-azure-datalake/pom.xml
++++ b/hadoop-tools/hadoop-azure-datalake/pom.xml
+@@ -121,7 +121,7 @@
+     <dependency>
+       <groupId>com.microsoft.azure</groupId>
+       <artifactId>azure-data-lake-store-sdk</artifactId>
+-      <version>2.1.4</version>
++      <version>2.2.1</version>
+     </dependency>
+     <!--  ENDS HERE-->
+     <dependency>
+diff --git a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlConfKeys.java b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlConfKeys.java
+index 31df222..f77d981 100644
+--- a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlConfKeys.java
++++ b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlConfKeys.java
+@@ -54,6 +54,14 @@
+   public static final String TOKEN_PROVIDER_TYPE_CLIENT_CRED =
+       "ClientCredential";
+ 
++  // MSI Auth Configuration
++  public static final String MSI_PORT = "fs.adl.oauth2.msi.port";
++  public static final String MSI_TENANT_GUID = "fs.adl.oauth2.msi.tenantguid";
++
++  // DeviceCode Auth configuration
++  public static final String DEVICE_CODE_CLIENT_APP_ID =
++      "fs.adl.oauth2.devicecode.clientapp.id";
++
+   public static final String READ_AHEAD_BUFFER_SIZE_KEY =
+       "adl.feature.client.cache.readahead";
+ 
+diff --git a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlFileSystem.java b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlFileSystem.java
+index f04eabe..22e6428 100644
+--- a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlFileSystem.java
++++ b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/AdlFileSystem.java
+@@ -35,6 +35,8 @@
+ import com.microsoft.azure.datalake.store.UserGroupRepresentation;
+ import com.microsoft.azure.datalake.store.oauth2.AccessTokenProvider;
+ import com.microsoft.azure.datalake.store.oauth2.ClientCredsTokenProvider;
++import com.microsoft.azure.datalake.store.oauth2.DeviceCodeTokenProvider;
++import com.microsoft.azure.datalake.store.oauth2.MsiTokenProvider;
+ import com.microsoft.azure.datalake.store.oauth2.RefreshTokenBasedTokenProvider;
+ 
+ import org.apache.commons.lang.StringUtils;
+@@ -254,6 +256,12 @@ private AccessTokenProvider getAccessTokenProvider(Configuration config)
+     case ClientCredential:
+       tokenProvider = getConfCredentialBasedTokenProvider(conf);
+       break;
++    case MSI:
++      tokenProvider = getMsiBasedTokenProvider(conf);
++      break;
++    case DeviceCode:
++      tokenProvider = getDeviceCodeTokenProvider(conf);
++      break;
+     case Custom:
+     default:
+       AzureADTokenProvider azureADTokenProvider = getCustomAccessTokenProvider(
+@@ -280,6 +288,19 @@ private AccessTokenProvider getConfRefreshTokenBasedTokenProvider(
+     return new RefreshTokenBasedTokenProvider(clientId, refreshToken);
+   }
+ 
++  private AccessTokenProvider getMsiBasedTokenProvider(
++          Configuration conf) throws IOException {
++    int port = Integer.parseInt(getNonEmptyVal(conf, MSI_PORT));
++    String tenantGuid = getPasswordString(conf, MSI_TENANT_GUID);
++    return new MsiTokenProvider(port, tenantGuid);
++  }
++
++  private AccessTokenProvider getDeviceCodeTokenProvider(
++          Configuration conf) throws IOException {
++    String clientAppId = getNonEmptyVal(conf, DEVICE_CODE_CLIENT_APP_ID);
++    return new DeviceCodeTokenProvider(clientAppId);
++  }
++
+   @VisibleForTesting
+   AccessTokenProvider getTokenProvider() {
+     return tokenProvider;
+diff --git a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/TokenProviderType.java b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/TokenProviderType.java
+index 9fd4f4f..1c11d84 100644
+--- a/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/TokenProviderType.java
++++ b/hadoop-tools/hadoop-azure-datalake/src/main/java/org/apache/hadoop/fs/adl/TokenProviderType.java
+@@ -21,5 +21,7 @@
+ enum TokenProviderType {
+   RefreshToken,
+   ClientCredential,
++  MSI,
++  DeviceCode,
+   Custom
+ }
+diff --git a/hadoop-tools/hadoop-azure-datalake/src/site/markdown/index.md b/hadoop-tools/hadoop-azure-datalake/src/site/markdown/index.md
+index d4b7d8e..e34da36 100644
+--- a/hadoop-tools/hadoop-azure-datalake/src/site/markdown/index.md
++++ b/hadoop-tools/hadoop-azure-datalake/src/site/markdown/index.md
+@@ -111,20 +111,24 @@ service associated with the client id. See [*Active Directory Library For Java*]
+ ##### Generating the Service Principal
+ 
+ 1.  Go to [the portal](https://portal.azure.com)
+-2.  Under "Browse", look for Active Directory and click on it.
+-3.  Create "Web Application". Remember the name you create here - that is what you will add to your ADL account as authorized user.
++2.  Under services in left nav, look for Azure Active Directory and click it.
++3.  Using "App Registrations" in the menu, create "Web Application". Remember
++    the name you create here - that is what you will add to your ADL account
++    as authorized user.
+ 4.  Go through the wizard
+-5.  Once app is created, Go to app configuration, and find the section on "keys"
++5.  Once app is created, go to "keys" under "settings" for the app
+ 6.  Select a key duration and hit save. Save the generated keys.
+-7. Note down the properties you will need to auth:
+-    -  The client ID
++7.  Go back to the App Registrations page, and click on the "Endpoints" button
++    at the top
++    a. Note down the  "Token Endpoint" URL
++8. Note down the properties you will need to auth:
++    -  The "Application ID" of the Web App you created above
+     -  The key you just generated above
+-    -  The token endpoint (select "View endpoints" at the bottom of the page and copy/paste the OAuth2 .0 Token Endpoint value)
+-    -  Resource: Always https://management.core.windows.net/ , for all customers
++    -  The token endpoint
+ 
+ ##### Adding the service principal to your ADL Account
+ 1.  Go to the portal again, and open your ADL account
+-2.  Select Users under Settings
++2.  Select `Access control (IAM)`
+ 3.  Add your user name you created in Step 6 above (note that it does not show up in the list, but will be found if you searched for the name)
+ 4.  Add "Owner" role
+ 
+@@ -153,6 +157,84 @@ Add the following properties to your `core-site.xml`
+ </property>
+ ```
+ 
++#### Using MSI (Managed Service Identity)
++
++Azure VMs can be provisioned with "service identities" that are managed by the
++Identity extension within the VM. The advantage of doing this is that the
++credentials are managed by the extension, and do not have to be put into
++core-site.xml.
++
++To use MSI, the following two steps are needed:
++1. Modify the VM deployment template to specify the port number of the token
++ service exposed to localhost by the identity extension in the VM.
++2. Get your Azure ActiveDirectory Tenant ID:
++   1. Go to [the portal](https://portal.azure.com)
++   2. Under services in left nav, look for Azure Active Directory and click on it.
++   3. Click on Properties
++   4. Note down the GUID shown under "Directory ID" - this is your AAD tenant ID
++
++
++##### Configure core-site.xml
++Add the following properties to your `core-site.xml`
++
++```xml
++<property>
++  <name>fs.adl.oauth2.access.token.provider.type</name>
++  <value>Msi</value>
++</property>
++
++<property>
++  <name>fs.adl.oauth2.msi.port</name>
++  <value>PORT NUMBER FROM STEP 1 ABOVE</value>
++</property>
++
++<property>
++  <name>fs.adl.oauth2.msi.TenantGuid</name>
++  <value>AAD TENANT ID GUID FROM STEP 2 ABOVE</value>
++</property>
++```
++
++### Using Device Code Auth for interactive login
++
++**Note:** This auth method is suitable for running interactive tools, but will
++not work for jobs submitted to a cluster.
++
++To use user-based login, Azure ActiveDirectory provides login flow using
++device code.
++
++To use device code flow, user must first create a **Native** app registration
++in the Azure portal, and provide the client ID for the app as a config. Here
++are the steps:
++
++1.  Go to [the portal](https://portal.azure.com)
++2.  Under services in left nav, look for Azure Active Directory and click on it.
++3.  Using "App Registrations" in the menu, create "Native Application".
++4.  Go through the wizard
++5.  Once app is created, note down the "Appplication ID" of the app
++6. Grant permissions to the app:
++    1. Click on "Permissions" for the app, and then add "Azure Data Lake" and
++       "Windows Azure Service Management API" permissions
++    2. Click on "Grant Permissions" to add the permissions to the app
++
++Add the following properties to your `core-site.xml`
++
++```xml
++<property>
++  <name>fs.adl.oauth2.devicecode.clientappid</name>
++  <value>APP ID FROM STEP 5 ABOVE</value>
++</property>
++```
++
++It is usually not desirable to add DeviceCode as the default token provider
++type. But it can be used when using a local command:
++```
++ hadoop fs -Dfs.adl.oauth2.access.token.provider.type=DeviceCode -ls ...
++```
++Running this will print a URL and device code that can be used to login from
++any browser (even on a different machine, outside of the ssh session). Once
++the login is done, the command continues.
++
++
+ #### Protecting the Credentials with Credential Providers
+ 
+ In many Hadoop clusters, the `core-site.xml` file is world-readable. To protect
+diff --git a/hadoop-tools/hadoop-azure-datalake/src/test/java/org/apache/hadoop/fs/adl/TestAzureADTokenProvider.java b/hadoop-tools/hadoop-azure-datalake/src/test/java/org/apache/hadoop/fs/adl/TestAzureADTokenProvider.java
+index 36498c6..929b33a 100644
+--- a/hadoop-tools/hadoop-azure-datalake/src/test/java/org/apache/hadoop/fs/adl/TestAzureADTokenProvider.java
++++ b/hadoop-tools/hadoop-azure-datalake/src/test/java/org/apache/hadoop/fs/adl/TestAzureADTokenProvider.java
+@@ -23,6 +23,8 @@
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ 
++import com.microsoft.azure.datalake.store.oauth2.DeviceCodeTokenProvider;
++import com.microsoft.azure.datalake.store.oauth2.MsiTokenProvider;
+ import org.apache.commons.lang.builder.EqualsBuilder;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.adl.common.CustomMockTokenProvider;
+@@ -40,6 +42,9 @@
+     .AZURE_AD_TOKEN_PROVIDER_CLASS_KEY;
+ import static org.apache.hadoop.fs.adl.AdlConfKeys
+     .AZURE_AD_TOKEN_PROVIDER_TYPE_KEY;
++import static org.apache.hadoop.fs.adl.AdlConfKeys.DEVICE_CODE_CLIENT_APP_ID;
++import static org.apache.hadoop.fs.adl.AdlConfKeys.MSI_PORT;
++import static org.apache.hadoop.fs.adl.AdlConfKeys.MSI_TENANT_GUID;
+ import static org.apache.hadoop.fs.adl.TokenProviderType.*;
+ import static org.junit.Assert.assertEquals;
+ 
+@@ -98,6 +103,41 @@ public void testClientCredTokenProvider()
+   }
+ 
+   @Test
++  public void testMSITokenProvider()
++          throws IOException, URISyntaxException {
++    Configuration conf = new Configuration();
++    conf.setEnum(AZURE_AD_TOKEN_PROVIDER_TYPE_KEY, MSI);
++    conf.set(MSI_PORT, "54321");
++    conf.set(MSI_TENANT_GUID, "TENANT_GUID");
++
++    URI uri = new URI("adl://localhost:8080");
++    AdlFileSystem fileSystem = new AdlFileSystem();
++    fileSystem.initialize(uri, conf);
++    AccessTokenProvider tokenProvider = fileSystem.getTokenProvider();
++    Assert.assertTrue(tokenProvider instanceof MsiTokenProvider);
++  }
++
++  @Test
++  public void testDeviceCodeTokenProvider()
++          throws IOException, URISyntaxException {
++    boolean runTest = false;
++    if (runTest) {
++      // Device code auth method causes an interactive prompt, so run this only
++      // when running the test interactively at a local terminal. Disabling
++      // test by default, to not break any automation.
++      Configuration conf = new Configuration();
++      conf.setEnum(AZURE_AD_TOKEN_PROVIDER_TYPE_KEY, DeviceCode);
++      conf.set(DEVICE_CODE_CLIENT_APP_ID, "CLIENT_APP_ID_GUID");
++
++      URI uri = new URI("adl://localhost:8080");
++      AdlFileSystem fileSystem = new AdlFileSystem();
++      fileSystem.initialize(uri, conf);
++      AccessTokenProvider tokenProvider = fileSystem.getTokenProvider();
++      Assert.assertTrue(tokenProvider instanceof DeviceCodeTokenProvider);
++    }
++  }
++
++  @Test
+   public void testCustomCredTokenProvider()
+       throws URISyntaxException, IOException {
+     Configuration conf = new Configuration();
+-- 
+1.7.9.5
+

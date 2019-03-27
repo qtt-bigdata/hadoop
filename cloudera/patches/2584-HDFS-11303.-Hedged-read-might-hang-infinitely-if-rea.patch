@@ -1,0 +1,162 @@
+From 2ebcdbbc0f576c57d42f897e993494a21c858db4 Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Sat, 12 Aug 2017 00:40:35 -0700
+Subject: [PATCH 2584/2848] HDFS-11303. Hedged read might hang infinitely if
+ read data from all DN failed . Contributed by
+ Chen Zhang, Wei-chiu Chuang, and John Zhuge.
+
+(cherry picked from commit 8b242f09a61a7536d2422546bfa6c2aaf1d57ed6)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+
+Change-Id: Iebab1fabacd215a4d5913b117991bf36abb78cf0
+---
+ .../apache/hadoop/hdfs/DFSClientFaultInjector.java |    3 +
+ .../org/apache/hadoop/hdfs/DFSInputStream.java     |   11 ++--
+ .../java/org/apache/hadoop/hdfs/TestPread.java     |   63 ++++++++++++++++++++
+ 3 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+index 5392c66..5609ad8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+@@ -36,6 +36,9 @@
+   public static DFSClientFaultInjector get() {
+     return instance;
+   }
++  public static void set(DFSClientFaultInjector instance) {
++    DFSClientFaultInjector.instance = instance;
++  }
+ 
+   public boolean corruptPacket() {
+     return false;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+index 4430239..d626d35 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+@@ -1290,8 +1290,9 @@ private void hedgedFetchBlockByteRange(LocatedBlock block, long start,
+         Future<ByteBuffer> firstRequest = hedgedService
+             .submit(getFromDataNodeCallable);
+         futures.add(firstRequest);
++        Future<ByteBuffer> future = null;
+         try {
+-          Future<ByteBuffer> future = hedgedService.poll(
++          future = hedgedService.poll(
+               dfsClient.getHedgedReadTimeout(), TimeUnit.MILLISECONDS);
+           if (future != null) {
+             ByteBuffer result = future.get();
+@@ -1304,16 +1305,18 @@ private void hedgedFetchBlockByteRange(LocatedBlock block, long start,
+                 + "ms to read from " + chosenNode.info
+                 + "; spawning hedged read");
+           }
+-          // Ignore this node on next go around.
+-          ignored.add(chosenNode.info);
+           dfsClient.getHedgedReadMetrics().incHedgedReadOps();
+           continue; // no need to refresh block locations
+         } catch (ExecutionException e) {
+-          // Ignore
++          futures.remove(future);
+         } catch (InterruptedException e) {
+           throw new InterruptedIOException(
+               "Interrupted while waiting for reading task");
+         }
++        // Ignore this node on next go around.
++        // If poll timeout and the request still ongoing, don't consider it
++        // again. If read data failed, don't consider it either.
++        ignored.add(chosenNode.info);
+       } else {
+         // We are starting up a 'hedged' read. We have a read already
+         // ongoing. Call getBestNodeDNAddrPair instead of chooseDataNode.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+index 3dee0e7..7e900f6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+@@ -60,6 +60,8 @@
+ import org.mockito.stubbing.Answer;
+ 
+ import com.google.common.base.Supplier;
++import org.slf4j.LoggerFactory;
++import org.slf4j.Logger;
+ 
+ /**
+  * This class tests the DFS positional read functionality in a single node
+@@ -71,6 +73,9 @@
+   boolean simulatedStorage;
+   boolean isHedgedRead;
+ 
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestPread.class.getName());
++
+   @Before
+   public void setup() {
+     simulatedStorage = false;
+@@ -551,6 +556,64 @@ public Void call() throws IOException {
+     }
+   }
+ 
++  @Test(timeout=30000)
++  public void testHedgedReadFromAllDNFailed() throws IOException {
++    Configuration conf = new Configuration();
++    int numHedgedReadPoolThreads = 5;
++    final int hedgedReadTimeoutMillis = 50;
++
++    conf.setInt(DFSConfigKeys.DFS_DFSCLIENT_HEDGED_READ_THREADPOOL_SIZE,
++        numHedgedReadPoolThreads);
++    conf.setLong(DFSConfigKeys.DFS_DFSCLIENT_HEDGED_READ_THRESHOLD_MILLIS,
++        hedgedReadTimeoutMillis);
++    conf.setInt(DFSConfigKeys.DFS_CLIENT_RETRY_WINDOW_BASE, 0);
++    // Set up the InjectionHandler
++    DFSClientFaultInjector.set(Mockito.mock(DFSClientFaultInjector.class));
++    DFSClientFaultInjector injector = DFSClientFaultInjector.get();
++    Mockito.doAnswer(new Answer<Void>() {
++      @Override
++      public Void answer(InvocationOnMock invocation) throws Throwable {
++        if (true) {
++          LOG.info("-------------- throw Checksum Exception");
++          throw new ChecksumException("ChecksumException test", 100);
++        }
++        return null;
++      }
++    }).when(injector).fetchFromDatanodeException();
++
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3)
++        .format(true).build();
++    DistributedFileSystem fileSys = cluster.getFileSystem();
++    DFSClient dfsClient = fileSys.getClient();
++    FSDataOutputStream output = null;
++    DFSInputStream input = null;
++    String filename = "/hedgedReadMaxOut.dat";
++    DFSHedgedReadMetrics metrics = dfsClient.getHedgedReadMetrics();
++    // Metrics instance is static, so we need to reset counts from prior tests.
++    metrics.hedgedReadOps.set(0);
++    try {
++      Path file = new Path(filename);
++      output = fileSys.create(file, (short) 2);
++      byte[] data = new byte[64 * 1024];
++      output.write(data);
++      output.flush();
++      output.close();
++      byte[] buffer = new byte[64 * 1024];
++      input = dfsClient.open(filename);
++      input.read(0, buffer, 0, 1024);
++      Assert.fail("Reading the block should have thrown BlockMissingException");
++    } catch (BlockMissingException e) {
++      assertEquals(3, input.getHedgedReadOpsLoopNumForTesting());
++      assertTrue(metrics.getHedgedReadOps() == 0);
++    } finally {
++      Mockito.reset(injector);
++      IOUtils.cleanupWithLogger(LOG, input);
++      IOUtils.cleanupWithLogger(LOG, output);
++      fileSys.close();
++      cluster.shutdown();
++    }
++  }
++
+   /**
+    * Scenario: 1. Write a file with RF=2, DN1 and DN2<br>
+    * 2. Open the stream, Consider Locations are [DN1, DN2] in LocatedBlock.<br>
+-- 
+1.7.9.5
+

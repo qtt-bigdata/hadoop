@@ -1,0 +1,186 @@
+From bb5c6cd69937c81e227b7b8dfa2981f498c98361 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Thu, 1 Dec 2016 12:15:15 -0600
+Subject: [PATCH 2482/2848] HDFS-8674. Improve performance of postponed block
+ scans. Contributed by Daryn Sharp.
+
+(cherry picked from commit 0d8a35bd6de5d2a5a9b816ca98f31975e94bd7c6)
+
+    Conflicts:
+    hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+
+Change-Id: Ia875096d660a5f2331617e40aae287cdcd8ba73e
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |   77 +++++++-------------
+ 1 file changed, 25 insertions(+), 52 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 230b7ec..ecad940 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -29,6 +29,7 @@
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+@@ -160,7 +161,6 @@
+   private volatile long underReplicatedBlocksCount = 0L;
+   private volatile long scheduledReplicationBlocksCount = 0L;
+   private final AtomicLong excessBlocksCount = new AtomicLong(0L);
+-  private final AtomicLong postponedMisreplicatedBlocksCount = new AtomicLong(0L);
+   private final long startupDelayBlockDeletionInMs;
+   private final BlockReportLeaseManager blockReportLeaseManager;
+   private ObjectName mxBeanName;
+@@ -195,7 +195,7 @@ public long getExcessBlocksCount() {
+   }
+   /** Used by metrics */
+   public long getPostponedMisreplicatedBlocksCount() {
+-    return postponedMisreplicatedBlocksCount.get();
++    return postponedMisreplicatedBlocks.size();
+   }
+   /** Used by metrics */
+   public int getPendingDataNodeMessageCount() {
+@@ -240,8 +240,10 @@ public int getPendingDataNodeMessageCount() {
+    * notified of all block deletions that might have been pending
+    * when the failover happened.
+    */
+-  private final LightWeightHashSet<Block> postponedMisreplicatedBlocks =
+-      new LightWeightHashSet<>();
++  private final LinkedHashSet<Block> postponedMisreplicatedBlocks =
++      new LinkedHashSet<Block>();
++  private final int blocksPerPostpondedRescan;
++  private final ArrayList<Block> rescannedMisreplicatedBlocks;
+ 
+   /**
+    * Maps a StorageID to the set of blocks that are "extra" for this
+@@ -329,6 +331,10 @@ public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+     datanodeManager = new DatanodeManager(this, namesystem, conf);
+     heartbeatManager = datanodeManager.getHeartbeatManager();
+ 
++    blocksPerPostpondedRescan = (int)Math.min(Integer.MAX_VALUE,
++        datanodeManager.getBlocksPerPostponedMisreplicatedBlocksRescan());
++    rescannedMisreplicatedBlocks =
++        new ArrayList<Block>(blocksPerPostpondedRescan);
+     startupDelayBlockDeletionInMs = conf.getLong(
+         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_KEY,
+         DFSConfigKeys.DFS_NAMENODE_STARTUP_DELAY_BLOCK_DELETION_SEC_DEFAULT) * 1000L;
+@@ -1413,9 +1419,7 @@ public void setPostponeBlocksFromFuture(boolean postpone) {
+ 
+ 
+   private void postponeBlock(Block blk) {
+-    if (postponedMisreplicatedBlocks.add(blk)) {
+-      postponedMisreplicatedBlocksCount.incrementAndGet();
+-    }
++    postponedMisreplicatedBlocks.add(blk);
+   }
+   
+   
+@@ -2136,39 +2140,14 @@ void rescanPostponedMisreplicatedBlocks() {
+     if (getPostponedMisreplicatedBlocksCount() == 0) {
+       return;
+     }
+-    long startTimeRescanPostponedMisReplicatedBlocks = Time.monotonicNow();
+-    long startPostponedMisReplicatedBlocksCount =
+-        getPostponedMisreplicatedBlocksCount();
+     namesystem.writeLock();
++    long startTime = Time.monotonicNow();
++    long startSize = postponedMisreplicatedBlocks.size();
+     try {
+-      // blocksPerRescan is the configured number of blocks per rescan.
+-      // Randomly select blocksPerRescan consecutive blocks from the HashSet
+-      // when the number of blocks remaining is larger than blocksPerRescan.
+-      // The reason we don't always pick the first blocksPerRescan blocks is to
+-      // handle the case if for some reason some datanodes remain in
+-      // content stale state for a long time and only impact the first
+-      // blocksPerRescan blocks.
+-      int i = 0;
+-      long startIndex = 0;
+-      long blocksPerRescan =
+-          datanodeManager.getBlocksPerPostponedMisreplicatedBlocksRescan();
+-      long base = getPostponedMisreplicatedBlocksCount() - blocksPerRescan;
+-      if (base > 0) {
+-        startIndex = DFSUtil.getRandom().nextLong() % (base+1);
+-        if (startIndex < 0) {
+-          startIndex += (base+1);
+-        }
+-      }
+       Iterator<Block> it = postponedMisreplicatedBlocks.iterator();
+-      for (int tmp = 0; tmp < startIndex; tmp++) {
+-        it.next();
+-      }
+-
+-      for (;it.hasNext(); i++) {
++      for (int i=0; i < blocksPerPostpondedRescan && it.hasNext(); i++) {
+         Block b = it.next();
+-        if (i >= blocksPerRescan) {
+-          break;
+-        }
++        it.remove();
+ 
+         BlockInfo bi = blocksMap.getStoredBlock(b);
+         if (bi == null) {
+@@ -2177,8 +2156,6 @@ void rescanPostponedMisreplicatedBlocks() {
+                 "Postponed mis-replicated block " + b + " no longer found " +
+                 "in block map.");
+           }
+-          it.remove();
+-          postponedMisreplicatedBlocksCount.decrementAndGet();
+           continue;
+         }
+         MisReplicationResult res = processMisReplicatedBlock(bi);
+@@ -2186,20 +2163,19 @@ void rescanPostponedMisreplicatedBlocks() {
+           LOG.debug("BLOCK* rescanPostponedMisreplicatedBlocks: " +
+               "Re-scanned block " + b + ", result is " + res);
+         }
+-        if (res != MisReplicationResult.POSTPONE) {
+-          it.remove();
+-          postponedMisreplicatedBlocksCount.decrementAndGet();
++        if (res == MisReplicationResult.POSTPONE) {
++          rescannedMisreplicatedBlocks.add(b);
+         }
+       }
+     } finally {
++      postponedMisreplicatedBlocks.addAll(rescannedMisreplicatedBlocks);
++      rescannedMisreplicatedBlocks.clear();
++      long endSize = postponedMisreplicatedBlocks.size();
+       namesystem.writeUnlock();
+-      long endPostponedMisReplicatedBlocksCount =
+-          getPostponedMisreplicatedBlocksCount();
+       LOG.info("Rescan of postponedMisreplicatedBlocks completed in " +
+-          (Time.monotonicNow() - startTimeRescanPostponedMisReplicatedBlocks) +
+-          " msecs. " + endPostponedMisReplicatedBlocksCount +
+-          " blocks are left. " + (startPostponedMisReplicatedBlocksCount -
+-          endPostponedMisReplicatedBlocksCount) + " blocks are removed.");
++          (Time.monotonicNow() - startTime) + " msecs. " +
++          endSize + " blocks are left. " +
++          (startSize - endSize) + " blocks were removed.");
+     }
+   }
+   
+@@ -3654,9 +3630,7 @@ public void removeBlock(BlockInfo block) {
+     // Remove the block from pendingReplications and neededReplications
+     pendingReplications.remove(block);
+     neededReplications.remove(block, UnderReplicatedBlocks.LEVEL);
+-    if (postponedMisreplicatedBlocks.remove(block)) {
+-      postponedMisreplicatedBlocksCount.decrementAndGet();
+-    }
++    postponedMisreplicatedBlocks.remove(block);
+   }
+ 
+   public BlockInfo getStoredBlock(Block block) {
+@@ -4079,8 +4053,7 @@ public void clearQueues() {
+     invalidateBlocks.clear();
+     datanodeManager.clearPendingQueues();
+     postponedMisreplicatedBlocks.clear();
+-    postponedMisreplicatedBlocksCount.set(0);
+-  }
++  };
+ 
+   private static class ReplicationWork {
+ 
+-- 
+1.7.9.5
+

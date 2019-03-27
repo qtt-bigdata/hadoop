@@ -1,0 +1,828 @@
+From 2fdf588e63a5bddc84108e680b1f97e62a9ee547 Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Tue, 23 Dec 2014 22:14:29 -0800
+Subject: [PATCH 2460/2848] YARN-2946. Fixed potential deadlock in
+ RMStateStore. Contributed by Rohith Sharmaks
+ (cherry picked from commit
+ 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 60530a6c4f5b7777711d03d784ef027d35ebfba9)
+
+Conflicts:
+	hadoop-yarn-project/CHANGES.txt
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+
+Detailed Conflicts:
+	RMStateStore: several conflicts because of YARN-2958 coming out of order
+	RMStateStoreRMDTEvent: added missing changes from YARN-2958
+	ZKRMStateStore: didn’t like a method name because of YARN-2958 coming out of order
+
+Change-Id: Id0fb0f17df88a4355f83f1f960c19c0161994101
+---
+ .../recovery/FileSystemRMStateStore.java           |   17 +-
+ .../resourcemanager/recovery/RMStateStore.java     |  281 +++++++++++++++-----
+ .../recovery/RMStateStoreAMRMTokenEvent.java       |   46 ++++
+ .../recovery/RMStateStoreEventType.java            |   10 +-
+ .../recovery/RMStateStoreRMDTEvent.java            |   50 ++++
+ .../recovery/RMStateStoreRMDTMasterKeyEvent.java   |   39 +++
+ .../resourcemanager/recovery/ZKRMStateStore.java   |   16 +-
+ .../security/AMRMTokenSecretManager.java           |   12 +-
+ .../yarn/server/resourcemanager/TestRMRestart.java |   10 +-
+ .../recovery/RMStateStoreTestBase.java             |    5 +-
+ .../recovery/TestZKRMStateStore.java               |   40 ++-
+ 11 files changed, 430 insertions(+), 96 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+index 192157c..194ec69 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+@@ -618,22 +618,17 @@ Path getNodePath(Path root, String nodeName) {
+ 
+   @Override
+   public synchronized void storeOrUpdateAMRMTokenSecretManagerState(
+-      AMRMTokenSecretManagerState amrmTokenSecretManagerState,
+-      boolean isUpdate){
++      AMRMTokenSecretManagerState amrmTokenSecretManagerState, boolean isUpdate)
++      throws Exception {
+     Path nodeCreatePath =
+         getNodePath(amrmTokenSecretManagerRoot, AMRMTOKEN_SECRET_MANAGER_NODE);
+     AMRMTokenSecretManagerState data =
+         AMRMTokenSecretManagerState.newInstance(amrmTokenSecretManagerState);
+     byte[] stateData = data.getProto().toByteArray();
+-    try {
+-      if (isUpdate) {
+-        updateFile(nodeCreatePath, stateData);
+-      } else {
+-        writeFile(nodeCreatePath, stateData);
+-      }
+-    } catch (Exception ex) {
+-      LOG.info("Error storing info for AMRMTokenSecretManager", ex);
+-      notifyStoreOperationFailed(ex);
++    if (isUpdate) {
++      updateFile(nodeCreatePath, stateData);
++    } else {
++      writeFile(nodeCreatePath, stateData);
+     }
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+index 9deafe9..dd7ade5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+@@ -24,6 +24,9 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.TreeMap;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ 
+ import javax.crypto.SecretKey;
+ 
+@@ -88,6 +91,8 @@
+   protected static final String VERSION_NODE = "RMVersionNode";
+   protected static final String EPOCH_NODE = "EpochNode";
+   private ResourceManager resourceManager;
++  private final ReadLock readLock;
++  private final WriteLock writeLock;
+ 
+   public static final Log LOG = LogFactory.getLog(RMStateStore.class);
+ 
+@@ -115,6 +120,24 @@
+           RMStateStoreEventType.STORE_APP_ATTEMPT, new StoreAppAttemptTransition())
+       .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
+           RMStateStoreEventType.UPDATE_APP_ATTEMPT, new UpdateAppAttemptTransition())
++      .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++          RMStateStoreEventType.STORE_MASTERKEY,
++              new StoreRMDTMasterKeyTransition())
++      .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++          RMStateStoreEventType.REMOVE_MASTERKEY,
++              new RemoveRMDTMasterKeyTransition())
++      .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++          RMStateStoreEventType.STORE_DELEGATION_TOKEN,
++              new StoreRMDTTransition())
++      .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++          RMStateStoreEventType.REMOVE_DELEGATION_TOKEN,
++              new RemoveRMDTTransition())
++      .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++          RMStateStoreEventType.UPDATE_DELEGATION_TOKEN,
++              new UpdateRMDTTransition())
++       .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.ACTIVE,
++           RMStateStoreEventType.UPDATE_AMRM_TOKEN,
++              new StoreOrUpdateAMRMTokenTransition())
+       .addTransition(RMStateStoreState.ACTIVE, RMStateStoreState.FENCED,
+           RMStateStoreEventType.FENCED)
+       .addTransition(RMStateStoreState.FENCED, RMStateStoreState.FENCED,
+@@ -124,7 +147,13 @@
+           RMStateStoreEventType.REMOVE_APP,
+           RMStateStoreEventType.STORE_APP_ATTEMPT,
+           RMStateStoreEventType.UPDATE_APP_ATTEMPT,
+-          RMStateStoreEventType.FENCED));
++          RMStateStoreEventType.FENCED,
++          RMStateStoreEventType.STORE_MASTERKEY,
++          RMStateStoreEventType.REMOVE_MASTERKEY,
++          RMStateStoreEventType.STORE_DELEGATION_TOKEN,
++          RMStateStoreEventType.REMOVE_DELEGATION_TOKEN,
++          RMStateStoreEventType.UPDATE_DELEGATION_TOKEN,
++          RMStateStoreEventType.UPDATE_AMRM_TOKEN));
+ 
+   private final StateMachine<RMStateStoreState,
+                              RMStateStoreEventType,
+@@ -257,8 +286,141 @@ public void transition(RMStateStore store, RMStateStoreEvent event) {
+     };
+   }
+ 
++  private static class StoreRMDTTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreRMDTEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++      RMStateStoreRMDTEvent dtEvent = (RMStateStoreRMDTEvent) event;
++      try {
++        LOG.info("Storing RMDelegationToken and SequenceNumber");
++        store.storeRMDelegationTokenState(
++            dtEvent.getRmDTIdentifier(), dtEvent.getRenewDate());
++      } catch (Exception e) {
++        LOG.error("Error While Storing RMDelegationToken and SequenceNumber ",
++            e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
++  private static class RemoveRMDTTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreRMDTEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++      RMStateStoreRMDTEvent dtEvent = (RMStateStoreRMDTEvent) event;
++      try {
++        LOG.info("Removing RMDelegationToken and SequenceNumber");
++        store.removeRMDelegationTokenState(dtEvent.getRmDTIdentifier());
++      } catch (Exception e) {
++        LOG.error("Error While Removing RMDelegationToken and SequenceNumber ",
++            e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
++  private static class UpdateRMDTTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreRMDTEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++
++      RMStateStoreRMDTEvent dtEvent = (RMStateStoreRMDTEvent) event;
++      try {
++        LOG.info("Updating RMDelegationToken and SequenceNumber");
++        store.updateRMDelegationTokenState(
++            dtEvent.getRmDTIdentifier(), dtEvent.getRenewDate());
++      } catch (Exception e) {
++        LOG.error("Error While Updating RMDelegationToken and SequenceNumber ",
++            e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
++  private static class StoreRMDTMasterKeyTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreRMDTMasterKeyEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++      RMStateStoreRMDTMasterKeyEvent dtEvent =
++          (RMStateStoreRMDTMasterKeyEvent) event;
++      try {
++        LOG.info("Storing RMDTMasterKey.");
++        store.storeRMDTMasterKeyState(dtEvent.getDelegationKey());
++      } catch (Exception e) {
++        LOG.error("Error While Storing RMDTMasterKey.", e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
++  private static class RemoveRMDTMasterKeyTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreRMDTMasterKeyEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++      RMStateStoreRMDTMasterKeyEvent dtEvent =
++          (RMStateStoreRMDTMasterKeyEvent) event;
++      try {
++        LOG.info("Removing RMDTMasterKey.");
++        store.removeRMDTMasterKeyState(dtEvent.getDelegationKey());
++      } catch (Exception e) {
++        LOG.error("Error While Removing RMDTMasterKey.", e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
++  private static class StoreOrUpdateAMRMTokenTransition implements
++      SingleArcTransition<RMStateStore, RMStateStoreEvent> {
++    @Override
++    public void transition(RMStateStore store, RMStateStoreEvent event) {
++      if (!(event instanceof RMStateStoreAMRMTokenEvent)) {
++        // should never happen
++        LOG.error("Illegal event type: " + event.getClass());
++        return;
++      }
++      RMStateStoreAMRMTokenEvent amrmEvent = (RMStateStoreAMRMTokenEvent) event;
++
++      try {
++        LOG.info("Updating AMRMToken");
++        store.storeOrUpdateAMRMTokenSecretManagerState(
++            amrmEvent.getAmrmTokenSecretManagerState(), amrmEvent.isUpdate());
++      } catch (Exception e) {
++        LOG.error("Error storing info for AMRMTokenSecretManager", e);
++        store.notifyStoreOperationFailed(e);
++      }
++    }
++  }
++
+   public RMStateStore() {
+     super(RMStateStore.class.getName());
++    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
++    this.readLock = lock.readLock();
++    this.writeLock = lock.writeLock();
+     stateMachine = stateMachineFactory.make(this);
+   }
+ 
+@@ -447,9 +609,8 @@ public void updateApplicationState(
+     dispatcher.getEventHandler().handle(new RMStateUpdateAppEvent(appState));
+   }
+ 
+-  public synchronized void updateFencedState() {
+-    this.stateMachine.doTransition(RMStateStoreEventType.FENCED,
+-         new RMStateStoreEvent(RMStateStoreEventType.FENCED));
++  public void updateFencedState() {
++    handleStoreEvent(new RMStateStoreEvent(RMStateStoreEventType.FENCED));
+   }
+ 
+   /**
+@@ -511,17 +672,10 @@ protected abstract void updateApplicationAttemptStateInternal(
+    * RMDTSecretManager call this to store the state of a delegation token
+    * and sequence number
+    */
+-  public synchronized void storeRMDelegationToken(
++  public void storeRMDelegationToken(
+       RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate) {
+-    if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't store RM Delegation Token.");
+-      return;
+-    }
+-    try {
+-      storeRMDelegationTokenState(rmDTIdentifier, renewDate);
+-    } catch (Exception e) {
+-      notifyStoreOperationFailed(e);
+-    }
++    handleStoreEvent(new RMStateStoreRMDTEvent(rmDTIdentifier, renewDate,
++        RMStateStoreEventType.STORE_DELEGATION_TOKEN));
+   }
+ 
+   /**
+@@ -536,17 +690,10 @@ protected abstract void storeRMDelegationTokenState(
+   /**
+    * RMDTSecretManager call this to remove the state of a delegation token
+    */
+-  public synchronized void removeRMDelegationToken(
++  public void removeRMDelegationToken(
+       RMDelegationTokenIdentifier rmDTIdentifier) {
+-    if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't remove RM Delegation Token.");
+-      return;
+-    }
+-    try {
+-      removeRMDelegationTokenState(rmDTIdentifier);
+-    } catch (Exception e) {
+-      notifyStoreOperationFailed(e);
+-    }
++    handleStoreEvent(new RMStateStoreRMDTEvent(rmDTIdentifier, null,
++        RMStateStoreEventType.REMOVE_DELEGATION_TOKEN));
+   }
+ 
+   /**
+@@ -560,17 +707,10 @@ protected abstract void removeRMDelegationTokenState(
+    * RMDTSecretManager call this to update the state of a delegation token
+    * and sequence number
+    */
+-  public synchronized void updateRMDelegationToken(
++  public void updateRMDelegationToken(
+       RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate) {
+-    if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't update RM Delegation Token.");
+-      return;
+-    }
+-    try {
+-      updateRMDelegationTokenState(rmDTIdentifier, renewDate);
+-    } catch (Exception e) {
+-      notifyStoreOperationFailed(e);
+-    }
++    handleStoreEvent(new RMStateStoreRMDTEvent(rmDTIdentifier, renewDate,
++        RMStateStoreEventType.UPDATE_DELEGATION_TOKEN));
+   }
+ 
+   /**
+@@ -585,17 +725,9 @@ protected abstract void updateRMDelegationTokenState(
+   /**
+    * RMDTSecretManager call this to store the state of a master key
+    */
+-  public synchronized void storeRMDTMasterKey(DelegationKey delegationKey) {
+-    if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't store RM Delegation " +
+-               "Token Master key.");
+-      return;
+-    }
+-    try {
+-      storeRMDTMasterKeyState(delegationKey);
+-    } catch (Exception e) {
+-      notifyStoreOperationFailed(e);
+-    }
++  public void storeRMDTMasterKey(DelegationKey delegationKey) {
++    handleStoreEvent(new RMStateStoreRMDTMasterKeyEvent(delegationKey,
++        RMStateStoreEventType.STORE_MASTERKEY));
+   }
+ 
+   /**
+@@ -609,17 +741,9 @@ protected abstract void storeRMDTMasterKeyState(DelegationKey delegationKey)
+   /**
+    * RMDTSecretManager call this to remove the state of a master key
+    */
+-  public synchronized void removeRMDTMasterKey(DelegationKey delegationKey) {
+-   if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't remove RM Delegation " +
+-               "Token Master key.");
+-      return;
+-    }
+-    try {
+-      removeRMDTMasterKeyState(delegationKey);
+-    } catch (Exception e) {
+-      notifyStoreOperationFailed(e);
+-    }
++  public void removeRMDTMasterKey(DelegationKey delegationKey) {
++    handleStoreEvent(new RMStateStoreRMDTMasterKeyEvent(delegationKey,
++        RMStateStoreEventType.REMOVE_MASTERKEY));
+   }
+ 
+   /**
+@@ -634,9 +758,19 @@ protected abstract void removeRMDTMasterKeyState(DelegationKey delegationKey)
+    * Blocking API Derived classes must implement this method to store or update
+    * the state of AMRMToken Master Key
+    */
+-  public abstract void storeOrUpdateAMRMTokenSecretManagerState(
+-      AMRMTokenSecretManagerState amrmTokenSecretManagerState,
+-      boolean isUpdate);
++  protected abstract void storeOrUpdateAMRMTokenSecretManagerState(
++      AMRMTokenSecretManagerState amrmTokenSecretManagerState, boolean isUpdate)
++      throws Exception;
++
++  /**
++   * Store or Update state of AMRMToken Master Key
++   */
++  public void storeOrUpdateAMRMTokenSecretManager(
++      AMRMTokenSecretManagerState amrmTokenSecretManagerState, boolean isUpdate) {
++    handleStoreEvent(new RMStateStoreAMRMTokenEvent(
++        amrmTokenSecretManagerState, isUpdate,
++        RMStateStoreEventType.UPDATE_AMRM_TOKEN));
++  }
+ 
+   /**
+    * Non-blocking API
+@@ -687,16 +821,32 @@ public Credentials getCredentialsFromAppAttempt(RMAppAttempt appAttempt) {
+   }
+   
+   @VisibleForTesting
+-  synchronized boolean isFencedState() {
+-    return (RMStateStoreState.FENCED == this.stateMachine.getCurrentState());
++  protected boolean isFencedState() {
++    return (RMStateStoreState.FENCED == getRMStateStoreState());
+   }
+ 
+   // Dispatcher related code
+   protected void handleStoreEvent(RMStateStoreEvent event) {
++    this.writeLock.lock();
+     try {
++
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Processing event of type " + event.getType());
++      }
++
++      final RMStateStoreState oldState = getRMStateStoreState();
++
+       this.stateMachine.doTransition(event.getType(), event);
++
++      if (oldState != getRMStateStoreState()) {
++        LOG.info("RMStateStore state change from " + oldState + " to "
++            + getRMStateStoreState());
++      }
++
+     } catch (InvalidStateTransitonException e) {
+       LOG.error("Can't handle this event at current state", e);
++    } finally {
++      this.writeLock.unlock();
+     }
+   }
+ 
+@@ -774,4 +924,13 @@ public abstract void removeApplication(ApplicationId removeAppId)
+   public void setResourceManager(ResourceManager rm) {
+     this.resourceManager = rm;
+   }
++
++  public RMStateStoreState getRMStateStoreState() {
++    this.readLock.lock();
++    try {
++      return this.stateMachine.getCurrentState();
++    } finally {
++      this.readLock.unlock();
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+new file mode 100644
+index 0000000..befec06
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.recovery;
++
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.AMRMTokenSecretManagerState;
++
++public class RMStateStoreAMRMTokenEvent extends RMStateStoreEvent {
++  private AMRMTokenSecretManagerState amrmTokenSecretManagerState;
++  private boolean isUpdate;
++
++  public RMStateStoreAMRMTokenEvent(RMStateStoreEventType type) {
++    super(type);
++  }
++
++  public RMStateStoreAMRMTokenEvent(
++      AMRMTokenSecretManagerState amrmTokenSecretManagerState,
++      boolean isUpdate, RMStateStoreEventType type) {
++    this(type);
++    this.amrmTokenSecretManagerState = amrmTokenSecretManagerState;
++    this.isUpdate = isUpdate;
++  }
++
++  public AMRMTokenSecretManagerState getAmrmTokenSecretManagerState() {
++    return amrmTokenSecretManagerState;
++  }
++
++  public boolean isUpdate() {
++    return isUpdate;
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+index 9301bf9..beba5eb 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+@@ -24,5 +24,13 @@
+   UPDATE_APP,
+   UPDATE_APP_ATTEMPT,
+   REMOVE_APP,
+-  FENCED
++  FENCED,
++
++  // Below events should be called synchronously
++  STORE_MASTERKEY,
++  REMOVE_MASTERKEY,
++  STORE_DELEGATION_TOKEN,
++  REMOVE_DELEGATION_TOKEN,
++  UPDATE_DELEGATION_TOKEN,
++  UPDATE_AMRM_TOKEN
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+new file mode 100644
+index 0000000..b8fada1
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+@@ -0,0 +1,50 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.recovery;
++
++import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
++
++public class RMStateStoreRMDTEvent extends RMStateStoreEvent {
++  private RMDelegationTokenIdentifier rmDTIdentifier;
++  private Long renewDate;
++  private int latestSequenceNumber;
++
++  public RMStateStoreRMDTEvent(RMStateStoreEventType type) {
++    super(type);
++  }
++
++  public RMStateStoreRMDTEvent(RMDelegationTokenIdentifier rmDTIdentifier,
++      Long renewDate, RMStateStoreEventType type) {
++    this(type);
++    this.rmDTIdentifier = rmDTIdentifier;
++    this.renewDate = renewDate;
++  }
++
++  public RMDelegationTokenIdentifier getRmDTIdentifier() {
++    return rmDTIdentifier;
++  }
++
++  public Long getRenewDate() {
++    return renewDate;
++  }
++
++  public int getLatestSequenceNumber() {
++    return latestSequenceNumber;
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+new file mode 100644
+index 0000000..c10b197
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+@@ -0,0 +1,39 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.recovery;
++
++import org.apache.hadoop.security.token.delegation.DelegationKey;
++
++public class RMStateStoreRMDTMasterKeyEvent extends RMStateStoreEvent {
++  private DelegationKey delegationKey;
++
++  public RMStateStoreRMDTMasterKeyEvent(RMStateStoreEventType type) {
++    super(type);
++  }
++
++  public RMStateStoreRMDTMasterKeyEvent(DelegationKey delegationKey,
++      RMStateStoreEventType type) {
++    this(type);
++    this.delegationKey = delegationKey;
++  }
++
++  public DelegationKey getDelegationKey() {
++    return delegationKey;
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+index 07bec1b..2e38521 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+@@ -1268,22 +1268,12 @@ protected synchronized ZooKeeper getNewZooKeeper()
+ 
+   @Override
+   public synchronized void storeOrUpdateAMRMTokenSecretManagerState(
+-      AMRMTokenSecretManagerState amrmTokenSecretManagerState,
+-      boolean isUpdate) {
+-    if(isFencedState()) {
+-      LOG.info("State store is in Fenced state. Can't store/update " +
+-               "AMRMToken Secret Manager state.");
+-      return;
+-    }	
++      AMRMTokenSecretManagerState amrmTokenSecretManagerState, boolean isUpdate)
++      throws Exception {
+     AMRMTokenSecretManagerState data =
+         AMRMTokenSecretManagerState.newInstance(amrmTokenSecretManagerState);
+     byte[] stateData = data.getProto().toByteArray();
+-    try {
+-      setDataWithRetries(amrmTokenSecretManagerRoot, stateData, -1);
+-    } catch (Exception ex) {
+-      LOG.info("Error storing info for AMRMTokenSecretManager", ex);
+-      notifyStoreOperationFailed(ex);
+-    }
++    setDataWithRetries(amrmTokenSecretManagerRoot, stateData, -1);
+   }
+ 
+   /**
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+index 5614338..c717ea9 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+@@ -107,8 +107,8 @@ public void start() {
+       AMRMTokenSecretManagerState state =
+           AMRMTokenSecretManagerState.newInstance(
+             this.currentMasterKey.getMasterKey(), null);
+-      rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManagerState(state,
+-        false);
++      rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManager(state,
++          false);
+     }
+     this.timer.scheduleAtFixedRate(new MasterKeyRoller(), rollingInterval,
+       rollingInterval);
+@@ -145,8 +145,8 @@ void rollMasterKey() {
+           AMRMTokenSecretManagerState.newInstance(
+             this.currentMasterKey.getMasterKey(),
+             this.nextMasterKey.getMasterKey());
+-      rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManagerState(state,
+-        true);
++      rmContext.getStateStore()
++          .storeOrUpdateAMRMTokenSecretManager(state, true);
+       this.timer.schedule(new NextKeyActivator(), this.activationDelay);
+     } finally {
+       this.writeLock.unlock();
+@@ -170,8 +170,8 @@ public void activateNextMasterKey() {
+       AMRMTokenSecretManagerState state =
+           AMRMTokenSecretManagerState.newInstance(
+             this.currentMasterKey.getMasterKey(), null);
+-      rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManagerState(state,
+-        true);
++      rmContext.getStateStore()
++          .storeOrUpdateAMRMTokenSecretManager(state, true);
+     } finally {
+       this.writeLock.unlock();
+     }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+index 81d8291..a8176cf 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+@@ -90,7 +90,10 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemoryRMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStoreAMRMTokenEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStoreEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStoreRMDTEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStoreRMDTMasterKeyEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationAttemptStateData;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationStateData;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+@@ -1465,7 +1468,12 @@ public void serviceStop() throws Exception {
+       @Override
+       protected void handleStoreEvent(RMStateStoreEvent event) {
+         // Block app saving request.
+-        while (wait);
++        // Skip if synchronous updation of DTToken
++        if (!(event instanceof RMStateStoreAMRMTokenEvent)
++            && !(event instanceof RMStateStoreRMDTEvent)
++            && !(event instanceof RMStateStoreRMDTMasterKeyEvent)) {
++          while (wait);
++        }
+         super.handleStoreEvent(event);
+       }
+     };
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+index 3710525..71e3136 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+@@ -628,7 +628,8 @@ public void testAMRMTokenSecretManagerStateStore(
+     AMRMTokenSecretManagerState state1 =
+         AMRMTokenSecretManagerState.newInstance(
+           firstMasterKeyData.getMasterKey(), null);
+-    rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManagerState(state1,
++    rmContext.getStateStore()
++        .storeOrUpdateAMRMTokenSecretManager(state1,
+       false);
+ 
+     // load state
+@@ -647,7 +648,7 @@ public void testAMRMTokenSecretManagerStateStore(
+         AMRMTokenSecretManagerState
+           .newInstance(firstMasterKeyData.getMasterKey(),
+             secondMasterKeyData.getMasterKey());
+-    rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManagerState(state2,
++    rmContext.getStateStore().storeOrUpdateAMRMTokenSecretManager(state2,
+       true);
+ 
+     // load state
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+index 6e54795..7324886 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+@@ -41,6 +41,8 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.ha.HAServiceProtocol;
+ import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.token.delegation.DelegationKey;
+ import org.apache.hadoop.service.Service;
+ import org.apache.hadoop.service.ServiceStateException;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+@@ -52,6 +54,7 @@
+ import org.apache.hadoop.yarn.api.records.impl.pb.ContainerPBImpl;
+ import org.apache.hadoop.yarn.conf.HAUtil;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
+ import org.apache.hadoop.yarn.server.records.Version;
+ import org.apache.hadoop.yarn.server.records.impl.pb.VersionPBImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+@@ -557,7 +560,42 @@ public void testFencedState() throws Exception {
+     store.removeApplication(mockApp);
+     assertEquals("RMStateStore should have been in fenced state",
+             true, store.isFencedState());
+- 
++
++    // store RM delegation token;
++    RMDelegationTokenIdentifier dtId1 =
++        new RMDelegationTokenIdentifier(new Text("owner1"),
++            new Text("renewer1"), new Text("realuser1"));
++    Long renewDate1 = new Long(System.currentTimeMillis());
++    int sequenceNumber = 1111;
++    store.storeRMDelegationToken(dtId1, renewDate1);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
++    store.updateRMDelegationToken(dtId1, renewDate1);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
++    // remove delegation key;
++    store.removeRMDelegationToken(dtId1);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
++    // store delegation master key;
++    DelegationKey key = new DelegationKey(1234, 4321, "keyBytes".getBytes());
++    store.storeRMDTMasterKey(key);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
++    // remove delegation master key;
++    store.removeRMDTMasterKey(key);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
++    // store or update AMRMToken;
++    store.storeOrUpdateAMRMTokenSecretManager(null, false);
++    assertEquals("RMStateStore should have been in fenced state", true,
++        store.isFencedState());
++
+     store.close();
+   }
+ }
+-- 
+1.7.9.5
+

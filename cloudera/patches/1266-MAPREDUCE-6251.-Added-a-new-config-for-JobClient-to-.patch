@@ -1,0 +1,271 @@
+From 63b61445b848d46da9dfe204259a4a008f96e0af Mon Sep 17 00:00:00 2001
+From: Vinod Kumar Vavilapalli <vinodkv@apache.org>
+Date: Tue, 12 May 2015 12:11:42 -0700
+Subject: [PATCH 1266/2848] MAPREDUCE-6251. Added a new config for JobClient
+ to retry JobStatus calls so that they don't fail
+ on history-server backed by DFSes with not so
+ strong guarantees. Contributed by Craig Welch.
+
+(cherry picked from commit f24452d14e9ba48cdb82e5e6e5c10ce5b1407308)
+(cherry picked from commit d5755ba241a459b67afa4d1cc0a48d2c6f358c2a)
+
+Conflicts:
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+
+Change-Id: I2cda19bc1ea18098fb289fb62cb469f137d3a1df
+---
+ .../java/org/apache/hadoop/mapred/JobClient.java   |   51 +++++++++++----
+ .../org/apache/hadoop/mapreduce/MRJobConfig.java   |   15 +++++
+ .../src/main/resources/mapred-default.xml          |   17 +++++
+ .../apache/hadoop/mapred/JobClientUnitTest.java    |   65 ++++++++++++++++++++
+ 4 files changed, 137 insertions(+), 11 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+index 34b1293..752574b 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+@@ -37,6 +37,7 @@
+ import org.apache.hadoop.mapreduce.Cluster;
+ import org.apache.hadoop.mapreduce.ClusterMetrics;
+ import org.apache.hadoop.mapreduce.Job;
++import org.apache.hadoop.mapreduce.MRJobConfig;
+ import org.apache.hadoop.mapreduce.QueueInfo;
+ import org.apache.hadoop.mapreduce.TaskTrackerInfo;
+ import org.apache.hadoop.mapreduce.TaskType;
+@@ -155,6 +156,10 @@
+   public static enum TaskStatusFilter { NONE, KILLED, FAILED, SUCCEEDED, ALL }
+   private TaskStatusFilter taskOutputFilter = TaskStatusFilter.FAILED; 
+   
++  private int maxRetry = MRJobConfig.DEFAULT_MR_CLIENT_JOB_MAX_RETRIES;
++  private long retryInterval =
++      MRJobConfig.DEFAULT_MR_CLIENT_JOB_RETRY_INTERVAL;
++
+   static{
+     ConfigUtil.loadResources();
+   }
+@@ -471,6 +476,14 @@ public void init(JobConf conf) throws IOException {
+     Limits.init(conf);
+     cluster = new Cluster(conf);
+     clientUgi = UserGroupInformation.getCurrentUser();
++
++    maxRetry = conf.getInt(MRJobConfig.MR_CLIENT_JOB_MAX_RETRIES,
++      MRJobConfig.DEFAULT_MR_CLIENT_JOB_MAX_RETRIES);
++
++    retryInterval =
++      conf.getLong(MRJobConfig.MR_CLIENT_JOB_RETRY_INTERVAL,
++        MRJobConfig.DEFAULT_MR_CLIENT_JOB_RETRY_INTERVAL);
++
+   }
+ 
+   /**
+@@ -584,16 +597,8 @@ public Job run() throws IOException, InterruptedException  {
+       }
+     });
+   }
+-  /**
+-   * Get an {@link RunningJob} object to track an ongoing job.  Returns
+-   * null if the id does not correspond to any known job.
+-   * 
+-   * @param jobid the jobid of the job.
+-   * @return the {@link RunningJob} handle to track the job, null if the 
+-   *         <code>jobid</code> doesn't correspond to any known job.
+-   * @throws IOException
+-   */
+-  public RunningJob getJob(final JobID jobid) throws IOException {
++
++  protected RunningJob getJobInner(final JobID jobid) throws IOException {
+     try {
+       
+       Job job = getJobUsingCluster(jobid);
+@@ -610,7 +615,31 @@ public RunningJob getJob(final JobID jobid) throws IOException {
+     return null;
+   }
+ 
+-  /**@deprecated Applications should rather use {@link #getJob(JobID)}. 
++  /**
++   * Get an {@link RunningJob} object to track an ongoing job.  Returns
++   * null if the id does not correspond to any known job.
++   *
++   * @param jobid the jobid of the job.
++   * @return the {@link RunningJob} handle to track the job, null if the
++   *         <code>jobid</code> doesn't correspond to any known job.
++   * @throws IOException
++   */
++  public RunningJob getJob(final JobID jobid) throws IOException {
++     for (int i = 0;i <= maxRetry;i++) {
++       if (i > 0) {
++         try {
++           Thread.sleep(retryInterval);
++         } catch (Exception e) { }
++       }
++       RunningJob job = getJobInner(jobid);
++       if (job != null) {
++         return job;
++       }
++     }
++     return null;
++  }
++
++  /**@deprecated Applications should rather use {@link #getJob(JobID)}.
+    */
+   @Deprecated
+   public RunningJob getJob(String jobid) throws IOException {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+index a011b3b..79f72a0 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+@@ -452,6 +452,21 @@
+     MR_PREFIX + "client.max-retries";
+   public static final int DEFAULT_MR_CLIENT_MAX_RETRIES = 3;
+   
++  /**
++   * How many times to retry jobclient calls (via getjob)
++   */
++  public static final String MR_CLIENT_JOB_MAX_RETRIES =
++      MR_PREFIX + "client.job.max-retries";
++  public static final int DEFAULT_MR_CLIENT_JOB_MAX_RETRIES = 0;
++
++  /**
++   * How long to wait between jobclient retries on failure
++   */
++  public static final String MR_CLIENT_JOB_RETRY_INTERVAL =
++      MR_PREFIX + "client.job.retry-interval";
++  public static final long DEFAULT_MR_CLIENT_JOB_RETRY_INTERVAL =
++      2000;
++
+   /** The staging directory for map reduce.*/
+   public static final String MR_AM_STAGING_DIR = 
+     MR_AM_PREFIX+"staging-dir";
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+index 1abbf32..66a7de2 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+@@ -1782,6 +1782,23 @@
+ </property>
+ 
+ <property>
++  <name>yarn.app.mapreduce.client.job.max-retries</name>
++  <value>0</value>
++  <description>The number of retries the client will make for getJob and
++  dependent calls.  The default is 0 as this is generally only needed for
++  non-HDFS DFS where additional, high level retries are required to avoid
++  spurious failures during the getJob call.  30 is a good value for
++  WASB</description>
++</property>
++
++<property>
++  <name>yarn.app.mapreduce.client.job.retry-interval</name>
++  <value>2000</value>
++  <description>The delay between getJob retries in ms for retries configured
++  with yarn.app.mapreduce.client.job.max-retries.</description>
++</property>
++
++<property>
+   <description>CLASSPATH for MR applications. A comma-separated list
+   of CLASSPATH entries. If mapreduce.application.framework is set then this
+   must specify the appropriate classpath for that archive, and the name of
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/JobClientUnitTest.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/JobClientUnitTest.java
+index 8dfac89..84b76bf 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/JobClientUnitTest.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/JobClientUnitTest.java
+@@ -20,6 +20,7 @@
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertNotNull;
+ import static org.mockito.Matchers.isA;
+ import static org.mockito.Mockito.atLeastOnce;
+ import static org.mockito.Mockito.mock;
+@@ -35,6 +36,7 @@
+ import org.apache.hadoop.mapreduce.Job;
+ import org.apache.hadoop.mapreduce.JobPriority;
+ import org.apache.hadoop.mapreduce.JobStatus;
++import org.apache.hadoop.mapreduce.MRJobConfig;
+ import org.apache.hadoop.mapreduce.TaskReport;
+ import org.apache.hadoop.mapreduce.TaskType;
+ import org.junit.Assert;
+@@ -52,6 +54,42 @@
+     void setCluster(Cluster cluster) {
+       this.cluster = cluster;
+     }
++
++  }
++
++  public class TestJobClientGetJob extends TestJobClient {
++
++    int lastGetJobRetriesCounter = 0;
++    int getJobRetriesCounter = 0;
++    int getJobRetries = 0;
++    RunningJob runningJob;
++
++    TestJobClientGetJob(JobConf jobConf) throws IOException {
++      super(jobConf);
++    }
++
++    public int getLastGetJobRetriesCounter() {
++      return lastGetJobRetriesCounter;
++    }
++
++    public void setGetJobRetries(int getJobRetries) {
++      this.getJobRetries = getJobRetries;
++    }
++
++    public void setRunningJob(RunningJob runningJob) {
++      this.runningJob = runningJob;
++    }
++
++    protected RunningJob getJobInner(final JobID jobid) throws IOException {
++      if (getJobRetriesCounter >= getJobRetries) {
++        lastGetJobRetriesCounter = getJobRetriesCounter;
++        getJobRetriesCounter = 0;
++        return runningJob;
++      }
++      getJobRetriesCounter++;
++      return null;
++    }
++
+   }
+ 
+   @Test
+@@ -124,6 +162,7 @@ public void testShowJob() throws Exception {
+ 
+     JobStatus mockJobStatus = mock(JobStatus.class);
+     when(mockJobStatus.getJobID()).thenReturn(jobID);
++    when(mockJobStatus.getJobName()).thenReturn(jobID.toString());
+     when(mockJobStatus.getState()).thenReturn(JobStatus.State.RUNNING);
+     when(mockJobStatus.getStartTime()).thenReturn(startTime);
+     when(mockJobStatus.getUsername()).thenReturn("mockuser");
+@@ -181,4 +220,30 @@ public void testGetJobWithUnknownJob() throws Exception {
+     assertNull(client.getJob(id));
+   }
+ 
++  @Test
++  public void testGetJobRetry() throws Exception {
++
++    //To prevent the test from running for a very long time, lower the retry
++    JobConf conf = new JobConf();
++    conf.set(MRJobConfig.MR_CLIENT_JOB_MAX_RETRIES, "3");
++
++    TestJobClientGetJob client = new TestJobClientGetJob(conf);
++    JobID id = new JobID("ajob",1);
++    RunningJob rj = mock(RunningJob.class);
++    client.setRunningJob(rj);
++
++    //no retry
++    assertNotNull(client.getJob(id));
++    assertEquals(client.getLastGetJobRetriesCounter(), 0);
++
++    //3 retry
++    client.setGetJobRetries(3);
++    assertNotNull(client.getJob(id));
++    assertEquals(client.getLastGetJobRetriesCounter(), 3);
++
++    //beyond MAPREDUCE_JOBCLIENT_GETJOB_MAX_RETRY_KEY, will get null
++    client.setGetJobRetries(5);
++    assertNull(client.getJob(id));
++  }
++
+ }
+-- 
+1.7.9.5
+

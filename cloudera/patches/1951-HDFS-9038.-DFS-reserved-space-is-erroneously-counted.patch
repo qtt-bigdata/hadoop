@@ -1,0 +1,684 @@
+From 4adebfcb84325da3ffd2e7eb1171dcf96f979fae Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Thu, 8 Sep 2016 13:40:01 -0700
+Subject: [PATCH 1951/2848] HDFS-9038. DFS reserved space is erroneously
+ counted towards non-DFS used. (Brahma Reddy
+ Battula)
+
+(cherry picked from commit 607801b2ff7a10dbe27ecba52a41e3897e5dfdd4)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeInfo.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeadDatanode.java
+
+Change-Id: I9262f0afcd311a5b58ffb973322e1263626a9c0f
+---
+ .../apache/hadoop/hdfs/protocol/DatanodeInfo.java  |   27 ++++++++++++-
+ .../apache/hadoop/hdfs/protocolPB/PBHelper.java    |   41 +++++++++++++-------
+ .../server/blockmanagement/DatanodeDescriptor.java |    3 ++
+ .../blockmanagement/DatanodeStorageInfo.java       |   10 +++--
+ .../server/blockmanagement/HeartbeatManager.java   |    7 ++--
+ .../datanode/fsdataset/impl/FsDatasetImpl.java     |    3 +-
+ .../datanode/fsdataset/impl/FsVolumeImpl.java      |   36 ++++++++++++++++-
+ .../hadoop/hdfs/server/protocol/StorageReport.java |   12 ++++--
+ .../hadoop-hdfs/src/main/proto/hdfs.proto          |    2 +
+ .../hadoop/hdfs/protocolPB/TestPBHelper.java       |   22 +++++++++++
+ .../blockmanagement/BlockManagerTestUtil.java      |    2 +-
+ .../hadoop/hdfs/server/common/TestJspHelper.java   |    5 ++-
+ .../hdfs/server/datanode/SimulatedFSDataset.java   |    2 +-
+ .../datanode/extdataset/ExternalDatasetImpl.java   |    2 +-
+ .../datanode/fsdataset/impl/TestFsVolumeList.java  |   39 +++++++++++++++++++
+ .../server/namenode/NNThroughputBenchmark.java     |    4 +-
+ .../hdfs/server/namenode/TestDeadDatanode.java     |    2 +-
+ .../namenode/TestNamenodeCapacityReport.java       |   35 +++++++++++++++--
+ .../namenode/metrics/TestNameNodeMetrics.java      |    4 +-
+ 19 files changed, 216 insertions(+), 42 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeInfo.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeInfo.java
+index 9aae0b0..8babaeb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeInfo.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeInfo.java
+@@ -44,6 +44,7 @@
+ public class DatanodeInfo extends DatanodeID implements Node {
+   private long capacity;
+   private long dfsUsed;
++  private long nonDfsUsed;
+   private long remaining;
+   private long blockPoolUsed;
+   private long cacheCapacity;
+@@ -88,6 +89,7 @@ public DatanodeInfo(DatanodeInfo from) {
+     super(from);
+     this.capacity = from.getCapacity();
+     this.dfsUsed = from.getDfsUsed();
++    this.nonDfsUsed = from.getNonDfsUsed();
+     this.remaining = from.getRemaining();
+     this.blockPoolUsed = from.getBlockPoolUsed();
+     this.cacheCapacity = from.getCacheCapacity();
+@@ -102,6 +104,7 @@ public DatanodeInfo(DatanodeID nodeID) {
+     super(nodeID);
+     this.capacity = 0L;
+     this.dfsUsed = 0L;
++    this.nonDfsUsed = 0L;
+     this.remaining = 0L;
+     this.blockPoolUsed = 0L;
+     this.cacheCapacity = 0L;
+@@ -135,10 +138,24 @@ public DatanodeInfo(final String ipAddr, final String hostName,
+       final long blockPoolUsed, final long cacheCapacity, final long cacheUsed,
+       final long lastUpdate, final int xceiverCount,
+       final String networkLocation, final AdminStates adminState) {
++    this(ipAddr, hostName, datanodeUuid, xferPort, infoPort, infoSecurePort,
++        ipcPort, capacity, dfsUsed, 0L, remaining, blockPoolUsed, cacheCapacity,
++        cacheUsed, lastUpdate, xceiverCount,
++        networkLocation, adminState);
++  }
++  /** Constructor. */
++  public DatanodeInfo(final String ipAddr, final String hostName,
++     final String datanodeUuid, final int xferPort, final int infoPort,
++     final int infoSecurePort, final int ipcPort, final long capacity,
++     final long dfsUsed, final long nonDfsUsed, final long remaining,
++     final long blockPoolUsed, final long cacheCapacity, final long cacheUsed,
++     final long lastUpdate, final int xceiverCount,
++     final String networkLocation, final AdminStates adminState) {
+     super(ipAddr, hostName, datanodeUuid, xferPort, infoPort,
+             infoSecurePort, ipcPort);
+     this.capacity = capacity;
+     this.dfsUsed = dfsUsed;
++    this.nonDfsUsed = nonDfsUsed;
+     this.remaining = remaining;
+     this.blockPoolUsed = blockPoolUsed;
+     this.cacheCapacity = cacheCapacity;
+@@ -166,8 +183,7 @@ public String getName() {
+ 
+   /** The used space by the data node. */
+   public long getNonDfsUsed() {
+-    long nonDFSUsed = capacity - dfsUsed - remaining;
+-    return nonDFSUsed < 0 ? 0 : nonDFSUsed;
++    return nonDfsUsed;
+   }
+ 
+   /** The used space by the data node as percentage of present capacity */
+@@ -240,6 +256,13 @@ public void setDfsUsed(long dfsUsed) {
+     this.dfsUsed = dfsUsed;
+   }
+ 
++  /**
++   * Sets the nondfs-used space for the datanode.
++   */
++  public void setNonDfsUsed(long nonDfsUsed) {
++    this.nonDfsUsed = nonDfsUsed;
++  }
++
+   /** Sets raw free space. */
+   public void setRemaining(long remaining) {
+     this.remaining = remaining;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+index 3b0aee9..c348063 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+@@ -641,14 +641,22 @@ public static RecoveringBlock convert(RecoveringBlockProto b) {
+   }
+   
+   static public DatanodeInfo convert(DatanodeInfoProto di) {
+-    if (di == null) return null;
+-    return new DatanodeInfo(
+-        PBHelper.convert(di.getId()),
+-        di.hasLocation() ? di.getLocation() : null , 
+-        di.getCapacity(),  di.getDfsUsed(),  di.getRemaining(),
+-        di.getBlockPoolUsed(), di.getCacheCapacity(), di.getCacheUsed(),
+-        di.getLastUpdate(), di.getXceiverCount(),
+-        PBHelper.convert(di.getAdminState())); 
++    if (di == null) {
++      return null;
++    }
++    DatanodeInfo dinfo = new DatanodeInfo(PBHelper.convert(di.getId()),
++        di.hasLocation() ? di.getLocation() : null, di.getCapacity(),
++        di.getDfsUsed(), di.getRemaining(), di.getBlockPoolUsed(),
++        di.getCacheCapacity(), di.getCacheUsed(), di.getLastUpdate(),
++        di.getXceiverCount(), PBHelper.convert(di.getAdminState()));
++    if (di.hasNonDfsUsed()) {
++      dinfo.setNonDfsUsed(di.getNonDfsUsed());
++    } else {
++      // use the legacy way for older datanodes
++      long nonDFSUsed = di.getCapacity() - di.getDfsUsed() - di.getRemaining();
++      dinfo.setNonDfsUsed(nonDFSUsed < 0 ? 0 : nonDFSUsed);
++    }
++    return dinfo;
+   }
+   
+   static public DatanodeInfoProto convertDatanodeInfo(DatanodeInfo di) {
+@@ -704,6 +712,7 @@ public static DatanodeInfoProto convert(DatanodeInfo info) {
+         .setId(PBHelper.convert((DatanodeID)info))
+         .setCapacity(info.getCapacity())
+         .setDfsUsed(info.getDfsUsed())
++        .setNonDfsUsed(info.getNonDfsUsed())
+         .setRemaining(info.getRemaining())
+         .setBlockPoolUsed(info.getBlockPoolUsed())
+         .setCacheCapacity(info.getCacheCapacity())
+@@ -1884,17 +1893,19 @@ public static StorageReportProto convert(StorageReport r) {
+         .setBlockPoolUsed(r.getBlockPoolUsed()).setCapacity(r.getCapacity())
+         .setDfsUsed(r.getDfsUsed()).setRemaining(r.getRemaining())
+         .setStorageUuid(r.getStorage().getStorageID())
+-        .setStorage(convert(r.getStorage()));
++        .setStorage(convert(r.getStorage()))
++        .setNonDfsUsed(r.getNonDfsUsed());
+     return builder.build();
+   }
+ 
+   public static StorageReport convert(StorageReportProto p) {
+-    return new StorageReport(
+-        p.hasStorage() ?
+-            convert(p.getStorage()) :
+-            new DatanodeStorage(p.getStorageUuid()),
+-        p.getFailed(), p.getCapacity(), p.getDfsUsed(), p.getRemaining(),
+-        p.getBlockPoolUsed());
++    long nonDfsUsed = p.hasNonDfsUsed() ?
++        p.getNonDfsUsed() :
++        p.getCapacity() - p.getDfsUsed() - p.getRemaining();
++    return new StorageReport(p.hasStorage() ?
++        convert(p.getStorage()) :
++        new DatanodeStorage(p.getStorageUuid()), p.getFailed(), p.getCapacity(),
++        p.getDfsUsed(), p.getRemaining(), p.getBlockPoolUsed(), nonDfsUsed);
+   }
+ 
+   public static StorageReport[] convertStorageReports(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+index 29e3b45..b26efb5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+@@ -420,6 +420,7 @@ public void updateHeartbeatState(StorageReport[] reports, long cacheCapacity,
+     long totalRemaining = 0;
+     long totalBlockPoolUsed = 0;
+     long totalDfsUsed = 0;
++    long totalNonDfsUsed = 0;
+     Set<DatanodeStorageInfo> failedStorageInfos = null;
+ 
+     // Decide if we should check for any missing StorageReport and mark it as
+@@ -479,6 +480,7 @@ public void updateHeartbeatState(StorageReport[] reports, long cacheCapacity,
+       totalRemaining += report.getRemaining();
+       totalBlockPoolUsed += report.getBlockPoolUsed();
+       totalDfsUsed += report.getDfsUsed();
++      totalNonDfsUsed += report.getNonDfsUsed();
+     }
+     rollBlocksScheduled(getLastUpdate());
+ 
+@@ -487,6 +489,7 @@ public void updateHeartbeatState(StorageReport[] reports, long cacheCapacity,
+     setRemaining(totalRemaining);
+     setBlockPoolUsed(totalBlockPoolUsed);
+     setDfsUsed(totalDfsUsed);
++    setNonDfsUsed(totalNonDfsUsed);
+     if (checkFailedStorages) {
+       updateFailedStorage(failedStorageInfos);
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
+index 99f0b0b..6f51003 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
+@@ -85,6 +85,7 @@ public void updateFromStorage(DatanodeStorage storage) {
+ 
+   private long capacity;
+   private long dfsUsed;
++  private long nonDfsUsed;
+   private volatile long remaining;
+   private long blockPoolUsed;
+ 
+@@ -194,6 +195,9 @@ long getDfsUsed() {
+     return dfsUsed;
+   }
+ 
++  long getNonDfsUsed() {
++    return nonDfsUsed;
++  }
+   long getRemaining() {
+     return remaining;
+   }
+@@ -271,6 +275,7 @@ int numBlocks() {
+   void updateState(StorageReport r) {
+     capacity = r.getCapacity();
+     dfsUsed = r.getDfsUsed();
++    nonDfsUsed = r.getNonDfsUsed();
+     remaining = r.getRemaining();
+     blockPoolUsed = r.getBlockPoolUsed();
+   }
+@@ -308,9 +313,8 @@ public String toString() {
+   }
+   
+   StorageReport toStorageReport() {
+-    return new StorageReport(
+-        new DatanodeStorage(storageID, state, storageType),
+-        false, capacity, dfsUsed, remaining, blockPoolUsed);
++    return new StorageReport(new DatanodeStorage(storageID, state, storageType),
++        false, capacity, dfsUsed, remaining, blockPoolUsed, nonDfsUsed);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+index c45237a..71bd827 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+@@ -151,9 +151,7 @@ public synchronized float getPercentBlockPoolUsed() {
+ 
+   @Override
+   public synchronized long getCapacityUsedNonDFS() {
+-    final long nonDFSUsed = stats.capacityTotal
+-        - stats.capacityRemaining - stats.capacityUsed;
+-    return nonDFSUsed < 0L? 0L : nonDFSUsed;
++    return stats.capacityUsedNonDfs;
+   }
+ 
+   @Override
+@@ -434,6 +432,7 @@ public void run() {
+ 
+     private long capacityTotal = 0L;
+     private long capacityUsed = 0L;
++    private long capacityUsedNonDfs = 0L;
+     private long capacityRemaining = 0L;
+     private long blockPoolUsed = 0L;
+     private int xceiverCount = 0;
+@@ -447,6 +446,7 @@ public void run() {
+ 
+     private void add(final DatanodeDescriptor node) {
+       capacityUsed += node.getDfsUsed();
++      capacityUsedNonDfs += node.getNonDfsUsed();
+       blockPoolUsed += node.getBlockPoolUsed();
+       xceiverCount += node.getXceiverCount();
+       if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
+@@ -471,6 +471,7 @@ private void add(final DatanodeDescriptor node) {
+ 
+     private void subtract(final DatanodeDescriptor node) {
+       capacityUsed -= node.getDfsUsed();
++      capacityUsedNonDfs -= node.getNonDfsUsed();
+       blockPoolUsed -= node.getBlockPoolUsed();
+       xceiverCount -= node.getXceiverCount();
+       if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+index 3f265ec..45592e5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+@@ -161,7 +161,8 @@ public DatanodeStorage getStorage(final String storageUuid) {
+               volume.getCapacity(),
+               volume.getDfsUsed(),
+               volume.getAvailable(),
+-              volume.getBlockPoolUsed(bpid));
++              volume.getBlockPoolUsed(bpid),
++              volume.getNonDfsUsed());
+           reports.add(sr);
+         } catch (ClosedChannelException e) {
+           continue;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+index 8a30c43..2cc74b0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+@@ -349,14 +349,46 @@ public void setCapacityForTesting(long capacity) {
+    */
+   @Override
+   public long getAvailable() throws IOException {
+-    long remaining = getCapacity() - getDfsUsed() - reservedForRbw.get();
+-    long available = usage.getAvailable() - reserved - reservedForRbw.get();
++    long remaining = getCapacity() - getDfsUsed() - getReservedForRbw();
++    long available =
++        usage.getAvailable() - getRemainingReserved() - getReservedForRbw();
+     if (remaining > available) {
+       remaining = available;
+     }
+     return (remaining > 0) ? remaining : 0;
+   }
+ 
++  long getActualNonDfsUsed() throws IOException {
++    return usage.getUsed() - getDfsUsed();
++  }
++
++  private long getRemainingReserved() throws IOException {
++    long actualNonDfsUsed = getActualNonDfsUsed();
++    if (actualNonDfsUsed < reserved) {
++      return reserved - actualNonDfsUsed;
++    }
++    return 0L;
++  }
++
++  /**
++   * Unplanned Non-DFS usage, i.e. Extra usage beyond reserved.
++   *
++   * @return
++   * @throws IOException
++   */
++  public long getNonDfsUsed() throws IOException {
++    long actualNonDfsUsed = getActualNonDfsUsed();
++    if (actualNonDfsUsed < reserved) {
++      return 0L;
++    }
++    return actualNonDfsUsed - reserved;
++  }
++
++  @VisibleForTesting
++  long getDfAvailable() {
++    return usage.getAvailable();
++  }
++
+   @VisibleForTesting
+   public long getReservedForRbw() {
+     return reservedForRbw.get();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/StorageReport.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/StorageReport.java
+index 5fd5733..7042b58 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/StorageReport.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/StorageReport.java
+@@ -25,17 +25,19 @@
+   private final boolean failed;
+   private final long capacity;
+   private final long dfsUsed;
++  private final long nonDfsUsed;
+   private final long remaining;
+   private final long blockPoolUsed;
+ 
+   public static final StorageReport[] EMPTY_ARRAY = {};
+-  
+-  public StorageReport(DatanodeStorage storage, boolean failed,
+-      long capacity, long dfsUsed, long remaining, long bpUsed) {
++
++  public StorageReport(DatanodeStorage storage, boolean failed, long capacity,
++      long dfsUsed, long remaining, long bpUsed, long nonDfsUsed) {
+     this.storage = storage;
+     this.failed = failed;
+     this.capacity = capacity;
+     this.dfsUsed = dfsUsed;
++    this.nonDfsUsed = nonDfsUsed;
+     this.remaining = remaining;
+     this.blockPoolUsed = bpUsed;
+   }
+@@ -56,6 +58,10 @@ public long getDfsUsed() {
+     return dfsUsed;
+   }
+ 
++  public long getNonDfsUsed() {
++    return nonDfsUsed;
++  }
++
+   public long getRemaining() {
+     return remaining;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+index 8a70c51..f4c3628 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/hdfs.proto
+@@ -88,6 +88,7 @@ message DatanodeInfoProto {
+   optional uint64 lastUpdate = 6 [default = 0];
+   optional uint32 xceiverCount = 7 [default = 0];
+   optional string location = 8;
++  optional uint64 nonDfsUsed = 9;
+   enum AdminState {
+     NORMAL = 0;
+     DECOMMISSION_INPROGRESS = 1;
+@@ -123,6 +124,7 @@ message StorageReportProto {
+   optional uint64 remaining = 5 [ default = 0 ];
+   optional uint64 blockPoolUsed = 6 [ default = 0 ];
+   optional DatanodeStorageProto storage = 7; // supersedes StorageUuid
++  optional uint64 nonDfsUsed = 8;
+ }
+ 
+ /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
+index 98fd59a..e1e2d32 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/protocolPB/TestPBHelper.java
+@@ -638,4 +638,26 @@ public void testAclStatusProto() {
+         .build();
+     Assert.assertEquals(s, PBHelper.convert(PBHelper.convert(s)));
+   }
++
++  @Test
++  public void testDataNodeInfoPBHelper() {
++    DatanodeID id = DFSTestUtil.getLocalDatanodeID();
++    DatanodeInfo dnInfos0 = new DatanodeInfo(id);
++    dnInfos0.setCapacity(3500L);
++    dnInfos0.setDfsUsed(1000L);
++    dnInfos0.setNonDfsUsed(2000L);
++    dnInfos0.setRemaining(500L);
++    HdfsProtos.DatanodeInfoProto dnproto = PBHelper.convert(dnInfos0);
++    DatanodeInfo dnInfos1 = PBHelper.convert(dnproto);
++    compare(dnInfos0, dnInfos1);
++    assertEquals(dnInfos0.getNonDfsUsed(), dnInfos1.getNonDfsUsed());
++
++    //Testing without nonDfs field
++    HdfsProtos.DatanodeInfoProto.Builder b =
++        HdfsProtos.DatanodeInfoProto.newBuilder();
++    b.setId(PBHelper.convert(id)).setCapacity(3500L).setDfsUsed(1000L)
++        .setRemaining(500L);
++    DatanodeInfo dnInfos3 = PBHelper.convert(b.build());
++    assertEquals(dnInfos0.getNonDfsUsed(), dnInfos3.getNonDfsUsed());
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
+index 1be25ce..ed062bc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
+@@ -291,7 +291,7 @@ public static DatanodeStorageInfo newDatanodeStorageInfo(
+       StorageReport report = new StorageReport(
+           dns ,false, storage.getCapacity(),
+           storage.getDfsUsed(), storage.getRemaining(),
+-          storage.getBlockPoolUsed());
++          storage.getBlockPoolUsed(), 0L);
+       reports.add(report);
+     }
+     return reports.toArray(StorageReport.EMPTY_ARRAY);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+index 66c4df3..851ef1e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+@@ -490,10 +490,11 @@ public void testSortNodeByFields() throws Exception {
+     DatanodeStorage dns2 = new DatanodeStorage("dnStorage2");
+ 
+     StorageReport[] report1 = new StorageReport[] {
+-        new StorageReport(dns1, false, 1024, 100, 924, 100)
++        new StorageReport(dns1, false, 1024, 100, 924, 100, 1024 - 100 - 924)
+     };
+     StorageReport[] report2 = new StorageReport[] {
+-        new StorageReport(dns2, false, 2500, 200, 1848, 200)
++        new StorageReport(dns2, false, 2500, 200, 1848, 200,
++            2500 - 200 - 1848)
+     };
+     dnDesc1.updateHeartbeat(report1, 5L, 3L, 10, 2, null);
+     dnDesc2.updateHeartbeat(report2, 10L, 2L, 20, 1, null);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+index 5cdcec4..48198c0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+@@ -430,7 +430,7 @@ DatanodeStorage getDnStorage() {
+     synchronized StorageReport getStorageReport(String bpid) {
+       return new StorageReport(dnStorage,
+           false, getCapacity(), getUsed(), getFree(),
+-          map.get(bpid).getUsed());
++          map.get(bpid).getUsed(), 0L);
+     }
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+index 1ac8fb6..37c1369 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+@@ -72,7 +72,7 @@ public DatanodeStorage getStorage(String storageUuid) {
+   @Override
+   public StorageReport[] getStorageReports(String bpid) throws IOException {
+     StorageReport[] result = new StorageReport[1];
+-    result[0] = new StorageReport(storage, false, 0, 0, 0, 0);
++    result[0] = new StorageReport(storage, false, 0, 0, 0, 0, 0);
+     return result;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsVolumeList.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsVolumeList.java
+index 5a6190d..b944388 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsVolumeList.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsVolumeList.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -37,6 +38,7 @@
+ import java.util.List;
+ import java.util.concurrent.TimeoutException;
+ 
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotEquals;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.fail;
+@@ -143,4 +145,41 @@ public void testReleaseVolumeRefIfNoBlockScanner() throws IOException {
+     volumeList.addVolume(ref);
+     assertNull(ref.getVolume());
+   }
++
++  @Test
++  public void testNonDfsUsedMetricForVolume() throws Exception {
++    File volDir = new File(baseDir, "volume-0");
++    volDir.mkdirs();
++    /*
++     * Lets have the example.
++     * Capacity - 1000
++     * Reserved - 100
++     * DfsUsed  - 200
++     * Actual Non-DfsUsed - 300 -->(expected)
++     * ReservedForReplicas - 50
++     */
++    long diskCapacity = 1000L;
++    long duReserved = 100L;
++    long dfsUsage = 200L;
++    long actualNonDfsUsage = 300L;
++    long reservedForReplicas = 50L;
++    conf.setLong(DFSConfigKeys.DFS_DATANODE_DU_RESERVED_KEY, duReserved);
++    FsVolumeImpl volume = new FsVolumeImpl(dataset, "storage-id", volDir, conf,
++        StorageType.DEFAULT);
++    FsVolumeImpl spyVolume = Mockito.spy(volume);
++    // Set Capacity for testing
++    long testCapacity = diskCapacity - duReserved;
++    spyVolume.setCapacityForTesting(testCapacity);
++    // Mock volume.getDfAvailable()
++    long dfAvailable = diskCapacity - dfsUsage - actualNonDfsUsage;
++    Mockito.doReturn(dfAvailable).when(spyVolume).getDfAvailable();
++    // Mock dfsUsage
++    Mockito.doReturn(dfsUsage).when(spyVolume).getDfsUsed();
++    // Mock reservedForReplcas
++    Mockito.doReturn(reservedForReplicas).when(spyVolume).getReservedForRbw();
++    Mockito.doReturn(actualNonDfsUsage).when(spyVolume).getActualNonDfsUsed();
++    long expectedNonDfsUsage = actualNonDfsUsage - duReserved;
++    assertEquals(expectedNonDfsUsage, spyVolume.getNonDfsUsed());
++  }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+index 82f3d24..c4cc660 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+@@ -953,7 +953,7 @@ void sendHeartbeat() throws IOException {
+       // register datanode
+       // TODO:FEDERATION currently a single block pool is supported
+       StorageReport[] rep = { new StorageReport(storage, false,
+-          DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED) };
++          DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0L) };
+       DatanodeCommand[] cmds = nameNodeProto.sendHeartbeat(dnRegistration, rep,
+           0L, 0L, 0, 0, 0, null, true).getCommands();
+       if(cmds != null) {
+@@ -1002,7 +1002,7 @@ public int compareTo(String xferAddr) {
+     int replicateBlocks() throws IOException {
+       // register datanode
+       StorageReport[] rep = { new StorageReport(storage,
+-          false, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED) };
++          false, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0L) };
+       DatanodeCommand[] cmds = nameNodeProto.sendHeartbeat(dnRegistration,
+           rep, 0L, 0L, 0, 0, 0, null, true).getCommands();
+       if (cmds != null) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeadDatanode.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeadDatanode.java
+index 6149a15..8666bc0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeadDatanode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeadDatanode.java
+@@ -121,7 +121,7 @@ public void testDeadDatanode() throws Exception {
+     // that asks datanode to register again
+     StorageReport[] rep = { new StorageReport(
+         new DatanodeStorage(reg.getDatanodeUuid()),
+-        false, 0, 0, 0, 0) };
++        false, 0, 0, 0, 0, 0) };
+     DatanodeCommand[] cmd =
+         dnp.sendHeartbeat(reg, rep, 0L, 0L, 0, 0, 0, null, true).getCommands();
+     assertEquals(1, cmd.length);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+index 8d2181c..68dcf73 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+@@ -100,8 +100,9 @@ public void testVolumeSize() throws Exception {
+             + " used " + used + " non DFS used " + nonDFSUsed 
+             + " remaining " + remaining + " perentUsed " + percentUsed
+             + " percentRemaining " + percentRemaining);
+-        
+-        assertTrue(configCapacity == (used + remaining + nonDFSUsed));
++        // There will be 5% space reserved in ext filesystem which is not
++        // considered.
++        assertTrue(configCapacity >= (used + remaining + nonDFSUsed));
+         assertTrue(percentUsed == DFSUtil.getPercentUsed(used, configCapacity));
+         assertTrue(percentRemaining == DFSUtil.getPercentRemaining(remaining,
+             configCapacity));
+@@ -147,7 +148,9 @@ public void testVolumeSize() throws Exception {
+       assertTrue(configCapacity == diskCapacity - reserved);
+       
+       // Ensure new total capacity reported excludes the reserved space
+-      assertTrue(configCapacity == (used + remaining + nonDFSUsed));
++      // There will be 5% space reserved in ext filesystem which is not
++      // considered.
++      assertTrue(configCapacity >= (used + remaining + nonDFSUsed));
+ 
+       // Ensure percent used is calculated based on used and present capacity
+       assertTrue(percentUsed == DFSUtil.getPercentUsed(used, configCapacity));
+@@ -157,9 +160,33 @@ public void testVolumeSize() throws Exception {
+ 
+       // Ensure percent used is calculated based on used and present capacity
+       assertTrue(percentRemaining == ((float)remaining * 100.0f)/(float)configCapacity);
++
++      //Adding testcase for non-dfs used where we need to consider
++      // reserved replica also.
++      final int fileCount = 5;
++      final DistributedFileSystem fs = cluster.getFileSystem();
++      // create streams and hsync to force datastreamers to start
++      DFSOutputStream[] streams = new DFSOutputStream[fileCount];
++      for (int i=0; i < fileCount; i++) {
++        streams[i] = (DFSOutputStream)fs.create(new Path("/f"+i))
++            .getWrappedStream();
++        streams[i].write("1".getBytes());
++        streams[i].hsync();
++      }
++      triggerHeartbeats(cluster.getDataNodes());
++      assertTrue(configCapacity > (namesystem.getCapacityUsed() + namesystem
++          .getCapacityRemaining() + namesystem.getNonDfsUsedSpace()));
++      // There is a chance that nonDFS usage might have slightly due to
++      // testlogs, So assume 1MB other files used within this gap
++      assertTrue(
++          (namesystem.getCapacityUsed() + namesystem.getCapacityRemaining()
++              + namesystem.getNonDfsUsedSpace() + fileCount * fs
++              .getDefaultBlockSize()) - configCapacity < 1 * 1024);
+     }
+     finally {
+-      if (cluster != null) {cluster.shutdown();}
++      if (cluster != null) {
++        cluster.shutdown();
++      }
+     }
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+index 8abc15e..5d5b8bf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+@@ -162,7 +162,9 @@ public void testCapacityMetrics() throws Exception {
+         MetricsAsserts.getLongGauge("CapacityRemaining", rb);
+     long capacityUsedNonDFS =
+         MetricsAsserts.getLongGauge("CapacityUsedNonDFS", rb);
+-    assert(capacityUsed + capacityRemaining + capacityUsedNonDFS ==
++    // There will be 5% space reserved in ext filesystem which is not
++    // considered.
++    assert(capacityUsed + capacityRemaining + capacityUsedNonDFS <=
+         capacityTotal);
+   }
+ 
+-- 
+1.7.9.5
+

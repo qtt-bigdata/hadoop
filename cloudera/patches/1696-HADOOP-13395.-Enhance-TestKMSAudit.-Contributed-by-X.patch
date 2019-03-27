@@ -1,0 +1,146 @@
+From 3769bf502a2a04eba281161067cfd17a13110eea Mon Sep 17 00:00:00 2001
+From: Wei-Chiu Chuang <weichiu@apache.org>
+Date: Mon, 8 Aug 2016 15:10:26 -0700
+Subject: [PATCH 1696/2848] HADOOP-13395. Enhance TestKMSAudit. Contributed by
+ Xiao Chen.
+
+(cherry picked from commit 070548943a16370a74277d1b1d10b713e2ca81d0)
+
+Change-Id: I60d4df54ee90e65c66bd88d5cb85f853545e74ef
+---
+ .../hadoop/crypto/key/kms/server/KMSAudit.java     |    6 +++
+ .../hadoop/crypto/key/kms/server/TestKMSAudit.java |   53 +++++++++++++++++---
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+index 7ff76e5..6a401e0 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.crypto.key.kms.server;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -227,4 +228,9 @@ private static String createCacheKey(String user, String key, KMS.KMSOp op) {
+   public void shutdown() {
+     executor.shutdownNow();
+   }
++
++  @VisibleForTesting
++  void evictCacheForTesting() {
++    cache.invalidateAll();
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+index 906a27b..41b31a3 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+@@ -33,7 +33,9 @@
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ import org.mockito.Mockito;
+ 
+ public class TestKMSAudit {
+@@ -55,6 +57,9 @@ public void setOutputStream(OutputStream out) {
+     }
+   }
+ 
++  @Rule
++  public final Timeout testTimeout = new Timeout(180000);
++
+   @Before
+   public void setUp() throws IOException {
+     originalOut = System.err;
+@@ -67,7 +72,8 @@ public void setUp() throws IOException {
+     PropertyConfigurator.configure(is);
+     IOUtils.closeStream(is);
+ 
+-    this.kmsAudit = new KMSAudit(1000);
++    this.kmsAudit =
++        new KMSAudit(KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW_DEFAULT);
+   }
+ 
+   @After
+@@ -97,9 +103,9 @@ public void testAggregation() throws Exception {
+     kmsAudit.ok(luser, KMSOp.DECRYPT_EEK, "k1", "testmsg");
+     kmsAudit.ok(luser, KMSOp.DECRYPT_EEK, "k1", "testmsg");
+     kmsAudit.ok(luser, KMSOp.DECRYPT_EEK, "k1", "testmsg");
+-    Thread.sleep(1500);
++    kmsAudit.evictCacheForTesting();
+     kmsAudit.ok(luser, KMSOp.DECRYPT_EEK, "k1", "testmsg");
+-    Thread.sleep(1500);
++    kmsAudit.evictCacheForTesting();
+     String out = getAndResetLogOutput();
+     System.out.println(out);
+     Assert.assertTrue(
+@@ -118,24 +124,55 @@ public void testAggregationUnauth() throws Exception {
+     UserGroupInformation luser = Mockito.mock(UserGroupInformation.class);
+     Mockito.when(luser.getShortUserName()).thenReturn("luser");
+     kmsAudit.unauthorized(luser, KMSOp.GENERATE_EEK, "k2");
+-    Thread.sleep(1000);
++    kmsAudit.evictCacheForTesting();
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+     kmsAudit.unauthorized(luser, KMSOp.GENERATE_EEK, "k3");
++    // wait a bit so the UNAUTHORIZED-triggered cache invalidation happens.
++    Thread.sleep(1000);
+     kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k3", "testmsg");
+-    Thread.sleep(2000);
++    kmsAudit.evictCacheForTesting();
+     String out = getAndResetLogOutput();
+     System.out.println(out);
+-    Assert.assertTrue(
+-        out.matches(
+-            "UNAUTHORIZED\\[op=GENERATE_EEK, key=k2, user=luser\\] "
++
++    // The UNAUTHORIZED will trigger cache invalidation, which then triggers
++    // the aggregated OK (accessCount=5). But the order of the UNAUTHORIZED and
++    // the aggregated OK is arbitrary - no correctness concerns, but flaky here.
++    Assert.assertTrue(out.matches(
++        "UNAUTHORIZED\\[op=GENERATE_EEK, key=k2, user=luser\\] "
+             + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
+             + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=5, interval=[^m]{1,4}ms\\] testmsg"
+             + "UNAUTHORIZED\\[op=GENERATE_EEK, key=k3, user=luser\\] "
++            + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg")
++        || out.matches(
++        "UNAUTHORIZED\\[op=GENERATE_EEK, key=k2, user=luser\\] "
++            + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
++            + "UNAUTHORIZED\\[op=GENERATE_EEK, key=k3, user=luser\\] "
++            + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=5, interval=[^m]{1,4}ms\\] testmsg"
+             + "OK\\[op=GENERATE_EEK, key=k3, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"));
+   }
+ 
++  @Test
++  public void testAuditLogFormat() throws Exception {
++    UserGroupInformation luser = Mockito.mock(UserGroupInformation.class);
++    Mockito.when(luser.getShortUserName()).thenReturn("luser");
++    kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "k4", "testmsg");
++    kmsAudit.ok(luser, KMSOp.GENERATE_EEK, "testmsg");
++    kmsAudit.evictCacheForTesting();
++    kmsAudit.unauthorized(luser, KMSOp.DECRYPT_EEK, "k4");
++    kmsAudit.error(luser, "method", "url", "testmsg");
++    kmsAudit.unauthenticated("remotehost", "method", "url", "testmsg");
++    String out = getAndResetLogOutput();
++    System.out.println(out);
++    Assert.assertTrue(out.matches(
++        "OK\\[op=GENERATE_EEK, key=k4, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
++            + "OK\\[op=GENERATE_EEK, user=luser\\] testmsg"
++            + "OK\\[op=GENERATE_EEK, key=k4, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
++            + "UNAUTHORIZED\\[op=DECRYPT_EEK, key=k4, user=luser\\] "
++            + "ERROR\\[user=luser\\] Method:'method' Exception:'testmsg'"
++            + "UNAUTHENTICATED RemoteHost:remotehost Method:method URL:url ErrorMsg:'testmsg'"));
++  }
+ }
+-- 
+1.7.9.5
+

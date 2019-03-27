@@ -1,0 +1,1482 @@
+From 9c0141e53b87ea425e438645461ef67a98a9af69 Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Mon, 14 Mar 2016 14:19:05 -0700
+Subject: [PATCH 2133/2848] YARN-4719. Add a helper library to maintain node
+ state and allows common queries. (kasha)
+
+(cherry picked from commit 20d389ce61eaacb5ddfb329015f50e96ad894f8d)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+
+Change-Id: I95867bcd7f7f4a4d12a2b3d1af9e2086960d4fd8
+---
+ .../scheduler/AbstractYarnScheduler.java           |  165 +++--------
+ .../scheduler/ClusterNodeTracker.java              |  300 ++++++++++++++++++++
+ .../resourcemanager/scheduler/NodeFilter.java      |   33 +++
+ .../scheduler/capacity/CapacityScheduler.java      |   87 +++---
+ .../scheduler/fair/FSAppAttempt.java               |   13 +-
+ .../scheduler/fair/FairScheduler.java              |  104 +++----
+ .../scheduler/fifo/FifoScheduler.java              |   36 +--
+ .../scheduler/TestAbstractYarnScheduler.java       |   14 +-
+ .../scheduler/capacity/TestReservations.java       |    9 +
+ .../scheduler/fair/TestFairScheduler.java          |    4 +-
+ .../scheduler/fifo/TestFifoScheduler.java          |   21 +-
+ 11 files changed, 498 insertions(+), 288 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ClusterNodeTracker.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/NodeFilter.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+index 342065c..44b463b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+@@ -19,13 +19,17 @@
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler;
+ 
+ import java.io.IOException;
+-import java.util.*;
+-import java.util.concurrent.ConcurrentHashMap;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.EnumSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.Timer;
++import java.util.TimerTask;
+ import java.util.concurrent.ConcurrentMap;
+-import java.util.concurrent.locks.ReentrantReadWriteLock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+@@ -78,22 +82,10 @@
+ 
+   private static final Log LOG = LogFactory.getLog(AbstractYarnScheduler.class);
+ 
+-  // Nodes in the cluster, indexed by NodeId
+-  protected Map<NodeId, N> nodes = new ConcurrentHashMap<NodeId, N>();
+-
+-  // Whole capacity of the cluster
+-  protected Resource clusterResource = Resource.newInstance(0, 0);
++  protected final ClusterNodeTracker<N> nodeTracker =
++      new ClusterNodeTracker<>();
+ 
+   protected Resource minimumAllocation;
+-  private Resource maximumAllocation;
+-  private Resource configuredMaximumAllocation;
+-  private int maxNodeMemory = -1;
+-  private int maxNodeVCores = -1;
+-  private final ReadLock maxAllocReadLock;
+-  private final WriteLock maxAllocWriteLock;
+-
+-  private boolean useConfiguredMaximumAllocationOnly = true;
+-  private long configuredMaximumAllocationWaitTime;
+ 
+   protected RMContext rmContext;
+   
+@@ -116,9 +108,6 @@
+    */
+   public AbstractYarnScheduler(String name) {
+     super(name);
+-    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+-    this.maxAllocReadLock = lock.readLock();
+-    this.maxAllocWriteLock = lock.writeLock();
+   }
+ 
+   @Override
+@@ -126,13 +115,20 @@ public void serviceInit(Configuration conf) throws Exception {
+     nmExpireInterval =
+         conf.getInt(YarnConfiguration.RM_NM_EXPIRY_INTERVAL_MS,
+           YarnConfiguration.DEFAULT_RM_NM_EXPIRY_INTERVAL_MS);
+-    configuredMaximumAllocationWaitTime =
++    long configuredMaximumAllocationWaitTime =
+         conf.getLong(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_SCHEDULING_WAIT_MS,
+           YarnConfiguration.DEFAULT_RM_WORK_PRESERVING_RECOVERY_SCHEDULING_WAIT_MS);
++    nodeTracker.setConfiguredMaxAllocationWaitTime(
++        configuredMaximumAllocationWaitTime);
+     createReleaseCache();
+     super.serviceInit(conf);
+   }
+ 
++  @VisibleForTesting
++  public ClusterNodeTracker getNodeTracker() {
++    return nodeTracker;
++  }
++
+   public List<Container> getTransferredContainers(
+       ApplicationAttemptId currentAttempt) {
+     ApplicationId appId = currentAttempt.getApplicationId();
+@@ -167,20 +163,21 @@ public void serviceInit(Configuration conf) throws Exception {
+    * Add blacklisted NodeIds to the list that is passed.
+    *
+    * @param app application attempt.
+-   * @param blacklistNodeIdList the list to store blacklisted NodeIds.
+    */
+-  public void addBlacklistedNodeIdsToList(SchedulerApplicationAttempt app,
+-      List<NodeId> blacklistNodeIdList) {
+-    for (Map.Entry<NodeId, N> nodeEntry : nodes.entrySet()) {
+-      if (SchedulerAppUtils.isBlacklisted(app, nodeEntry.getValue(), LOG)) {
+-        blacklistNodeIdList.add(nodeEntry.getKey());
++  public List<N> getBlacklistedNodes(final SchedulerApplicationAttempt app) {
++
++    NodeFilter nodeFilter = new NodeFilter() {
++      @Override
++      public boolean accept(SchedulerNode node) {
++        return SchedulerAppUtils.isBlacklisted(app, node, LOG);
+       }
+-    }
++    };
++    return nodeTracker.getNodes(nodeFilter);
+   }
+ 
+   @Override
+   public Resource getClusterResource() {
+-    return clusterResource;
++    return nodeTracker.getClusterCapacity();
+   }
+ 
+   @Override
+@@ -190,34 +187,11 @@ public Resource getMinimumResourceCapability() {
+ 
+   @Override
+   public Resource getMaximumResourceCapability() {
+-    Resource maxResource;
+-    maxAllocReadLock.lock();
+-    try {
+-      if (useConfiguredMaximumAllocationOnly) {
+-        if (System.currentTimeMillis() - ResourceManager.getClusterTimeStamp()
+-            > configuredMaximumAllocationWaitTime) {
+-          useConfiguredMaximumAllocationOnly = false;
+-        }
+-        maxResource = Resources.clone(configuredMaximumAllocation);
+-      } else {
+-        maxResource = Resources.clone(maximumAllocation);
+-      }
+-    } finally {
+-      maxAllocReadLock.unlock();
+-    }
+-    return maxResource;
++    return nodeTracker.getMaxAllowedAllocation();
+   }
+ 
+   protected void initMaximumResourceCapability(Resource maximumAllocation) {
+-    maxAllocWriteLock.lock();
+-    try {
+-      if (this.configuredMaximumAllocation == null) {
+-        this.configuredMaximumAllocation = Resources.clone(maximumAllocation);
+-        this.maximumAllocation = Resources.clone(maximumAllocation);
+-      }
+-    } finally {
+-      maxAllocWriteLock.unlock();
+-    }
++    nodeTracker.setConfiguredMaxAllocation(maximumAllocation);
+   }
+ 
+   protected synchronized void containerLaunchedOnNode(
+@@ -282,8 +256,7 @@ public RMContainer getRMContainer(ContainerId containerId) {
+ 
+   @Override
+   public SchedulerNodeReport getNodeReport(NodeId nodeId) {
+-    N node = nodes.get(nodeId);
+-    return node == null ? null : new SchedulerNodeReport(node);
++    return nodeTracker.getNodeReport(nodeId);
+   }
+ 
+   @Override
+@@ -381,11 +354,13 @@ public synchronized void recoverContainersOnNode(
+         container));
+ 
+       // recover scheduler node
+-      nodes.get(nm.getNodeID()).recoverContainer(rmContainer);
++      SchedulerNode schedulerNode = nodeTracker.getNode(nm.getNodeID());
++      schedulerNode.recoverContainer(rmContainer);
+ 
+       // recover queue: update headroom etc.
+       Queue queue = schedulerAttempt.getQueue();
+-      queue.recoverContainer(clusterResource, schedulerAttempt, rmContainer);
++      queue.recoverContainer(
++          getClusterResource(), schedulerAttempt, rmContainer);
+ 
+       // recover scheduler attempt
+       schedulerAttempt.recoverContainer(rmContainer);
+@@ -513,7 +488,7 @@ protected void releaseContainers(List<ContainerId> containers,
+ 
+   @Override
+   public SchedulerNode getSchedulerNode(NodeId nodeId) {
+-    return nodes.get(nodeId);
++    return nodeTracker.getNode(nodeId);
+   }
+ 
+   @Override
+@@ -576,18 +551,12 @@ public synchronized void updateNodeResource(RMNode nm,
+           + " from: " + oldResource + ", to: "
+           + newResource);
+ 
+-      nodes.remove(nm.getNodeID());
+-      updateMaximumAllocation(node, false);
++      nodeTracker.removeNode(nm.getNodeID());
+ 
+       // update resource to node
+       node.setTotalResource(newResource);
+ 
+-      nodes.put(nm.getNodeID(), (N)node);
+-      updateMaximumAllocation(node, true);
+-
+-      // update resource to clusterResource
+-      Resources.subtractFrom(clusterResource, oldResource);
+-      Resources.addTo(clusterResource, newResource);
++      nodeTracker.addNode((N) node);
+     } else {
+       // Log resource change
+       LOG.warn("Update resource on node: " + node.getNodeName() 
+@@ -607,61 +576,7 @@ public synchronized void updateNodeResource(RMNode nm,
+         + " does not support reservations");
+   }
+ 
+-  protected void updateMaximumAllocation(SchedulerNode node, boolean add) {
+-    Resource totalResource = node.getTotalResource();
+-    maxAllocWriteLock.lock();
+-    try {
+-      if (add) { // added node
+-        int nodeMemory = totalResource.getMemory();
+-        if (nodeMemory > maxNodeMemory) {
+-          maxNodeMemory = nodeMemory;
+-          maximumAllocation.setMemory(Math.min(
+-              configuredMaximumAllocation.getMemory(), maxNodeMemory));
+-        }
+-        int nodeVCores = totalResource.getVirtualCores();
+-        if (nodeVCores > maxNodeVCores) {
+-          maxNodeVCores = nodeVCores;
+-          maximumAllocation.setVirtualCores(Math.min(
+-              configuredMaximumAllocation.getVirtualCores(), maxNodeVCores));
+-        }
+-      } else {  // removed node
+-        if (maxNodeMemory == totalResource.getMemory()) {
+-          maxNodeMemory = -1;
+-        }
+-        if (maxNodeVCores == totalResource.getVirtualCores()) {
+-          maxNodeVCores = -1;
+-        }
+-        // We only have to iterate through the nodes if the current max memory
+-        // or vcores was equal to the removed node's
+-        if (maxNodeMemory == -1 || maxNodeVCores == -1) {
+-          for (Map.Entry<NodeId, N> nodeEntry : nodes.entrySet()) {
+-            int nodeMemory =
+-                nodeEntry.getValue().getTotalResource().getMemory();
+-            if (nodeMemory > maxNodeMemory) {
+-              maxNodeMemory = nodeMemory;
+-            }
+-            int nodeVCores =
+-                nodeEntry.getValue().getTotalResource().getVirtualCores();
+-            if (nodeVCores > maxNodeVCores) {
+-              maxNodeVCores = nodeVCores;
+-            }
+-          }
+-          if (maxNodeMemory == -1) {  // no nodes
+-            maximumAllocation.setMemory(configuredMaximumAllocation.getMemory());
+-          } else {
+-            maximumAllocation.setMemory(
+-                Math.min(configuredMaximumAllocation.getMemory(), maxNodeMemory));
+-          }
+-          if (maxNodeVCores == -1) {  // no nodes
+-            maximumAllocation.setVirtualCores(configuredMaximumAllocation.getVirtualCores());
+-          } else {
+-            maximumAllocation.setVirtualCores(
+-                Math.min(configuredMaximumAllocation.getVirtualCores(), maxNodeVCores));
+-          }
+-        }
+-      }
+-    } finally {
+-      maxAllocWriteLock.unlock();
+-    }
++  protected void refreshMaximumAllocation(Resource newMaxAlloc) {
++    nodeTracker.setConfiguredMaxAllocation(newMaxAlloc);
+   }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ClusterNodeTracker.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ClusterNodeTracker.java
+new file mode 100644
+index 0000000..34b4267
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ClusterNodeTracker.java
+@@ -0,0 +1,300 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
++import org.apache.hadoop.yarn.util.resource.Resources;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++/**
++ * Helper library that:
++ * - tracks the state of all cluster {@link SchedulerNode}s
++ * - provides convenience methods to filter and sort nodes
++ */
++@InterfaceAudience.Private
++public class ClusterNodeTracker<N extends SchedulerNode> {
++  private static final Log LOG = LogFactory.getLog(ClusterNodeTracker.class);
++
++  private ReadWriteLock readWriteLock = new ReentrantReadWriteLock(true);
++  private Lock readLock = readWriteLock.readLock();
++  private Lock writeLock = readWriteLock.writeLock();
++
++  private HashMap<NodeId, N> nodes = new HashMap<>();
++  private Map<String, Integer> nodesPerRack = new HashMap<>();
++
++  private Resource clusterCapacity = Resources.clone(Resources.none());
++  private Resource staleClusterCapacity = null;
++
++  // Max allocation
++  private int maxNodeMemory = -1;
++  private int maxNodeVCores = -1;
++  private Resource configuredMaxAllocation;
++  private boolean forceConfiguredMaxAllocation = true;
++  private long configuredMaxAllocationWaitTime;
++
++  public void addNode(N node) {
++    writeLock.lock();
++    try {
++      nodes.put(node.getNodeID(), node);
++
++      // Update nodes per rack as well
++      String rackName = node.getRackName();
++      Integer numNodes = nodesPerRack.get(rackName);
++      if (numNodes == null) {
++        numNodes = 0;
++      }
++      nodesPerRack.put(rackName, ++numNodes);
++
++      // Update cluster capacity
++      Resources.addTo(clusterCapacity, node.getTotalResource());
++
++      // Update maximumAllocation
++      updateMaxResources(node, true);
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  public boolean exists(NodeId nodeId) {
++    readLock.lock();
++    try {
++      return nodes.containsKey(nodeId);
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public N getNode(NodeId nodeId) {
++    readLock.lock();
++    try {
++      return nodes.get(nodeId);
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public SchedulerNodeReport getNodeReport(NodeId nodeId) {
++    readLock.lock();
++    try {
++      N n = nodes.get(nodeId);
++      return n == null ? null : new SchedulerNodeReport(n);
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public int nodeCount() {
++    readLock.lock();
++    try {
++      return nodes.size();
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public int nodeCount(String rackName) {
++    readLock.lock();
++    String rName = rackName == null ? "NULL" : rackName;
++    try {
++      Integer nodeCount = nodesPerRack.get(rName);
++      return nodeCount == null ? 0 : nodeCount;
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public Resource getClusterCapacity() {
++    readLock.lock();
++    try {
++      if (staleClusterCapacity == null ||
++          !Resources.equals(staleClusterCapacity, clusterCapacity)) {
++        staleClusterCapacity = Resources.clone(clusterCapacity);
++      }
++      return staleClusterCapacity;
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  public N removeNode(NodeId nodeId) {
++    writeLock.lock();
++    try {
++      N node = nodes.remove(nodeId);
++      if (node == null) {
++        LOG.warn("Attempting to remove a non-existent node " + nodeId);
++        return null;
++      }
++
++      // Update nodes per rack as well
++      String rackName = node.getRackName();
++      Integer numNodes = nodesPerRack.get(rackName);
++      if (numNodes > 0) {
++        nodesPerRack.put(rackName, --numNodes);
++      } else {
++        LOG.error("Attempting to remove node from an empty rack " + rackName);
++      }
++
++      // Update cluster capacity
++      Resources.subtractFrom(clusterCapacity, node.getTotalResource());
++
++      // Update maximumAllocation
++      updateMaxResources(node, false);
++
++      return node;
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  public void setConfiguredMaxAllocation(Resource resource) {
++    writeLock.lock();
++    try {
++      configuredMaxAllocation = Resources.clone(resource);
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  public void setConfiguredMaxAllocationWaitTime(
++      long configuredMaxAllocationWaitTime) {
++    writeLock.lock();
++    try {
++      this.configuredMaxAllocationWaitTime =
++          configuredMaxAllocationWaitTime;
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  public Resource getMaxAllowedAllocation() {
++    readLock.lock();
++    try {
++      if (forceConfiguredMaxAllocation &&
++          System.currentTimeMillis() - ResourceManager.getClusterTimeStamp()
++              > configuredMaxAllocationWaitTime) {
++        forceConfiguredMaxAllocation = false;
++      }
++
++      if (forceConfiguredMaxAllocation
++          || maxNodeMemory == -1 || maxNodeVCores == -1) {
++        return configuredMaxAllocation;
++      }
++
++      return Resources.createResource(
++          Math.min(configuredMaxAllocation.getMemory(), maxNodeMemory),
++          Math.min(configuredMaxAllocation.getVirtualCores(), maxNodeVCores)
++      );
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  private void updateMaxResources(SchedulerNode node, boolean add) {
++    Resource totalResource = node.getTotalResource();
++    writeLock.lock();
++    try {
++      if (add) { // added node
++        int nodeMemory = totalResource.getMemory();
++        if (nodeMemory > maxNodeMemory) {
++          maxNodeMemory = nodeMemory;
++        }
++        int nodeVCores = totalResource.getVirtualCores();
++        if (nodeVCores > maxNodeVCores) {
++          maxNodeVCores = nodeVCores;
++        }
++      } else {  // removed node
++        if (maxNodeMemory == totalResource.getMemory()) {
++          maxNodeMemory = -1;
++        }
++        if (maxNodeVCores == totalResource.getVirtualCores()) {
++          maxNodeVCores = -1;
++        }
++        // We only have to iterate through the nodes if the current max memory
++        // or vcores was equal to the removed node's
++        if (maxNodeMemory == -1 || maxNodeVCores == -1) {
++          // Treat it like an empty cluster and add nodes
++          for (N n : nodes.values()) {
++            updateMaxResources(n, true);
++          }
++        }
++      }
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  public List<N> getAllNodes() {
++    return getNodes(null);
++  }
++
++  /**
++   * Convenience method to filter nodes based on a condition.
++   */
++  public List<N> getNodes(NodeFilter nodeFilter) {
++    List<N> nodeList = new ArrayList<>();
++    readLock.lock();
++    try {
++      if (nodeFilter == null) {
++        nodeList.addAll(nodes.values());
++      } else {
++        for (N node : nodes.values()) {
++          if (nodeFilter.accept(node)) {
++            nodeList.add(node);
++          }
++        }
++      }
++    } finally {
++      readLock.unlock();
++    }
++    return nodeList;
++  }
++
++  /**
++   * Convenience method to sort nodes.
++   *
++   * Note that the sort is performed without holding a lock. We are sorting
++   * here instead of on the caller to allow for future optimizations (e.g.
++   * sort once every x milliseconds).
++   */
++  public List<N> sortedNodeList(Comparator<N> comparator) {
++    List<N> sortedList = null;
++    readLock.lock();
++    try {
++      sortedList = new ArrayList(nodes.values());
++    } finally {
++      readLock.unlock();
++    }
++    Collections.sort(sortedList, comparator);
++    return sortedList;
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/NodeFilter.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/NodeFilter.java
+new file mode 100644
+index 0000000..7b3e7a2
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/NodeFilter.java
+@@ -0,0 +1,33 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++
++/**
++ * Convenience way to filter nodes based on a criteria. To be used in
++ * conjunction with {@link ClusterNodeTracker}
++ */
++@InterfaceAudience.Private
++public interface NodeFilter {
++
++  /**
++   * Criteria to accept node in the filtered list.
++   */
++  boolean accept(SchedulerNode node);
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+index 5ee7840..383e412 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+@@ -22,6 +22,7 @@
+ import java.io.InputStream;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.EnumSet;
+ import java.util.HashMap;
+@@ -31,11 +32,12 @@
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.HashSet;
+ 
++import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.commons.math3.analysis.function.Add;
+ import org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+ import org.apache.hadoop.classification.InterfaceStability.Evolving;
+@@ -44,9 +46,11 @@
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.Groups;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.Container;
++import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+@@ -55,9 +59,11 @@
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.api.records.ResourceOption;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.exceptions.InvalidResourceRequestException;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+ import org.apache.hadoop.yarn.proto.YarnServiceProtos.SchedulerResourceTypes;
+@@ -85,6 +91,9 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueNotFoundException;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplication;
++
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler
++    .SchedulerApplicationAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.QueueMapping;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.QueueMapping.MappingType;
+@@ -203,8 +212,6 @@ public Configuration getConf() {
+ 
+   private Map<String, CSQueue> queues = new ConcurrentHashMap<String, CSQueue>();
+ 
+-  private AtomicInteger numNodeManagers = new AtomicInteger(0);
+-
+   private ResourceCalculator calculator;
+   private boolean usePortForNodeName;
+ 
+@@ -272,7 +279,7 @@ public ResourceCalculator getResourceCalculator() {
+ 
+   @Override
+   public int getNumClusterNodes() {
+-    return numNodeManagers.get();
++    return nodeTracker.nodeCount();
+   }
+ 
+   @Override
+@@ -377,7 +384,7 @@ long getAsyncScheduleInterval() {
+   static void schedule(CapacityScheduler cs) {
+     // First randomize the start point
+     int current = 0;
+-    Collection<FiCaSchedulerNode> nodes = cs.getAllNodes().values();
++    Collection<FiCaSchedulerNode> nodes = cs.nodeTracker.getAllNodes();
+     int start = random.nextInt(nodes.size());
+     for (FiCaSchedulerNode node : nodes) {
+       if (current++ >= start) {
+@@ -491,11 +498,11 @@ private void reinitializeQueues(CapacitySchedulerConfiguration conf)
+     addNewQueues(queues, newQueues);
+     
+     // Re-configure queues
+-    root.reinitialize(newRoot, clusterResource);
++    root.reinitialize(newRoot, getClusterResource());
+     initializeQueueMappings();
+ 
+     // Re-calculate headroom for active applications
+-    root.updateClusterResource(clusterResource);
++    root.updateClusterResource(getClusterResource());
+ 
+     labelManager.reinitializeQueueLabels(getQueueToLabels());
+     setQueueAcls(authorizer, queues);
+@@ -916,7 +923,7 @@ public Allocation allocate(ApplicationAttemptId applicationAttemptId,
+       }
+ 
+       return application.getAllocation(getResourceCalculator(),
+-                   clusterResource, getMinimumResourceCapability());
++                   getClusterResource(), getMinimumResourceCapability());
+     }
+   }
+ 
+@@ -953,7 +960,8 @@ public QueueInfo getQueueInfo(String queueName,
+ 
+   private synchronized void nodeUpdate(RMNode nm) {
+     if (LOG.isDebugEnabled()) {
+-      LOG.debug("nodeUpdate: " + nm + " clusterResources: " + clusterResource);
++      LOG.debug("nodeUpdate: " + nm +
++          " clusterResources: " + getClusterResource());
+     }
+ 
+     FiCaSchedulerNode node = getNode(nm.getNodeID());
+@@ -1006,6 +1014,7 @@ private synchronized void nodeUpdate(RMNode nm) {
+   private synchronized void updateNodeAndQueueResource(RMNode nm, 
+       ResourceOption resourceOption) {
+     updateNodeResource(nm, resourceOption);
++    Resource clusterResource = getClusterResource();
+     root.updateClusterResource(clusterResource);
+   }
+ 
+@@ -1025,19 +1034,19 @@ private synchronized void allocateContainersToNode(FiCaSchedulerNode node) {
+           getCurrentAttemptForContainer(reservedContainer.getContainerId());
+       
+       // Try to fulfill the reservation
+-      LOG.info("Trying to fulfill reservation for application " + 
++      LOG.info("Trying to fulfill reservation for application " +
+           reservedApplication.getApplicationId() + " on node: " + 
+           node.getNodeID());
+       
+       LeafQueue queue = ((LeafQueue)reservedApplication.getQueue());
+-      CSAssignment assignment = queue.assignContainers(clusterResource, node,
+-          false);
++      CSAssignment assignment = queue.assignContainers(getClusterResource(),
++          node, false);
+       
+       RMContainer excessReservation = assignment.getExcessReservation();
+       if (excessReservation != null) {
+       Container container = excessReservation.getContainer();
+       queue.completedContainer(
+-          clusterResource, assignment.getApplication(), node, 
++          getClusterResource(), assignment.getApplication(), node,
+           excessReservation, 
+           SchedulerUtils.createAbnormalContainerStatus(
+               container.getId(), 
+@@ -1055,7 +1064,7 @@ private synchronized void allocateContainersToNode(FiCaSchedulerNode node) {
+           LOG.debug("Trying to schedule on node: " + node.getNodeName() +
+               ", available: " + node.getAvailableResource());
+         }
+-        root.assignContainers(clusterResource, node, false);
++        root.assignContainers(getClusterResource(), node, false);
+       }
+     } else {
+       LOG.info("Skipping scheduling since node " + node.getNodeID() + 
+@@ -1169,7 +1178,7 @@ public void handle(SchedulerEvent event) {
+   private synchronized void addNode(RMNode nodeManager) {
+     FiCaSchedulerNode schedulerNode = new FiCaSchedulerNode(nodeManager,
+         usePortForNodeName);
+-    this.nodes.put(nodeManager.getNodeID(), schedulerNode);
++    nodeTracker.addNode(schedulerNode);
+ 
+     // update this node to node label manager
+     if (labelManager != null) {
+@@ -1177,15 +1186,13 @@ private synchronized void addNode(RMNode nodeManager) {
+           schedulerNode.getTotalResource());
+     }
+ 
+-    Resources.addTo(clusterResource, nodeManager.getTotalCapability());
++    Resource clusterResource = getClusterResource();
+     root.updateClusterResource(clusterResource);
+-    int numNodes = numNodeManagers.incrementAndGet();
+-    updateMaximumAllocation(schedulerNode, true);
+-    
+-    LOG.info("Added node " + nodeManager.getNodeAddress() + 
++
++    LOG.info("Added node " + nodeManager.getNodeAddress() +
+         " clusterResource: " + clusterResource);
+ 
+-    if (scheduleAsynchronously && numNodes == 1) {
++    if (scheduleAsynchronously && getNumClusterNodes() == 1) {
+       asyncSchedulerThread.beginSchedule();
+     }
+   }
+@@ -1195,19 +1202,14 @@ private synchronized void removeNode(RMNode nodeInfo) {
+     if (labelManager != null) {
+       labelManager.deactivateNode(nodeInfo.getNodeID());
+     }
+-    
+-    FiCaSchedulerNode node = nodes.get(nodeInfo.getNodeID());
++
++    NodeId nodeId = nodeInfo.getNodeID();
++    FiCaSchedulerNode node = nodeTracker.getNode(nodeId);
+     if (node == null) {
++      LOG.error("Attempting to remove non-existent node " + nodeId);
+       return;
+     }
+-    Resources.subtractFrom(clusterResource, node.getTotalResource());
+-    root.updateClusterResource(clusterResource);
+-    int numNodes = numNodeManagers.decrementAndGet();
+ 
+-    if (scheduleAsynchronously && numNodes == 0) {
+-      asyncSchedulerThread.suspendSchedule();
+-    }
+-    
+     // Remove running containers
+     List<RMContainer> runningContainers = node.getRunningContainers();
+     for (RMContainer container : runningContainers) {
+@@ -1228,11 +1230,17 @@ private synchronized void removeNode(RMNode nodeInfo) {
+           RMContainerEventType.KILL);
+     }
+ 
+-    this.nodes.remove(nodeInfo.getNodeID());
+-    updateMaximumAllocation(node, false);
++    nodeTracker.removeNode(nodeId);
++    Resource clusterResource = getClusterResource();
++    root.updateClusterResource(clusterResource);
++    int numNodes = nodeTracker.nodeCount();
++
++    if (scheduleAsynchronously && numNodes == 0) {
++      asyncSchedulerThread.suspendSchedule();
++    }
+ 
+     LOG.info("Removed node " + nodeInfo.getNodeAddress() + 
+-        " clusterResource: " + clusterResource);
++        " clusterResource: " + getClusterResource());
+   }
+   
+   @Lock(CapacityScheduler.class)
+@@ -1262,7 +1270,7 @@ protected synchronized void completedContainer(RMContainer rmContainer,
+     
+     // Inform the queue
+     LeafQueue queue = (LeafQueue)application.getQueue();
+-    queue.completedContainer(clusterResource, application, node, 
++    queue.completedContainer(getClusterResource(), application, node,
+         rmContainer, containerStatus, event, null, true);
+ 
+     LOG.info("Application attempt " + application.getApplicationAttemptId()
+@@ -1280,14 +1288,9 @@ public FiCaSchedulerApp getApplicationAttempt(
+   
+   @Lock(Lock.NoLock.class)
+   public FiCaSchedulerNode getNode(NodeId nodeId) {
+-    return nodes.get(nodeId);
++    return nodeTracker.getNode(nodeId);
+   }
+   
+-  @Lock(Lock.NoLock.class)
+-  Map<NodeId, FiCaSchedulerNode> getAllNodes() {
+-    return nodes;
+-  }
+-
+   @Override
+   @Lock(Lock.NoLock.class)
+   public void recover(RMState state) throws Exception {
+@@ -1514,9 +1517,9 @@ public synchronized String moveApplication(ApplicationId appId,
+     }
+     // Move all live containers
+     for (RMContainer rmContainer : app.getLiveContainers()) {
+-      source.detachContainer(clusterResource, app, rmContainer);
++      source.detachContainer(getClusterResource(), app, rmContainer);
+       // attach the Container to another queue
+-      dest.attachContainer(clusterResource, app, rmContainer);
++      dest.attachContainer(getClusterResource(), app, rmContainer);
+     }
+     // Detach the application..
+     source.finishApplicationAttempt(app, sourceQueueName);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+index d5ef7e1..4327c63 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+@@ -86,7 +86,7 @@
+   // Key = RackName, Value = Set of Nodes reserved by app on rack
+   private Map<String, Set<String>> reservations = new HashMap<>();
+ 
+-  private List<NodeId> blacklistNodeIds = new ArrayList<NodeId>();
++  private List<FSSchedulerNode> blacklistNodeIds = new ArrayList<>();
+   /**
+    * Delay scheduling: We often want to prioritize scheduling of node-local
+    * containers over rack-local or off-switch containers. To acheive this
+@@ -184,14 +184,11 @@ private void subtractResourcesOnBlacklistedNodes(
+       Resource availableResources) {
+     if (appSchedulingInfo.getAndResetBlacklistChanged()) {
+       blacklistNodeIds.clear();
+-      scheduler.addBlacklistedNodeIdsToList(this, blacklistNodeIds);
++      blacklistNodeIds.addAll(scheduler.getBlacklistedNodes(this));
+     }
+-    for (NodeId nodeId: blacklistNodeIds) {
+-      SchedulerNode node = scheduler.getSchedulerNode(nodeId);
+-      if (node != null) {
+-        Resources.subtractFrom(availableResources,
+-            node.getAvailableResource());
+-      }
++    for (FSSchedulerNode node: blacklistNodeIds) {
++      Resources.subtractFrom(availableResources,
++          node.getAvailableResource());
+     }
+     if (availableResources.getMemory() < 0) {
+       availableResources.setMemory(0);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 54e275d..793c7da 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -21,13 +21,11 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.EnumSet;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+@@ -184,13 +182,10 @@
+   private float reservableNodesRatio; // percentage of available nodes
+                                       // an app can be reserved on
+ 
+-  // Count of number of nodes per rack
+-  private Map<String, Integer> nodesPerRack = new ConcurrentHashMap<>();
+-
+   protected boolean sizeBasedWeight; // Give larger weights to larger jobs
+   protected boolean continuousSchedulingEnabled; // Continuous Scheduling enabled or not
+   protected int continuousSchedulingSleepMs; // Sleep time for each pass in continuous scheduling
+-  private Comparator<NodeId> nodeAvailableResourceComparator =
++  private Comparator<FSSchedulerNode> nodeAvailableResourceComparator =
+           new NodeAvailableResourceComparator(); // Node available resource comparator
+   protected double nodeLocalityThreshold; // Cluster threshold for node locality
+   protected double rackLocalityThreshold; // Cluster threshold for rack locality
+@@ -224,8 +219,8 @@ public FairScheduler() {
+ 
+   public boolean isAtLeastReservationThreshold(
+       ResourceCalculator resourceCalculator, Resource resource) {
+-    return Resources.greaterThanOrEqual(
+-        resourceCalculator, clusterResource, resource, reservationThreshold);
++    return Resources.greaterThanOrEqual(resourceCalculator,
++        getClusterResource(), resource, reservationThreshold);
+   }
+ 
+   private void validateConf(Configuration conf) {
+@@ -273,11 +268,7 @@ public FairSchedulerConfiguration getConf() {
+   }
+ 
+   public int getNumNodesInRack(String rackName) {
+-    String rName = rackName == null ? "NULL" : rackName;
+-    if (nodesPerRack.containsKey(rName)) {
+-      return nodesPerRack.get(rName);
+-    }
+-    return 0;
++    return nodeTracker.nodeCount(rackName);
+   }
+ 
+   public QueueManager getQueueManager() {
+@@ -353,6 +344,7 @@ protected synchronized void update() {
+     // Recursively update demands for all queues
+     rootQueue.updateDemand();
+ 
++    Resource clusterResource = getClusterResource();
+     rootQueue.setFairShare(clusterResource);
+     // Recursively compute fair shares for all queues
+     // and update metrics
+@@ -526,6 +518,7 @@ protected Resource resourceDeficit(FSLeafQueue sched, long curTime) {
+     Resource resDueToMinShare = Resources.none();
+     Resource resDueToFairShare = Resources.none();
+     ResourceCalculator calc = sched.getPolicy().getResourceCalculator();
++    Resource clusterResource = getClusterResource();
+     if (curTime - sched.getLastTimeAtMinShare() > minShareTimeout) {
+       Resource target = Resources.componentwiseMin(
+           sched.getMinShare(), sched.getDemand());
+@@ -573,7 +566,7 @@ public Resource getIncrementResourceCapability() {
+   }
+ 
+   private FSSchedulerNode getFSSchedulerNode(NodeId nodeId) {
+-    return nodes.get(nodeId);
++    return nodeTracker.getNode(nodeId);
+   }
+ 
+   public double getNodeLocalityThreshold() {
+@@ -891,18 +884,11 @@ protected synchronized void completedContainer(RMContainer rmContainer,
+   private synchronized void addNode(List<NMContainerStatus> containerReports,
+       RMNode node) {
+     FSSchedulerNode schedulerNode = new FSSchedulerNode(node, usePortForNodeName);
+-    nodes.put(node.getNodeID(), schedulerNode);
+-    String rackName = node.getRackName() == null ? "NULL" : node.getRackName();
+-    if (nodesPerRack.containsKey(rackName)) {
+-      nodesPerRack.put(rackName, nodesPerRack.get(rackName) + 1);
+-    } else {
+-      nodesPerRack.put(rackName, 1);
+-    }
+-    Resources.addTo(clusterResource, schedulerNode.getTotalResource());
+-    updateMaximumAllocation(schedulerNode, true);
++    nodeTracker.addNode(schedulerNode);
+ 
+     triggerUpdate();
+ 
++    Resource clusterResource = getClusterResource();
+     queueMgr.getRootQueue().setSteadyFairShare(clusterResource);
+     queueMgr.getRootQueue().recomputeSteadyShares();
+     LOG.info("Added node " + node.getNodeAddress() +
+@@ -913,15 +899,12 @@ private synchronized void addNode(List<NMContainerStatus> containerReports,
+   }
+ 
+   private synchronized void removeNode(RMNode rmNode) {
+-    FSSchedulerNode node = getFSSchedulerNode(rmNode.getNodeID());
+-    // This can occur when an UNHEALTHY node reconnects
++    NodeId nodeId = rmNode.getNodeID();
++    FSSchedulerNode node = nodeTracker.getNode(nodeId);
+     if (node == null) {
++      LOG.error("Attempting to remove non-existent node " + nodeId);
+       return;
+     }
+-    Resources.subtractFrom(clusterResource, node.getTotalResource());
+-    updateRootQueueMetrics();
+-
+-    triggerUpdate();
+ 
+     // Remove running containers
+     List<RMContainer> runningContainers = node.getRunningContainers();
+@@ -943,18 +926,13 @@ private synchronized void removeNode(RMNode rmNode) {
+           RMContainerEventType.KILL);
+     }
+ 
+-    nodes.remove(rmNode.getNodeID());
+-    String rackName = node.getRackName() == null ? "NULL" : node.getRackName();
+-    if (nodesPerRack.containsKey(rackName)
+-            && (nodesPerRack.get(rackName) > 0)) {
+-      nodesPerRack.put(rackName, nodesPerRack.get(rackName) - 1);
+-    } else {
+-      LOG.error("Node [" + rmNode.getNodeAddress() + "] being removed from" +
+-              " unknown rack [" + rackName + "] !!");
+-    }
++    nodeTracker.removeNode(nodeId);
++    Resource clusterResource = getClusterResource();
+     queueMgr.getRootQueue().setSteadyFairShare(clusterResource);
+     queueMgr.getRootQueue().recomputeSteadyShares();
+-    updateMaximumAllocation(node, false);
++    updateRootQueueMetrics();
++    triggerUpdate();
++
+     LOG.info("Removed node " + rmNode.getNodeAddress() +
+         " cluster capacity: " + clusterResource);
+   }
+@@ -974,7 +952,7 @@ public Allocation allocate(ApplicationAttemptId appAttemptId,
+ 
+     // Sanity check
+     SchedulerUtils.normalizeRequests(ask, DOMINANT_RESOURCE_CALCULATOR,
+-        clusterResource, minimumAllocation, getMaximumResourceCapability(),
++        getClusterResource(), minimumAllocation, getMaximumResourceCapability(),
+         incrAllocation);
+ 
+     // Record container allocation start time
+@@ -1041,7 +1019,8 @@ public Allocation allocate(ApplicationAttemptId appAttemptId,
+   private synchronized void nodeUpdate(RMNode nm) {
+     long start = getClock().getTime();
+     if (LOG.isDebugEnabled()) {
+-      LOG.debug("nodeUpdate: " + nm + " cluster capacity: " + clusterResource);
++      LOG.debug("nodeUpdate: " + nm +
++          " cluster capacity: " + getClusterResource());
+     }
+     eventLog.log("HEARTBEAT", nm.getHostName());
+     FSSchedulerNode node = getFSSchedulerNode(nm.getNodeID());
+@@ -1093,20 +1072,13 @@ private synchronized void nodeUpdate(RMNode nm) {
+ 
+   void continuousSchedulingAttempt() throws InterruptedException {
+     long start = getClock().getTime();
+-    List<NodeId> nodeIdList = new ArrayList<NodeId>(nodes.keySet());
+-    // Sort the nodes by space available on them, so that we offer
+-    // containers on emptier nodes first, facilitating an even spread. This
+-    // requires holding the scheduler lock, so that the space available on a
+-    // node doesn't change during the sort.
+-    synchronized (this) {
+-      Collections.sort(nodeIdList, nodeAvailableResourceComparator);
+-    }
++    List<FSSchedulerNode> nodeIdList =
++        nodeTracker.sortedNodeList(nodeAvailableResourceComparator);
+ 
+     // iterate all nodes
+-    for (NodeId nodeId : nodeIdList) {
+-      FSSchedulerNode node = getFSSchedulerNode(nodeId);
++    for (FSSchedulerNode node : nodeIdList) {
+       try {
+-        if (node != null && Resources.fitsIn(minimumAllocation,
++        if (Resources.fitsIn(minimumAllocation,
+             node.getAvailableResource())) {
+           attemptScheduling(node);
+         }
+@@ -1128,19 +1100,14 @@ void continuousSchedulingAttempt() throws InterruptedException {
+   }
+ 
+   /** Sort nodes by available resource */
+-  private class NodeAvailableResourceComparator implements Comparator<NodeId> {
++  private class NodeAvailableResourceComparator
++      implements Comparator<FSSchedulerNode> {
+ 
+     @Override
+-    public int compare(NodeId n1, NodeId n2) {
+-      if (!nodes.containsKey(n1)) {
+-        return 1;
+-      }
+-      if (!nodes.containsKey(n2)) {
+-        return -1;
+-      }
+-      return RESOURCE_CALCULATOR.compare(clusterResource,
+-              nodes.get(n2).getAvailableResource(),
+-              nodes.get(n1).getAvailableResource());
++    public int compare(FSSchedulerNode n1, FSSchedulerNode n2) {
++      return RESOURCE_CALCULATOR.compare(getClusterResource(),
++          n2.getAvailableResource(),
++          n1.getAvailableResource());
+     }
+   }
+ 
+@@ -1168,7 +1135,7 @@ synchronized void attemptScheduling(FSSchedulerNode node) {
+     }
+ 
+     final NodeId nodeID = node.getNodeID();
+-    if (!nodes.containsKey(nodeID)) {
++    if (!nodeTracker.exists(nodeID)) {
+       // The node might have just been removed while this thread was waiting
+       // on the synchronized lock before it entered this synchronized method
+       LOG.info("Skipping scheduling as the node " + nodeID +
+@@ -1226,7 +1193,7 @@ public static ResourceCalculator getResourceCalculator() {
+   private void updateRootQueueMetrics() {
+     rootMetrics.setAvailableResourcesToQueue(
+         Resources.subtract(
+-            clusterResource, rootMetrics.getAllocatedResources()));
++            getClusterResource(), rootMetrics.getAllocatedResources()));
+   }
+ 
+   /**
+@@ -1237,6 +1204,7 @@ private void updateRootQueueMetrics() {
+    */
+   private boolean shouldAttemptPreemption() {
+     if (preemptionEnabled) {
++      Resource clusterResource = getClusterResource();
+       return (preemptionUtilizationThreshold < Math.max(
+           (float) rootMetrics.getAllocatedMB() / clusterResource.getMemory(),
+           (float) rootMetrics.getAllocatedVirtualCores() /
+@@ -1520,7 +1488,7 @@ public QueueInfo getQueueInfo(String queueName, boolean includeChildQueues,
+ 
+   @Override
+   public int getNumClusterNodes() {
+-    return nodes.size();
++    return nodeTracker.nodeCount();
+   }
+ 
+   @Override
+@@ -1550,7 +1518,7 @@ public void onReload(AllocationConfiguration queueInfo) {
+       // if it does not already exist, so it can be displayed on the web UI.
+       synchronized (FairScheduler.this) {
+         allocConf = queueInfo;
+-        allocConf.getDefaultSchedulingPolicy().initialize(clusterResource);
++        allocConf.getDefaultSchedulingPolicy().initialize(getClusterResource());
+         queueMgr.updateAllocationConfiguration(allocConf);
+         applyChildDefaults();
+         maxRunningEnforcer.updateRunnabilityOnReload();
+@@ -1737,7 +1705,7 @@ public synchronized void updateNodeResource(RMNode nm,
+       ResourceOption resourceOption) {
+     super.updateNodeResource(nm, resourceOption);
+     updateRootQueueMetrics();
+-    queueMgr.getRootQueue().setSteadyFairShare(clusterResource);
++    queueMgr.getRootQueue().setSteadyFairShare(getClusterResource());
+     queueMgr.getRootQueue().recomputeSteadyShares();
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+index f766f25..a6d78d1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+@@ -141,6 +141,7 @@ public QueueInfo getQueueInfo(
+       QueueInfo queueInfo = recordFactory.newRecordInstance(QueueInfo.class);
+       queueInfo.setQueueName(DEFAULT_QUEUE.getQueueName());
+       queueInfo.setCapacity(1.0f);
++      Resource clusterResource = getClusterResource();
+       if (clusterResource.getMemory() == 0) {
+         queueInfo.setCurrentCapacity(0.0f);
+       } else {
+@@ -282,7 +283,7 @@ public synchronized Configuration getConf() {
+ 
+   @Override
+   public int getNumClusterNodes() {
+-    return nodes.size();
++    return nodeTracker.nodeCount();
+   }
+ 
+   @Override
+@@ -310,7 +311,8 @@ public Allocation allocate(
+ 
+     // Sanity check
+     SchedulerUtils.normalizeRequests(ask, resourceCalculator, 
+-        clusterResource, minimumAllocation, getMaximumResourceCapability());
++        getClusterResource(), minimumAllocation,
++        getMaximumResourceCapability());
+ 
+     // Release containers
+     releaseContainers(release, application);
+@@ -361,7 +363,7 @@ public Allocation allocate(
+   }
+ 
+   private FiCaSchedulerNode getNode(NodeId nodeId) {
+-    return nodes.get(nodeId);
++    return nodeTracker.getNode(nodeId);
+   }
+ 
+   @VisibleForTesting
+@@ -510,7 +512,7 @@ private void assignContainers(FiCaSchedulerNode node) {
+       application.showRequests();
+ 
+       // Done
+-      if (Resources.lessThan(resourceCalculator, clusterResource,
++      if (Resources.lessThan(resourceCalculator, getClusterResource(),
+               node.getAvailableResource(), minimumAllocation)) {
+         break;
+       }
+@@ -748,9 +750,9 @@ private synchronized void nodeUpdate(RMNode rmNode) {
+       return;
+     }
+ 
+-    if (Resources.greaterThanOrEqual(resourceCalculator, clusterResource,
+-            node.getAvailableResource(),minimumAllocation)) {
+-      LOG.debug("Node heartbeat " + rmNode.getNodeID() + 
++    if (Resources.greaterThanOrEqual(resourceCalculator, getClusterResource(),
++            node.getAvailableResource(), minimumAllocation)) {
++      LOG.debug("Node heartbeat " + rmNode.getNodeID() +
+           " available resource = " + node.getAvailableResource());
+ 
+       assignContainers(node);
+@@ -767,13 +769,13 @@ private void increaseUsedResources(RMContainer rmContainer) {
+   }
+ 
+   private void updateAppHeadRoom(SchedulerApplicationAttempt schedulerAttempt) {
+-    schedulerAttempt.setHeadroom(Resources.subtract(clusterResource,
++    schedulerAttempt.setHeadroom(Resources.subtract(getClusterResource(),
+       usedResource));
+   }
+ 
+   private void updateAvailableResourcesMetrics() {
+-    metrics.setAvailableResourcesToQueue(Resources.subtract(clusterResource,
+-      usedResource));
++    metrics.setAvailableResourcesToQueue(
++        Resources.subtract(getClusterResource(), usedResource));
+   }
+ 
+   @Override
+@@ -919,7 +921,7 @@ protected synchronized void completedContainer(RMContainer rmContainer,
+   private Resource usedResource = recordFactory.newRecordInstance(Resource.class);
+ 
+   private synchronized void removeNode(RMNode nodeInfo) {
+-    FiCaSchedulerNode node = getNode(nodeInfo.getNodeID());
++    FiCaSchedulerNode node = nodeTracker.getNode(nodeInfo.getNodeID());
+     if (node == null) {
+       return;
+     }
+@@ -931,13 +933,7 @@ private synchronized void removeNode(RMNode nodeInfo) {
+               SchedulerUtils.LOST_CONTAINER),
+               RMContainerEventType.KILL);
+     }
+-    
+-    //Remove the node
+-    this.nodes.remove(nodeInfo.getNodeID());
+-    updateMaximumAllocation(node, false);
+-    
+-    // Update cluster metrics
+-    Resources.subtractFrom(clusterResource, node.getTotalResource());
++    nodeTracker.removeNode(nodeInfo.getNodeID());
+   }
+ 
+   @Override
+@@ -954,9 +950,7 @@ public QueueInfo getQueueInfo(String queueName,
+   private synchronized void addNode(RMNode nodeManager) {
+     FiCaSchedulerNode schedulerNode = new FiCaSchedulerNode(nodeManager,
+         usePortForNodeName);
+-    this.nodes.put(nodeManager.getNodeID(), schedulerNode);
+-    Resources.addTo(clusterResource, nodeManager.getTotalCapability());
+-    updateMaximumAllocation(schedulerNode, true);
++    nodeTracker.addNode(schedulerNode);
+   }
+ 
+   @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+index d2f0044..4354fb0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+@@ -303,22 +303,16 @@ public void testUpdateMaxAllocationUsesTotal() throws IOException {
+ 
+       verifyMaximumResourceCapability(configuredMaximumResource, scheduler);
+ 
+-      scheduler.nodes = new HashMap<NodeId, SchedulerNode>();
+-
+-      scheduler.nodes.put(mockNode1.getNodeID(), mockNode1);
+-      scheduler.updateMaximumAllocation(mockNode1, true);
++      scheduler.nodeTracker.addNode(mockNode1);
+       verifyMaximumResourceCapability(fullResource1, scheduler);
+ 
+-      scheduler.nodes.put(mockNode2.getNodeID(), mockNode2);
+-      scheduler.updateMaximumAllocation(mockNode2, true);
++      scheduler.nodeTracker.addNode(mockNode2);
+       verifyMaximumResourceCapability(fullResource2, scheduler);
+ 
+-      scheduler.nodes.remove(mockNode2.getNodeID());
+-      scheduler.updateMaximumAllocation(mockNode2, false);
++      scheduler.nodeTracker.removeNode(mockNode2.getNodeID());
+       verifyMaximumResourceCapability(fullResource1, scheduler);
+ 
+-      scheduler.nodes.remove(mockNode1.getNodeID());
+-      scheduler.updateMaximumAllocation(mockNode1, false);
++      scheduler.nodeTracker.removeNode(mockNode1.getNodeID());
+       verifyMaximumResourceCapability(configuredMaximumResource, scheduler);
+     } finally {
+       rm.stop();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+index b100b6a..65c1bdb 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+@@ -201,6 +201,7 @@ public Container answer(InvocationOnMock invocation) throws Throwable {
+   }
+ 
+   @Test
++  @SuppressWarnings("unchecked")
+   public void testReservation() throws Exception {
+     // Test that we now unreserve and use a node that has space
+ 
+@@ -243,6 +244,10 @@ public void testReservation() throws Exception {
+     when(csContext.getNode(node_1.getNodeID())).thenReturn(node_1);
+     when(csContext.getNode(node_2.getNodeID())).thenReturn(node_2);
+ 
++    cs.getNodeTracker().addNode(node_0);
++    cs.getNodeTracker().addNode(node_1);
++    cs.getNodeTracker().addNode(node_2);
++
+     final int numNodes = 3;
+     Resource clusterResource = Resources.createResource(numNodes * (8 * GB));
+     when(csContext.getNumClusterNodes()).thenReturn(numNodes);
+@@ -498,6 +503,7 @@ public void testReservationNoContinueLook() throws Exception {
+   }
+ 
+   @Test
++  @SuppressWarnings("unchecked")
+   public void testAssignContainersNeedToUnreserve() throws Exception {
+     // Test that we now unreserve and use a node that has space
+ 
+@@ -533,6 +539,9 @@ public void testAssignContainersNeedToUnreserve() throws Exception {
+     FiCaSchedulerNode node_1 = TestUtils.getMockNode(host_1, DEFAULT_RACK, 0,
+         8 * GB);
+ 
++    cs.getNodeTracker().addNode(node_0);
++    cs.getNodeTracker().addNode(node_1);
++
+     when(csContext.getNode(node_0.getNodeID())).thenReturn(node_0);
+     when(csContext.getNode(node_1.getNodeID())).thenReturn(node_1);
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 3093e6b..3c5ee26 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -4436,8 +4436,8 @@ public void testReservationsStrictLocality() throws IOException {
+ 
+     RMNode node1 = MockNodes.newNodeInfo(1, Resources.createResource(1024), 1, "127.0.0.1");
+     RMNode node2 = MockNodes.newNodeInfo(1, Resources.createResource(1024), 2, "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent2);
++    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
++    scheduler.handle(nodeEvent1);
+ 
+     ApplicationAttemptId attId = createSchedulingRequest(1024, "queue1",
+         "user1", 0);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+index 147f5e3..ffd6c3b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo;
+ 
++import org.apache.commons.math3.analysis.function.Add;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ import static org.mockito.Mockito.mock;
+@@ -286,10 +287,10 @@ public void testUpdateResourceOnNode() throws Exception {
+         mock(SystemMetricsPublisher.class));
+ 
+     FifoScheduler scheduler = new FifoScheduler(){
+-      @SuppressWarnings("unused")
+-      public Map<NodeId, FiCaSchedulerNode> getNodes(){
+-        return nodes;
+-      }
++//      @SuppressWarnings("unused")
++//      public Map<NodeId, FiCaSchedulerNode> getNodes(){
++//        return nodes;
++//      }
+     };
+     scheduler.setRMContext(rmContext);
+     scheduler.init(conf);
+@@ -300,11 +301,7 @@ public void testUpdateResourceOnNode() throws Exception {
+     NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node0);
+     scheduler.handle(nodeEvent1);
+     
+-    Method method = scheduler.getClass().getDeclaredMethod("getNodes");
+-    @SuppressWarnings("unchecked")
+-    Map<NodeId, FiCaSchedulerNode> schedulerNodes = 
+-        (Map<NodeId, FiCaSchedulerNode>) method.invoke(scheduler);
+-    assertEquals(schedulerNodes.values().size(), 1);
++    assertEquals(scheduler.getNumClusterNodes(), 1);
+     
+     Resource newResource = Resources.createResource(1024, 4);
+     
+@@ -314,9 +311,9 @@ public void testUpdateResourceOnNode() throws Exception {
+     scheduler.handle(node0ResourceUpdate);
+     
+     // SchedulerNode's total resource and available resource are changed.
+-    assertEquals(schedulerNodes.get(node0.getNodeID()).getTotalResource()
+-        .getMemory(), 1024);
+-    assertEquals(schedulerNodes.get(node0.getNodeID()).
++    assertEquals(1024, scheduler.getNodeTracker().getNode(node0.getNodeID())
++        .getTotalResource().getMemory());
++    assertEquals(1024, scheduler.getNodeTracker().getNode(node0.getNodeID()).
+         getAvailableResource().getMemory(), 1024);
+     QueueInfo queueInfo = scheduler.getQueueInfo(null, false, false);
+     Assert.assertEquals(0.0f, queueInfo.getCurrentCapacity(), 0.0f);
+-- 
+1.7.9.5
+

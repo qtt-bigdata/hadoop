@@ -1,0 +1,283 @@
+From 9a5f04f100de9f901b8cfc5779e5579ee1766a0b Mon Sep 17 00:00:00 2001
+From: Robert Kanter <rkanter@cloudera.com>
+Date: Mon, 28 Nov 2016 18:08:09 -0800
+Subject: [PATCH 2088/2848] HADOOP-13838. KMSTokenRenewer should close
+ providers (xiaochen via rkanter)
+
+(cherry picked from commit 47ca9e26fba4a639e43bee5bfc001ffc4b42330d)
+
+Change-Id: I635b89f171c2e268a9a51fff2752877b229122d3
+---
+ .../hadoop/crypto/key/kms/KMSClientProvider.java   |   41 ++++++---
+ .../hadoop/crypto/key/kms/server/TestKMS.java      |   97 +++++++++++++++-----
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    7 ++
+ 3 files changed, 110 insertions(+), 35 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+index 82396f6..ca642fc 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+@@ -172,14 +172,20 @@ public long renew(Token<?> token, Configuration conf) throws IOException {
+       LOG.debug("Renewing delegation token {}", token);
+       KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+           KeyProviderFactory.KEY_PROVIDER_PATH);
+-      if (!(keyProvider instanceof
+-          KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+-        LOG.warn("keyProvider {} cannot renew dt.", keyProvider == null ?
+-            "null" : keyProvider.getClass());
+-        return 0;
++      try {
++        if (!(keyProvider instanceof
++            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
++          LOG.warn("keyProvider {} cannot renew dt.", keyProvider == null ?
++              "null" : keyProvider.getClass());
++          return 0;
++        }
++        return ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
++            keyProvider).renewDelegationToken(token);
++      } finally {
++        if (keyProvider != null) {
++          keyProvider.close();
++        }
+       }
+-      return ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+-          keyProvider).renewDelegationToken(token);
+     }
+ 
+     @Override
+@@ -187,14 +193,20 @@ public void cancel(Token<?> token, Configuration conf) throws IOException {
+       LOG.debug("Canceling delegation token {}", token);
+       KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+           KeyProviderFactory.KEY_PROVIDER_PATH);
+-      if (!(keyProvider instanceof
+-          KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+-        LOG.warn("keyProvider {} cannot cancel dt.", keyProvider == null ?
+-            "null" : keyProvider.getClass());
+-        return;
++      try {
++        if (!(keyProvider instanceof
++            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
++          LOG.warn("keyProvider {} cannot cancel dt.", keyProvider == null ?
++              "null" : keyProvider.getClass());
++          return;
++        }
++        ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
++            keyProvider).cancelDelegationToken(token);
++      } finally {
++        if (keyProvider != null) {
++          keyProvider.close();
++        }
+       }
+-      ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+-          keyProvider).cancelDelegationToken(token);
+     }
+   }
+ 
+@@ -1069,6 +1081,7 @@ public void close() throws IOException {
+     } finally {
+       if (sslFactory != null) {
+         sslFactory.destroy();
++        sslFactory = null;
+       }
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+index 9277615..6e110a9 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.crypto.key.kms.server;
+ 
++import com.google.common.base.Supplier;
+ import org.apache.curator.test.TestingServer;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.crypto.key.KeyProviderFactory;
+@@ -76,12 +77,16 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Properties;
++import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ 
+ public class TestKMS {
+   private static final Logger LOG = LoggerFactory.getLogger(TestKMS.class);
+ 
++  private static final String SSL_RELOADER_THREAD_NAME =
++      "Truststore reloader thread";
++
+   @Rule
+   public final Timeout testTimeout = new Timeout(180000);
+ 
+@@ -346,7 +351,7 @@ public Void call() throws Exception {
+           Thread reloaderThread = null;
+           for (Thread thread : threads) {
+             if ((thread.getName() != null)
+-                && (thread.getName().contains("Truststore reloader thread"))) {
++                && (thread.getName().contains(SSL_RELOADER_THREAD_NAME))) {
+               reloaderThread = thread;
+             }
+           }
+@@ -376,6 +381,7 @@ public Void run() throws Exception {
+                     .addDelegationTokens("myuser", new Credentials());
+                 Assert.assertEquals(1, tokens.length);
+                 Assert.assertEquals("kms-dt", tokens[0].getKind().toString());
++                kp.close();
+                 return null;
+               }
+             });
+@@ -391,6 +397,7 @@ public Void run() throws Exception {
+               .addDelegationTokens("myuser", new Credentials());
+           Assert.assertEquals(1, tokens.length);
+           Assert.assertEquals("kms-dt", tokens[0].getKind().toString());
++          kp.close();
+         }
+         return null;
+       }
+@@ -1754,34 +1761,63 @@ public Void run() throws Exception {
+     });
+   }
+ 
++  private Configuration setupConfForKerberos(File confDir) throws Exception {
++    final Configuration conf =  createBaseKMSConf(confDir, null);
++    conf.set("hadoop.security.authentication", "kerberos");
++    conf.set("hadoop.kms.authentication.type", "kerberos");
++    conf.set("hadoop.kms.authentication.kerberos.keytab",
++        keytab.getAbsolutePath());
++    conf.set("hadoop.kms.authentication.kerberos.principal",
++        "HTTP/localhost");
++    conf.set("hadoop.kms.authentication.kerberos.name.rules", "DEFAULT");
++    return conf;
++  }
++
+   @Test
+-  public void testDelegationTokensOpsSimple() throws Exception {
+-    final Configuration conf = new Configuration();
+-    testDelegationTokensOps(conf, false);
++  public void testDelegationTokensOpsHttpPseudo() throws Exception {
++    testDelegationTokensOps(false, false);
+   }
+ 
+   @Test
+-  public void testDelegationTokensOpsKerberized() throws Exception {
+-    final Configuration conf = new Configuration();
+-    conf.set("hadoop.security.authentication", "kerberos");
+-    testDelegationTokensOps(conf, true);
++  public void testDelegationTokensOpsHttpKerberized() throws Exception {
++    testDelegationTokensOps(false, true);
+   }
+ 
+-  private void testDelegationTokensOps(Configuration conf,
+-      final boolean useKrb) throws Exception {
+-    File confDir = getTestDir();
+-    conf = createBaseKMSConf(confDir, conf);
+-    if (useKrb) {
+-      conf.set("hadoop.kms.authentication.type", "kerberos");
+-      conf.set("hadoop.kms.authentication.kerberos.keytab",
+-          keytab.getAbsolutePath());
+-      conf.set("hadoop.kms.authentication.kerberos.principal",
+-          "HTTP/localhost");
+-      conf.set("hadoop.kms.authentication.kerberos.name.rules", "DEFAULT");
++  @Test
++  public void testDelegationTokensOpsHttpsPseudo() throws Exception {
++    testDelegationTokensOps(true, false);
++  }
++
++  @Test
++  public void testDelegationTokensOpsHttpsKerberized() throws Exception {
++    testDelegationTokensOps(true, true);
++  }
++
++  private void testDelegationTokensOps(final boolean ssl, final boolean kerb)
++      throws Exception {
++    final File confDir = getTestDir();
++    final Configuration conf;
++    if (kerb) {
++      conf = setupConfForKerberos(confDir);
++    } else {
++      conf = createBaseKMSConf(confDir, null);
++    }
++
++    final String keystore;
++    final String password;
++    if (ssl) {
++      final String sslConfDir = KeyStoreTestUtil.getClasspathDir(TestKMS.class);
++      KeyStoreTestUtil.setupSSLConfig(confDir.getAbsolutePath(), sslConfDir,
++          conf, false);
++      keystore = confDir.getAbsolutePath() + "/serverKS.jks";
++      password = "serverP";
++    } else {
++      keystore = null;
++      password = null;
+     }
+     writeConf(confDir, conf);
+ 
+-    runServer(null, null, confDir, new KMSCallable<Void>() {
++    runServer(keystore, password, confDir, new KMSCallable<Void>() {
+       @Override
+       public Void call() throws Exception {
+         final Configuration clientConf = new Configuration();
+@@ -1826,7 +1862,7 @@ public Void run() throws Exception {
+             }
+ 
+             final UserGroupInformation otherUgi;
+-            if (useKrb) {
++            if (kerb) {
+               UserGroupInformation
+                   .loginUserFromKeytab("client1", keytab.getAbsolutePath());
+               otherUgi = UserGroupInformation.getLoginUser();
+@@ -1880,6 +1916,9 @@ public Void run() throws Exception {
+                   return null;
+                 }
+               });
++              // Close the client provider. We will verify all providers'
++              // Truststore reloader threads are closed later.
++              kp.close();
+               return null;
+             } finally {
+               otherUgi.logoutUserFromKeytab();
+@@ -1889,6 +1928,22 @@ public Void run() throws Exception {
+         return null;
+       }
+     });
++
++    // verify that providers created by KMSTokenRenewer are closed.
++    if (ssl) {
++      GenericTestUtils.waitFor(new Supplier<Boolean>() {
++        @Override
++        public Boolean get() {
++          final Set<Thread> threadSet = Thread.getAllStackTraces().keySet();
++          for (Thread t : threadSet) {
++            if (t.getName().contains(SSL_RELOADER_THREAD_NAME)) {
++              return false;
++            }
++          }
++          return true;
++        }
++      }, 1000, 10000);
++    }
+   }
+ 
+   @Test
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index a5204d3..2e44a9b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -6781,6 +6781,13 @@ void shutdown() {
+     if (blockManager != null) {
+       blockManager.shutdown();
+     }
++    if (provider != null) {
++      try {
++        provider.close();
++      } catch (IOException e) {
++        LOG.error("Failed to close provider.", e);
++      }
++    }
+   }
+ 
+   @Override // FSNamesystemMBean
+-- 
+1.7.9.5
+

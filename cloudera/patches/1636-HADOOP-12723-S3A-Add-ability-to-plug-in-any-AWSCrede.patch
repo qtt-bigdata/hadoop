@@ -1,0 +1,333 @@
+From 4e814d39a19346c367b02e1eb1b06838d5c1e9f5 Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Fri, 20 May 2016 13:42:59 +0100
+Subject: [PATCH 1636/2848] HADOOP-12723 S3A: Add ability to plug in any
+ AWSCredentialsProvider. Contributed by Steven
+ Wong.
+
+(cherry-picked from commit 757050ff355d40bc28f9dbfd0c0083c5f337d270)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+
+Change-Id: I6b0afa2257dce6ee6f64b8cdb1200118c18322ab
+---
+ .../src/main/resources/core-default.xml            |    9 +-
+ .../java/org/apache/hadoop/fs/s3a/Constants.java   |    4 +
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   60 ++++++++---
+ .../src/site/markdown/tools/hadoop-aws/index.md    |   21 ++--
+ .../fs/s3a/TestS3AAWSCredentialsProvider.java      |  106 ++++++++++++++++++++
+ 5 files changed, 178 insertions(+), 22 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AAWSCredentialsProvider.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 9df331b..175dd53 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -743,12 +743,17 @@ for ldap providers in the same way as above does.
+ 
+ <property>
+   <name>fs.s3a.access.key</name>
+-  <description>AWS access key ID used by S3A file system. Omit for Role-based authentication.</description>
++  <description>AWS access key ID used by S3A file system. Omit for IAM role-based or provider-based authentication.</description>
+ </property>
+ 
+ <property>
+   <name>fs.s3a.secret.key</name>
+-  <description>AWS secret key used by S3A file system. Omit for Role-based authentication.</description>
++  <description>AWS secret key used by S3A file system. Omit for IAM role-based or provider-based authentication.</description>
++</property>
++
++<property>
++  <name>fs.s3a.aws.credentials.provider</name>
++  <description>Class name of a credentials provider that implements com.amazonaws.auth.AWSCredentialsProvider. Omit if using access/secret keys or another authentication mechanism.</description>
+ </property>
+ 
+ <property>
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index f1dbba9..0441566 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -25,6 +25,10 @@
+   // s3 secret key
+   public static final String SECRET_KEY = "fs.s3a.secret.key";
+ 
++  // aws credentials provider
++  public static final String AWS_CREDENTIALS_PROVIDER =
++      "fs.s3a.aws.credentials.provider";
++
+   // number of simultaneous connections to s3
+   public static final String MAXIMUM_CONNECTIONS = "fs.s3a.connection.maximum";
+   public static final int DEFAULT_MAXIMUM_CONNECTIONS = 15;
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index ead8595..c2052e6 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -37,8 +37,8 @@
+ import com.amazonaws.AmazonServiceException;
+ import com.amazonaws.ClientConfiguration;
+ import com.amazonaws.Protocol;
++import com.amazonaws.auth.AWSCredentialsProvider;
+ import com.amazonaws.auth.AWSCredentialsProviderChain;
+-
+ import com.amazonaws.auth.InstanceProfileCredentialsProvider;
+ import com.amazonaws.services.s3.AmazonS3Client;
+ import com.amazonaws.services.s3.S3ClientOptions;
+@@ -56,10 +56,9 @@
+ import com.amazonaws.services.s3.transfer.Upload;
+ import com.amazonaws.event.ProgressListener;
+ import com.amazonaws.event.ProgressEvent;
+-
+ import com.google.common.annotations.VisibleForTesting;
+-import org.apache.commons.lang.StringUtils;
+ 
++import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+@@ -172,17 +171,10 @@ public void initialize(URI name, Configuration conf) throws IOException {
+     workingDir = new Path("/user", System.getProperty("user.name")).makeQualified(this.uri,
+         this.getWorkingDirectory());
+ 
+-    AWSAccessKeys creds = getAWSAccessKeys(name, conf);
+-
+-    AWSCredentialsProviderChain credentials = new AWSCredentialsProviderChain(
+-        new BasicAWSCredentialsProvider(
+-            creds.getAccessKey(), creds.getAccessSecret()),
+-        new InstanceProfileCredentialsProvider(),
+-        new AnonymousAWSCredentialsProvider()
+-    );
+-
+     bucket = name.getHost();
+ 
++    AWSCredentialsProvider credentials = getAWSCredentialsProvider(name, conf);
++
+     ClientConfiguration awsConf = new ClientConfiguration();
+     awsConf.setMaxConnections(conf.getInt(MAXIMUM_CONNECTIONS,
+       DEFAULT_MAXIMUM_CONNECTIONS));
+@@ -300,7 +292,7 @@ void initProxySupport(Configuration conf, ClientConfiguration awsConf,
+   }
+ 
+   private void initAmazonS3Client(Configuration conf,
+-      AWSCredentialsProviderChain credentials, ClientConfiguration awsConf)
++      AWSCredentialsProvider credentials, ClientConfiguration awsConf)
+       throws IllegalArgumentException {
+     s3 = new AmazonS3Client(credentials, awsConf);
+     String endPoint = conf.getTrimmed(ENDPOINT,"");
+@@ -406,6 +398,48 @@ private void enablePathStyleAccessIfRequired(Configuration conf) {
+     }
+   }
+   /**
++   * Create the standard credential provider, or load in one explicitly
++   * identified in the configuration.
++   * @param binding the S3 binding/bucket.
++   * @param conf configuration
++   * @return a credential provider
++   * @throws IOException on any problem. Class construction issues may be
++   * nested inside the IOE.
++   */
++  private AWSCredentialsProvider getAWSCredentialsProvider(URI binding,
++      Configuration conf) throws IOException {
++    AWSCredentialsProvider credentials;
++
++    String className = conf.getTrimmed(AWS_CREDENTIALS_PROVIDER);
++    if (StringUtils.isEmpty(className)) {
++      AWSAccessKeys creds = getAWSAccessKeys(binding, conf);
++      credentials = new AWSCredentialsProviderChain(
++          new BasicAWSCredentialsProvider(
++              creds.getAccessKey(), creds.getAccessSecret()),
++          new InstanceProfileCredentialsProvider(),
++          new AnonymousAWSCredentialsProvider()
++      );
++
++    } else {
++      try {
++        LOG.debug("Credential provider class is {}", className);
++        credentials = (AWSCredentialsProvider) Class.forName(className)
++            .getDeclaredConstructor(URI.class, Configuration.class)
++            .newInstance(this.uri, conf);
++      } catch (ClassNotFoundException e) {
++        throw new IOException(className + " not found.", e);
++      } catch (NoSuchMethodException | SecurityException e) {
++        throw new IOException(className + " constructor exception.", e);
++      } catch (ReflectiveOperationException | IllegalArgumentException e) {
++        throw new IOException(className + " instantiation exception.", e);
++      }
++      LOG.debug("Using {} for {}.", credentials, this.uri);
++    }
++
++    return credentials;
++  }
++
++  /**
+    * Return the protocol scheme for the FileSystem.
+    *
+    * @return "s3a"
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+index 9802d9a..2037e10 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+@@ -174,20 +174,27 @@ If you do any of these: change your credentials immediately!
+ 
+     <property>
+       <name>fs.s3a.access.key</name>
+-      <description>AWS access key ID. Omit for Role-based authentication.</description>
++      <description>AWS access key ID. Omit for IAM role-based or provider-based authentication.</description>
+     </property>
+ 
+     <property>
+       <name>fs.s3a.secret.key</name>
+-      <description>AWS secret key. Omit for Role-based authentication.</description>
++      <description>AWS secret key. Omit for IAM role-based or provider-based authentication.</description>
++    </property>
++
++    <property>
++      <name>fs.s3a.aws.credentials.provider</name>
++      <description>Class name of a credentials provider that implements com.amazonaws.auth.AWSCredentialsProvider.
++      Omit if using access/secret keys or another authentication mechanism.</description>
+     </property>
+ 
+ #### Protecting the AWS Credentials in S3A
+ 
+-To protect these credentials from prying eyes, it is recommended that you use
++To protect the access/secret keys from prying eyes, it is recommended that you
++use either IAM role-based authentication (such as EC2 instance profile) or
+ the credential provider framework securely storing them and accessing them
+- through configuration. The following describes its use for AWS credentials
+-in S3A FileSystem.
++through configuration. The following describes using the latter for AWS
++credentials in S3AFileSystem.
+ 
+ For additional reading on the credential provider API see:
+ [Credential Provider API](../../../hadoop-project-dist/hadoop-common/CredentialProviderAPI.html).
+@@ -529,13 +536,13 @@ Example:
+ 
+       <property>
+         <name>fs.s3a.access.key</name>
+-        <description>AWS access key ID. Omit for Role-based authentication.</description>
++        <description>AWS access key ID. Omit for IAM role-based authentication.</description>
+         <value>DONOTCOMMITTHISKEYTOSCM</value>
+       </property>
+   
+       <property>
+         <name>fs.s3a.secret.key</name>
+-        <description>AWS secret key. Omit for Role-based authentication.</description>
++        <description>AWS secret key. Omit for IAM role-based authentication.</description>
+         <value>DONOTEVERSHARETHISSECRETKEY!</value>
+       </property>
+     </configuration>
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AAWSCredentialsProvider.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AAWSCredentialsProvider.java
+new file mode 100644
+index 0000000..b20a768
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestS3AAWSCredentialsProvider.java
+@@ -0,0 +1,106 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import static org.apache.hadoop.fs.s3a.Constants.*;
++import static org.junit.Assert.*;
++
++import java.io.IOException;
++import java.net.URI;
++
++import org.apache.hadoop.conf.Configuration;
++import org.junit.Test;
++
++import com.amazonaws.auth.AWSCredentials;
++import com.amazonaws.auth.AWSCredentialsProvider;
++import com.amazonaws.auth.AWSCredentialsProviderChain;
++import com.amazonaws.auth.BasicAWSCredentials;
++import com.amazonaws.auth.InstanceProfileCredentialsProvider;
++import com.amazonaws.services.s3.model.AmazonS3Exception;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Tests for {@link Constants#AWS_CREDENTIALS_PROVIDER} logic.
++ *
++ */
++public class TestS3AAWSCredentialsProvider {
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestS3AAWSCredentialsProvider.class);
++
++  @Test
++  public void testBadConfiguration() throws IOException {
++    Configuration conf = new Configuration();
++    conf.set(AWS_CREDENTIALS_PROVIDER, "no.such.class");
++    try {
++      S3ATestUtils.createTestFileSystem(conf);
++    } catch (IOException e) {
++      if (!(e.getCause() instanceof ClassNotFoundException)) {
++        LOG.error("Unexpected nested cause: {} in {}", e.getCause(), e, e);
++        throw e;
++      }
++    }
++  }
++
++  static class BadCredentialsProvider implements AWSCredentialsProvider {
++
++    @SuppressWarnings("unused")
++    public BadCredentialsProvider(URI name, Configuration conf) {
++    }
++
++    @Override
++    public AWSCredentials getCredentials() {
++      return new BasicAWSCredentials("bad_key", "bad_secret");
++    }
++
++    @Override
++    public void refresh() {
++    }
++  }
++
++  @Test
++  public void testBadCredentials() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set(AWS_CREDENTIALS_PROVIDER, BadCredentialsProvider.class.getName());
++    try {
++      S3ATestUtils.createTestFileSystem(conf);
++    } catch (AmazonS3Exception e) {
++      if (e.getStatusCode() != 403) {
++        LOG.error("Unexpected status code: {}", e.getStatusCode(), e);
++        throw e;
++      }
++    }
++  }
++
++  static class GoodCredentialsProvider extends AWSCredentialsProviderChain {
++
++    @SuppressWarnings("unused")
++    public GoodCredentialsProvider(URI name, Configuration conf) {
++      super(new BasicAWSCredentialsProvider(conf.get(ACCESS_KEY),
++          conf.get(SECRET_KEY)), new InstanceProfileCredentialsProvider());
++    }
++  }
++
++  @Test
++  public void testGoodProvider() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set(AWS_CREDENTIALS_PROVIDER, GoodCredentialsProvider.class.getName());
++    S3ATestUtils.createTestFileSystem(conf);
++  }
++}
+-- 
+1.7.9.5
+

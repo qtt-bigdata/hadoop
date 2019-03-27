@@ -1,0 +1,938 @@
+From 42aac38d71d88cb70889815998c096b72619e659 Mon Sep 17 00:00:00 2001
+From: Kai Zheng <kai.zheng@intel.com>
+Date: Fri, 27 May 2016 17:16:32 +0800
+Subject: [PATCH 1786/2848] HADOOP-12782. Faster LDAP group name resolution
+ with ActiveDirectory. Contributed by Wei-Chiu
+ Chuang
+
+(cherry picked from commit 4c8ab5e1628c574345622f2f7edc1ef87590279a)
+
+Conflicts:
+hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+
+Change-Id: I5f445d93eb628a6659fffb4ec6c52252714eb14f
+---
+ .../apache/hadoop/security/LdapGroupsMapping.java  |  228 ++++++++++++++++----
+ .../src/main/resources/core-default.xml            |   12 ++
+ .../src/site/markdown/GroupsMapping.md             |  201 +++++++++++++++++
+ .../hadoop/security/TestLdapGroupsMapping.java     |   31 +--
+ .../hadoop/security/TestLdapGroupsMappingBase.java |   71 ++++--
+ .../TestLdapGroupsMappingWithOneQuery.java         |  100 +++++++++
+ .../TestLdapGroupsMappingWithPosixGroup.java       |   41 ++--
+ 7 files changed, 588 insertions(+), 96 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+ create mode 100644 hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithOneQuery.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+index f6793b3..4e6fa47 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+@@ -33,6 +33,8 @@
+ import javax.naming.directory.InitialDirContext;
+ import javax.naming.directory.SearchControls;
+ import javax.naming.directory.SearchResult;
++import javax.naming.ldap.LdapName;
++import javax.naming.ldap.Rdn;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -135,6 +137,13 @@
+   public static final String GROUP_SEARCH_FILTER_DEFAULT = "(objectClass=group)";
+ 
+   /*
++     * LDAP attribute to use for determining group membership
++     */
++  public static final String MEMBEROF_ATTR_KEY =
++      LDAP_CONFIG_PREFIX + ".search.attr.memberof";
++  public static final String MEMBEROF_ATTR_DEFAULT = "";
++
++  /*
+    * LDAP attribute to use for determining group membership
+    */
+   public static final String GROUP_MEMBERSHIP_ATTR_KEY = LDAP_CONFIG_PREFIX + ".search.attr.member";
+@@ -188,11 +197,13 @@
+   private String baseDN;
+   private String groupSearchFilter;
+   private String userSearchFilter;
++  private String memberOfAttr;
+   private String groupMemberAttr;
+   private String groupNameAttr;
+   private String posixUidAttr;
+   private String posixGidAttr;
+   private boolean isPosix;
++  private boolean useOneQuery;
+ 
+   public static final int RECONNECT_RETRY_COUNT = 3;
+   
+@@ -228,58 +239,173 @@
+     
+     return Collections.emptyList();
+   }
+-  
+-  List<String> doGetGroups(String user) throws NamingException {
+-    List<String> groups = new ArrayList<String>();
+ 
+-    DirContext ctx = getDirContext();
++  /**
++   * A helper method to get the Relative Distinguished Name (RDN) from
++   * Distinguished name (DN). According to Active Directory documentation,
++   * a group object's RDN is a CN.
++   *
++   * @param distinguishedName A string representing a distinguished name.
++   * @throws NamingException if the DN is malformed.
++   * @return a string which represents the RDN
++   */
++  private String getRelativeDistinguishedName(String distinguishedName)
++      throws NamingException {
++    LdapName ldn = new LdapName(distinguishedName);
++    List<Rdn> rdns = ldn.getRdns();
++    if (rdns.isEmpty()) {
++      throw new NamingException("DN is empty");
++    }
++    Rdn rdn = rdns.get(rdns.size()-1);
++    if (rdn.getType().equalsIgnoreCase(groupNameAttr)) {
++      String groupName = (String)rdn.getValue();
++      return groupName;
++    }
++    throw new NamingException("Unable to find RDN: The DN " +
++    distinguishedName + " is malformed.");
++  }
+ 
+-    // Search for the user. We'll only ever need to look at the first result
+-    NamingEnumeration<SearchResult> results = ctx.search(baseDN,
+-        userSearchFilter,
+-        new Object[]{user},
+-        SEARCH_CONTROLS);
+-    if (results.hasMoreElements()) {
+-      SearchResult result = results.nextElement();
+-      String userDn = result.getNameInNamespace();
++  /**
++   * Look up groups using posixGroups semantics. Use posix gid/uid to find
++   * groups of the user.
++   *
++   * @param result the result object returned from the prior user lookup.
++   * @param c the context object of the LDAP connection.
++   * @return an object representing the search result.
++   *
++   * @throws NamingException if the server does not support posixGroups
++   * semantics.
++   */
++  private NamingEnumeration<SearchResult> lookupPosixGroup(SearchResult result,
++      DirContext c) throws NamingException {
++    String gidNumber = null;
++    String uidNumber = null;
++    Attribute gidAttribute = result.getAttributes().get(posixGidAttr);
++    Attribute uidAttribute = result.getAttributes().get(posixUidAttr);
++    String reason = "";
++    if (gidAttribute == null) {
++      reason = "Can't find attribute '" + posixGidAttr + "'.";
++    } else {
++      gidNumber = gidAttribute.get().toString();
++    }
++    if (uidAttribute == null) {
++      reason = "Can't find attribute '" + posixUidAttr + "'.";
++    } else {
++      uidNumber = uidAttribute.get().toString();
++    }
++    if (uidNumber != null && gidNumber != null) {
++      return c.search(baseDN,
++              "(&"+ groupSearchFilter + "(|(" + posixGidAttr + "={0})" +
++                  "(" + groupMemberAttr + "={1})))",
++              new Object[] {gidNumber, uidNumber},
++              SEARCH_CONTROLS);
++    }
++    throw new NamingException("The server does not support posixGroups " +
++        "semantics. Reason: " + reason +
++        " Returned user object: " + result.toString());
++  }
+ 
+-      NamingEnumeration<SearchResult> groupResults = null;
++  /**
++   * Perform the second query to get the groups of the user.
++   *
++   * If posixGroups is enabled, use use posix gid/uid to find.
++   * Otherwise, use the general group member attribute to find it.
++   *
++   * @param result the result object returned from the prior user lookup.
++   * @param c the context object of the LDAP connection.
++   * @return a list of strings representing group names of the user.
++   * @throws NamingException if unable to find group names
++   */
++  private List<String> lookupGroup(SearchResult result, DirContext c)
++      throws NamingException {
++    List<String> groups = new ArrayList<String>();
+ 
+-      if (isPosix) {
+-        String gidNumber = null;
+-        String uidNumber = null;
+-        Attribute gidAttribute = result.getAttributes().get(posixGidAttr);
+-        Attribute uidAttribute = result.getAttributes().get(posixUidAttr);
+-        if (gidAttribute != null) {
+-          gidNumber = gidAttribute.get().toString();
+-        }
+-        if (uidAttribute != null) {
+-          uidNumber = uidAttribute.get().toString();
+-        }
+-        if (uidNumber != null && gidNumber != null) {
+-          groupResults =
+-              ctx.search(baseDN,
+-                  "(&"+ groupSearchFilter + "(|(" + posixGidAttr + "={0})" +
+-                      "(" + groupMemberAttr + "={1})))",
+-                  new Object[] { gidNumber, uidNumber },
+-                  SEARCH_CONTROLS);
++    NamingEnumeration<SearchResult> groupResults = null;
++    // perform the second LDAP query
++    if (isPosix) {
++      groupResults = lookupPosixGroup(result, c);
++    } else {
++      String userDn = result.getNameInNamespace();
++      groupResults =
++          c.search(baseDN,
++              "(&" + groupSearchFilter + "(" + groupMemberAttr + "={0}))",
++              new Object[]{userDn},
++              SEARCH_CONTROLS);
++    }
++    // if the second query is successful, group objects of the user will be
++    // returned. Get group names from the returned objects.
++    if (groupResults != null) {
++      while (groupResults.hasMoreElements()) {
++        SearchResult groupResult = groupResults.nextElement();
++        Attribute groupName = groupResult.getAttributes().get(groupNameAttr);
++        if (groupName == null) {
++          throw new NamingException("The group object does not have " +
++              "attribute '" + groupNameAttr + "'.");
+         }
+-      } else {
+-        groupResults =
+-            ctx.search(baseDN,
+-                "(&" + groupSearchFilter + "(" + groupMemberAttr + "={0}))",
+-                new Object[]{userDn},
+-                SEARCH_CONTROLS);
++        groups.add(groupName.get().toString());
+       }
+-      if (groupResults != null) {
+-        while (groupResults.hasMoreElements()) {
+-          SearchResult groupResult = groupResults.nextElement();
+-          Attribute groupName = groupResult.getAttributes().get(groupNameAttr);
+-          groups.add(groupName.get().toString());
+-        }
++    }
++    return groups;
++  }
++
++  /**
++   * Perform LDAP queries to get group names of a user.
++   *
++   * Perform the first LDAP query to get the user object using the user's name.
++   * If one-query is enabled, retrieve the group names from the user object.
++   * If one-query is disabled, or if it failed, perform the second query to
++   * get the groups.
++   *
++   * @param user user name
++   * @return a list of group names for the user. If the user can not be found,
++   * return an empty string array.
++   * @throws NamingException if unable to get group names
++   */
++  List<String> doGetGroups(String user) throws NamingException {
++    DirContext c = getDirContext();
++
++    // Search for the user. We'll only ever need to look at the first result
++    NamingEnumeration<SearchResult> results = c.search(baseDN,
++        userSearchFilter, new Object[]{user}, SEARCH_CONTROLS);
++    // return empty list if the user can not be found.
++    if (!results.hasMoreElements()) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("doGetGroups(" + user + ") return no groups because the " +
++            "user is not found.");
+       }
++      return new ArrayList<String>();
+     }
++    SearchResult result = results.nextElement();
+ 
++    List<String> groups = null;
++    if (useOneQuery) {
++      try {
++        /**
++         * For Active Directory servers, the user object has an attribute
++         * 'memberOf' that represents the DNs of group objects to which the
++         * user belongs. So the second query may be skipped.
++         */
++        Attribute groupDNAttr = result.getAttributes().get(memberOfAttr);
++        if (groupDNAttr == null) {
++          throw new NamingException("The user object does not have '" +
++              memberOfAttr + "' attribute." +
++              "Returned user object: " + result.toString());
++        }
++        groups = new ArrayList<String>();
++        NamingEnumeration groupEnumeration = groupDNAttr.getAll();
++        while (groupEnumeration.hasMore()) {
++          String groupDN = groupEnumeration.next().toString();
++          groups.add(getRelativeDistinguishedName(groupDN));
++        }
++      } catch (NamingException e) {
++        // If the first lookup failed, fall back to the typical scenario.
++        LOG.info("Failed to get groups from the first lookup. Initiating " +
++                "the second LDAP query using the user's DN.", e);
++      }
++    }
++    if (groups == null || groups.isEmpty()) {
++      groups = lookupGroup(result, c);
++    }
+     if (LOG.isDebugEnabled()) {
+       LOG.debug("doGetGroups(" + user + ") return " + groups);
+     }
+@@ -365,6 +491,11 @@ public synchronized void setConf(Configuration conf) {
+         conf.get(USER_SEARCH_FILTER_KEY, USER_SEARCH_FILTER_DEFAULT);
+     isPosix = groupSearchFilter.contains(POSIX_GROUP) && userSearchFilter
+         .contains(POSIX_ACCOUNT);
++    memberOfAttr =
++        conf.get(MEMBEROF_ATTR_KEY, MEMBEROF_ATTR_DEFAULT);
++    // if memberOf attribute is set, resolve group names from the attribute
++    // of user objects.
++    useOneQuery = !memberOfAttr.isEmpty();
+     groupMemberAttr =
+         conf.get(GROUP_MEMBERSHIP_ATTR_KEY, GROUP_MEMBERSHIP_ATTR_DEFAULT);
+     groupNameAttr =
+@@ -378,8 +509,15 @@ public synchronized void setConf(Configuration conf) {
+     SEARCH_CONTROLS.setTimeLimit(dirSearchTimeout);
+     // Limit the attributes returned to only those required to speed up the search.
+     // See HADOOP-10626 and HADOOP-12001 for more details.
+-    SEARCH_CONTROLS.setReturningAttributes(
+-        new String[] {groupNameAttr, posixUidAttr, posixGidAttr});
++    String[] returningAttributes;
++    if (useOneQuery) {
++      returningAttributes = new String[] {
++          groupNameAttr, posixUidAttr, posixGidAttr, memberOfAttr};
++    } else {
++      returningAttributes = new String[] {
++          groupNameAttr, posixUidAttr, posixGidAttr};
++    }
++    SEARCH_CONTROLS.setReturningAttributes(returningAttributes);
+ 
+     this.conf = conf;
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 516cd77..0a1998b 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -371,6 +371,18 @@ for ldap providers in the same way as above does.
+ </property>
+ 
+ <property>
++    <name>hadoop.security.group.mapping.ldap.search.attr.memberof</name>
++    <value></value>
++    <description>
++      The attribute of the user object that identifies its group objects. By
++      default, Hadoop makes two LDAP queries per user if this value is empty. If
++      set, Hadoop will attempt to resolve group names from this attribute,
++      instead of making the second LDAP query to get group objects. The value
++      should be 'memberOf' for an MS AD installation.
++    </description>
++</property>
++
++<property>
+   <name>hadoop.security.group.mapping.ldap.search.attr.member</name>
+   <value>member</value>
+   <description>
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md b/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+new file mode 100644
+index 0000000..b0508f8
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+@@ -0,0 +1,201 @@
++<!---
++  Licensed under the Apache License, Version 2.0 (the "License");
++  you may not use this file except in compliance with the License.
++  You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License. See accompanying LICENSE file.
++-->
++
++Hadoop Groups Mapping
++===================
++
++<!-- MACRO{toc|fromDepth=0|toDepth=3} -->
++
++Overview
++--------
++The groups of a user is determined by a group mapping service provider.
++Hadoop supports various group mapping mechanisms, configured by the `hadoop.security.group.mapping` property. Some of them, such as `JniBasedUnixGroupsMappingWithFallback`, use operating
++systems' group name resolution and requires no configuration. But Hadoop also supports special group mapping mechanisms through
++LDAP and composition of LDAP and operating system group name resolution, which require additional configurations.
++`hadoop.security.group.mapping` can be one of the following:
++
++*    **org.apache.hadoop.security.JniBasedUnixGroupsMappingWithFallback**
++
++     The default implementation. It will determine if the Java Native Interface (JNI) is available. If JNI is available, the implementation will use the API within hadoop to resolve a list of groups for a user. If JNI is not available then the shell-based implementation, `ShellBasedUnixGroupsMapping`, is used.
++
++*    **org.apache.hadoop.security.JniBasedUnixGroupsNetgroupMappingWithFallback**
++
++     Similar to `JniBasedUnixGroupsMappingWithFallback`. If JNI is available, it obtains netgroup membership using the Hadoop native API; otherwise uses `ShellBasedUnixGroupsNetgroupMapping`.
++
++*    **org.apache.hadoop.security.ShellBasedUnixGroupsMapping**
++
++     This implementation shells out with the `bash -c groups` command (for a Linux/Unix environment) or the `net group` command (for a Windows environment) to resolve a list of groups for a user.
++
++*    **org.apache.hadoop.security.ShellBasedUnixGroupsNetgroupMapping**
++
++     This implementation is similar to `ShellBasedUnixGroupsMapping`, except that it executes `getent netgroup` command to get netgroup membership.
++
++*    **org.apache.hadoop.security.LdapGroupsMapping**
++
++     An alternate implementation, which connects directly to an LDAP server to resolve the list of groups. However, this provider should only be used if the required groups reside exclusively in LDAP, and are not materialized on the Unix servers.
++     LdapGroupsMapping supports SSL connection and POSIX group semantics. See section [LDAP Groups Mapping](#LDAP_Groups_Mapping) for details.
++
++*    **org.apache.hadoop.security.CompositeGroupsMapping**
++
++     This implementation composites other group mapping providers for determining group membership. This allows to combine existing provider implementations and composite a virtually new provider without customized development to deal with complex situation. See section [Composite Groups Mapping](#Composite_Groups_Mapping) for details.
++
++For HDFS, the mapping of users to groups is performed on the NameNode. Thus, the host system configuration of the NameNode determines the group mappings for the users.
++
++Note that HDFS stores the user and group of a file or directory as strings; there is no conversion from user and group identity numbers as is conventional in Unix.
++
++Static Mapping
++--------
++It is possible to statically map users to groups by defining the mapping in `hadoop.user.group.static.mapping.overrides` in the format `user1=group1,group2;user2=;user3=group2`.
++This property overrides any group mapping service provider. If a user's groups are defined in it, the groups are returned without more lookups; otherwise, the service provider defined in `hadoop.security.group.mapping` is used to look up the groups. By default, `dr.who=;` is defined, so the fake user dr.who will not have any groups.
++
++Caching/Negative caching
++--------
++Since the group mapping resolution relies on external mechanisms, the NameNode performance may be impacted. To reduce the impact due to repeated lookups, Hadoop caches the groups returned by the service provider. The cache invalidate is configurable via `hadoop.security.groups.cache.secs`, and the default is 300 seconds.
++
++To avoid spamming NameNode with unknown users, Hadoop employs negative caching so that if the result of the lookup is empty, return an empty group directly instead of performing more group mapping queries,
++The cache invalidation is configurable via `hadoop.security.groups.negative-cache.secs`. The default is 30 seconds, so if group mapping service providers returns no group for a user, no lookup will be performed for the same user within 30 seconds.
++
++LDAP Groups Mapping
++--------
++This provider supports LDAP with simple password authentication using JNDI API.
++`hadoop.security.group.mapping.ldap.url` must be set. This refers to the URL of the LDAP server for resolving user groups.
++
++`hadoop.security.group.mapping.ldap.base` configures the search base for the LDAP connection. This is a distinguished name, and will typically be the root of the LDAP directory.
++
++If the LDAP server does not support anonymous binds,
++set the distinguished name of the user to bind in `hadoop.security.group.mapping.ldap.bind.user`.
++The path to the file containing the bind user's password is specified in `hadoop.security.group.mapping.ldap.bind.password.file`.
++This file should be readable only by the Unix user running the daemons.
++
++It is possible to set a maximum time limit when searching and awaiting a result.
++Set `hadoop.security.group.mapping.ldap.directory.search.timeout` to 0 if infinite wait period is desired. Default is 10,000 milliseconds (10 seconds).
++
++The implementation does not attempt to resolve group hierarchies. Therefore, a user must be an explicit member of a group object
++in order to be considered a member.
++
++
++### Active Directory ###
++The default configuration supports LDAP group name resolution with an Active Directory server.
++
++### POSIX Groups ###
++If the LDAP server supports POSIX group semantics (RFC-2307), Hadoop can perform LDAP group resolution queries to the server by setting both
++`hadoop.security.group.mapping.ldap.search.filter.user` to  `(&amp;(objectClass=posixAccount)(uid={0}))` and
++`hadoop.security.group.mapping.ldap.search.filter.group` to `(objectClass=posixGroup)`.
++
++### SSL ###
++To secure the connection, the implementation supports LDAP over SSL (LDAPS). SSL is enable by setting `hadoop.security.group.mapping.ldap.ssl` to `true`.
++In addition, specify the path to the keystore file for SSL connection in `hadoop.security.group.mapping.ldap.ssl.keystore` and keystore password in `hadoop.security.group.mapping.ldap.ssl.keystore.password`.
++Alternatively, store the keystore password in a file, and point `hadoop.security.group.mapping.ldap.ssl.keystore.password.file` to that file. For security purposes, this file should be readable only by the Unix user running the daemons.
++
++### Low latency group mapping resolution ###
++Typically, Hadoop resolves a user's group names by making two LDAP queries: the first query gets the user object, and the second query uses the user's Distinguished Name to find the groups.
++For some LDAP servers, such as Active Directory, the user object returned in the first query also contains the DN of the user's groups in its `memberOf` attribute, and the name of a group is its Relative Distinguished Name.
++Therefore, it is possible to infer the user's groups from the first query without sending the second one, and it may reduce group name resolution latency incurred by the second query. If it fails to get group names, it will fall back to the typical two-query scenario and send the second query to get group names.
++To enable this feature, set `hadoop.security.group.mapping.ldap.search.attr.memberof` to `memberOf`, and Hadoop will resolve group names using this attribute in the user object.
++
++Composite Groups Mapping
++--------
++`CompositeGroupsMapping` works by enumerating a list of service providers in `hadoop.security.group.mapping.providers`.
++It get groups from each of the providers in the list one after the other. If `hadoop.security.group.mapping.providers.combined` is `true`, merge the groups returned by all providers; otherwise, return the groups in the first successful provider.
++See the following section for a sample configuration.
++
++### Multiple group mapping providers configuration sample ###
++  This sample illustrates a typical use case for `CompositeGroupsMapping` where
++Hadoop authentication uses MIT Kerberos which trusts an AD realm. In this case, service
++principals such as hdfs, mapred, hbase, hive, oozie and etc can be placed in MIT Kerberos,
++but end users are just from the trusted AD. For the service principals, `ShellBasedUnixGroupsMapping`
++provider can be used to query their groups for efficiency, and for end users, `LdapGroupsMapping`
++provider can be used. This avoids to add group entries in AD for service principals when only using
++`LdapGroupsMapping` provider.
++  In case multiple ADs are involved and trusted by the MIT Kerberos, `LdapGroupsMapping`
++provider can be used multiple times with different AD specific configurations. This sample also shows how
++to do that. Here are the necessary configurations.
++
++```<property>
++  <name>hadoop.security.group.mapping</name>
++  <value>org.apache.hadoop.security.CompositeGroupsMapping</value>
++  <description>
++    Class for user to group mapping (get groups for a given user) for ACL, which
++    makes use of other multiple providers to provide the service.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.group.mapping.providers</name>
++  <value>shell4services,ad4usersX,ad4usersY</value>
++  <description>
++    Comma separated of names of other providers to provide user to group mapping.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.group.mapping.providers.combined</name>
++  <value>true</value>
++  <description>
++    true or false to indicate whether groups from the providers are combined or not. The default value is true
++    If true, then all the providers will be tried to get groups and all the groups are combined to return as
++    the final results. Otherwise, providers are tried one by one in the configured list order, and if any
++    groups are retrieved from any provider, then the groups will be returned without trying the left ones.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.group.mapping.provider.shell4services</name>
++  <value>org.apache.hadoop.security.ShellBasedUnixGroupsMapping</value>
++  <description>
++    Class for group mapping provider named by 'shell4services'. The name can then be referenced
++    by hadoop.security.group.mapping.providers property.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.group.mapping.provider.ad4usersX</name>
++  <value>org.apache.hadoop.security.LdapGroupsMapping</value>
++  <description>
++    Class for group mapping provider named by 'ad4usersX'. The name can then be referenced
++    by hadoop.security.group.mapping.providers property.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.group.mapping.provider.ad4usersY</name>
++  <value>org.apache.hadoop.security.LdapGroupsMapping</value>
++  <description>
++    Class for group mapping provider named by 'ad4usersY'. The name can then be referenced
++    by hadoop.security.group.mapping.providers property.
++  </description>
++</property>
++
++<property>
++<name>hadoop.security.group.mapping.provider.ad4usersX.ldap.url</name>
++<value>ldap://ad-host-for-users-X:389</value>
++  <description>
++    ldap url for the provider named by 'ad4usersX'. Note this property comes from
++    'hadoop.security.group.mapping.ldap.url'.
++  </description>
++</property>
++
++<property>
++<name>hadoop.security.group.mapping.provider.ad4usersY.ldap.url</name>
++<value>ldap://ad-host-for-users-Y:389</value>
++  <description>
++    ldap url for the provider named by 'ad4usersY'. Note this property comes from
++    'hadoop.security.group.mapping.ldap.url'.
++  </description>
++</property>
++```
++
++You also need to configure other properties like
++  hadoop.security.group.mapping.ldap.bind.password.file and etc.
++for ldap providers in the same way as above does.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+index ab038c2..42f6363 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+@@ -19,7 +19,11 @@
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+-import static org.mockito.Mockito.*;
++import static org.mockito.Matchers.any;
++import static org.mockito.Matchers.anyString;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
+ 
+ import java.io.File;
+ import java.io.FileWriter;
+@@ -31,7 +35,6 @@
+ import javax.naming.CommunicationException;
+ import javax.naming.NamingException;
+ import javax.naming.directory.SearchControls;
+-import javax.naming.directory.SearchResult;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
+@@ -46,18 +49,17 @@
+ public class TestLdapGroupsMapping extends TestLdapGroupsMappingBase {
+   @Before
+   public void setupMocks() throws NamingException {
+-    SearchResult mockUserResult = mock(SearchResult.class);
+-    when(mockUserNamingEnum.nextElement()).thenReturn(mockUserResult);
+-    when(mockUserResult.getNameInNamespace()).thenReturn("CN=some_user,DC=test,DC=com");
++    when(getUserSearchResult().getNameInNamespace()).
++        thenReturn("CN=some_user,DC=test,DC=com");
+   }
+   
+   @Test
+   public void testGetGroups() throws IOException, NamingException {
+     // The search functionality of the mock context is reused, so we will
+     // return the user NamingEnumeration first, and then the group
+-    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++    when(getContext().search(anyString(), anyString(), any(Object[].class),
+         any(SearchControls.class)))
+-        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
++        .thenReturn(getUserNames(), getGroupNames());
+     
+     doTestGetGroups(Arrays.asList(testGroups), 2);
+   }
+@@ -66,10 +68,10 @@ public void testGetGroups() throws IOException, NamingException {
+   public void testGetGroupsWithConnectionClosed() throws IOException, NamingException {
+     // The case mocks connection is closed/gc-ed, so the first search call throws CommunicationException,
+     // then after reconnected return the user NamingEnumeration first, and then the group
+-    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++    when(getContext().search(anyString(), anyString(), any(Object[].class),
+         any(SearchControls.class)))
+         .thenThrow(new CommunicationException("Connection is closed"))
+-        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
++        .thenReturn(getUserNames(), getGroupNames());
+     
+     // Although connection is down but after reconnected it still should retrieve the result groups
+     doTestGetGroups(Arrays.asList(testGroups), 1 + 2); // 1 is the first failure call 
+@@ -78,7 +80,7 @@ public void testGetGroupsWithConnectionClosed() throws IOException, NamingExcept
+   @Test
+   public void testGetGroupsWithLdapDown() throws IOException, NamingException {
+     // This mocks the case where Ldap server is down, and always throws CommunicationException 
+-    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++    when(getContext().search(anyString(), anyString(), any(Object[].class),
+         any(SearchControls.class)))
+         .thenThrow(new CommunicationException("Connection is closed"));
+     
+@@ -91,16 +93,17 @@ private void doTestGetGroups(List<String> expectedGroups, int searchTimes) throw
+     Configuration conf = new Configuration();
+     // Set this, so we don't throw an exception
+     conf.set(LdapGroupsMapping.LDAP_URL_KEY, "ldap://test");
+-    
+-    mappingSpy.setConf(conf);
++
++    LdapGroupsMapping groupsMapping = getGroupsMapping();
++    groupsMapping.setConf(conf);
+     // Username is arbitrary, since the spy is mocked to respond the same,
+     // regardless of input
+-    List<String> groups = mappingSpy.getGroups("some_user");
++    List<String> groups = groupsMapping.getGroups("some_user");
+     
+     Assert.assertEquals(expectedGroups, groups);
+     
+     // We should have searched for a user, and then two groups
+-    verify(mockContext, times(searchTimes)).search(anyString(),
++    verify(getContext(), times(searchTimes)).search(anyString(),
+                                          anyString(),
+                                          any(Object[].class),
+                                          any(SearchControls.class));
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingBase.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingBase.java
+index c54ac4c..75e3bf1 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingBase.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingBase.java
+@@ -20,7 +20,6 @@
+ 
+ import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.mock;
+-import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.when;
+ 
+ import javax.naming.NamingEnumeration;
+@@ -30,34 +29,49 @@
+ import javax.naming.directory.BasicAttribute;
+ import javax.naming.directory.BasicAttributes;
+ import javax.naming.directory.DirContext;
++import javax.naming.directory.SearchControls;
+ import javax.naming.directory.SearchResult;
+ 
+ import org.junit.Before;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.mockito.Spy;
+ 
+ public class TestLdapGroupsMappingBase {
+-  protected DirContext mockContext;
++  @Mock
++  private DirContext context;
++  @Mock
++  private NamingEnumeration<SearchResult> userNames;
++  @Mock
++  private NamingEnumeration<SearchResult> groupNames;
++  @Mock
++  private SearchResult userSearchResult;
++  @Mock
++  private Attributes attributes;
++  @Spy
++  private LdapGroupsMapping groupsMapping = new LdapGroupsMapping();
+ 
+-  protected LdapGroupsMapping mappingSpy = spy(new LdapGroupsMapping());
+-  protected NamingEnumeration mockUserNamingEnum =
+-      mock(NamingEnumeration.class);
+-  protected NamingEnumeration mockGroupNamingEnum =
+-      mock(NamingEnumeration.class);
+   protected String[] testGroups = new String[] {"group1", "group2"};
+ 
+   @Before
+   public void setupMocksBase() throws NamingException {
+-    mockContext = mock(DirContext.class);
+-    doReturn(mockContext).when(mappingSpy).getDirContext();
++    MockitoAnnotations.initMocks(this);
++    DirContext ctx = getContext();
++    doReturn(ctx).when(groupsMapping).getDirContext();
+ 
++    when(ctx.search(Mockito.anyString(), Mockito.anyString(),
++        Mockito.any(Object[].class), Mockito.any(SearchControls.class))).
++        thenReturn(userNames);
+     // We only ever call hasMoreElements once for the user NamingEnum, so
+     // we can just have one return value
+-    when(mockUserNamingEnum.hasMoreElements()).thenReturn(true);
++    when(userNames.hasMoreElements()).thenReturn(true);
+ 
+-    SearchResult mockGroupResult = mock(SearchResult.class);
++    SearchResult groupSearchResult = mock(SearchResult.class);
+     // We're going to have to define the loop here. We want two iterations,
+     // to get both the groups
+-    when(mockGroupNamingEnum.hasMoreElements()).thenReturn(true, true, false);
+-    when(mockGroupNamingEnum.nextElement()).thenReturn(mockGroupResult);
++    when(groupNames.hasMoreElements()).thenReturn(true, true, false);
++    when(groupNames.nextElement()).thenReturn(groupSearchResult);
+ 
+     // Define the attribute for the name of the first group
+     Attribute group1Attr = new BasicAttribute("cn");
+@@ -72,6 +86,35 @@ public void setupMocksBase() throws NamingException {
+     group2Attrs.put(group2Attr);
+ 
+     // This search result gets reused, so return group1, then group2
+-    when(mockGroupResult.getAttributes()).thenReturn(group1Attrs, group2Attrs);
++    when(groupSearchResult.getAttributes()).
++        thenReturn(group1Attrs, group2Attrs);
++
++    when(getUserNames().nextElement()).
++        thenReturn(getUserSearchResult());
++
++    when(getUserSearchResult().getAttributes()).thenReturn(getAttributes());
++  }
++
++  protected DirContext getContext() {
++    return context;
++  }
++  protected NamingEnumeration<SearchResult> getUserNames() {
++    return userNames;
++  }
++
++  protected NamingEnumeration<SearchResult> getGroupNames() {
++    return groupNames;
++  }
++
++  protected SearchResult getUserSearchResult() {
++    return userSearchResult;
++  }
++
++  protected Attributes getAttributes() {
++    return attributes;
++  }
++
++  protected LdapGroupsMapping getGroupsMapping() {
++    return groupsMapping;
+   }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithOneQuery.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithOneQuery.java
+new file mode 100644
+index 0000000..e5cd2b6
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithOneQuery.java
+@@ -0,0 +1,100 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.security;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.List;
++
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.Attribute;
++import javax.naming.directory.SearchControls;
++import javax.naming.directory.SearchResult;
++
++import org.apache.hadoop.conf.Configuration;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.mockito.Matchers.any;
++import static org.mockito.Matchers.anyString;
++import static org.mockito.Matchers.eq;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * Test LdapGroupsMapping with one-query lookup enabled.
++ * Mockito is used to simulate the LDAP server response.
++ */
++@SuppressWarnings("unchecked")
++public class TestLdapGroupsMappingWithOneQuery
++    extends TestLdapGroupsMappingBase {
++
++  @Before
++  public void setupMocks() throws NamingException {
++    Attribute groupDN = mock(Attribute.class);
++
++    NamingEnumeration<SearchResult> groupNames = getGroupNames();
++    doReturn(groupNames).when(groupDN).getAll();
++    String groupName1 = "CN=abc,DC=foo,DC=bar,DC=com";
++    String groupName2 = "CN=xyz,DC=foo,DC=bar,DC=com";
++    String groupName3 = "CN=sss,CN=foo,DC=bar,DC=com";
++    doReturn(groupName1).doReturn(groupName2).doReturn(groupName3).
++        when(groupNames).next();
++    when(groupNames.hasMore()).thenReturn(true).thenReturn(true).
++        thenReturn(true).thenReturn(false);
++
++    when(getAttributes().get(eq("memberOf"))).thenReturn(groupDN);
++  }
++
++  @Test
++  public void testGetGroups() throws IOException, NamingException {
++    // given a user whose ldap query returns a user object with three "memberOf"
++    // properties, return an array of strings representing its groups.
++    String[] testGroups = new String[] {"abc", "xyz", "sss"};
++    doTestGetGroups(Arrays.asList(testGroups));
++  }
++
++  private void doTestGetGroups(List<String> expectedGroups)
++      throws IOException, NamingException {
++    Configuration conf = new Configuration();
++    // Set this, so we don't throw an exception
++    conf.set(LdapGroupsMapping.LDAP_URL_KEY, "ldap://test");
++    // enable single-query lookup
++    conf.set(LdapGroupsMapping.MEMBEROF_ATTR_KEY, "memberOf");
++
++    LdapGroupsMapping groupsMapping = getGroupsMapping();
++    groupsMapping.setConf(conf);
++    // Username is arbitrary, since the spy is mocked to respond the same,
++    // regardless of input
++    List<String> groups = groupsMapping.getGroups("some_user");
++
++    Assert.assertEquals(expectedGroups, groups);
++
++    // We should have only made one query because single-query lookup is enabled
++    verify(getContext(), times(1)).search(anyString(),
++        anyString(),
++        any(Object[].class),
++        any(SearchControls.class));
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithPosixGroup.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithPosixGroup.java
+index 247f6c4..332eed4 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithPosixGroup.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMappingWithPosixGroup.java
+@@ -36,7 +36,6 @@
+ import javax.naming.directory.Attribute;
+ import javax.naming.directory.Attributes;
+ import javax.naming.directory.SearchControls;
+-import javax.naming.directory.SearchResult;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.junit.Assert;
+@@ -49,31 +48,26 @@
+ 
+   @Before
+   public void setupMocks() throws NamingException {
+-    SearchResult mockUserResult = mock(SearchResult.class);
+-    when(mockUserNamingEnum.nextElement()).thenReturn(mockUserResult);
+-
+-    Attribute mockUidNumberAttr = mock(Attribute.class);
+-    Attribute mockGidNumberAttr = mock(Attribute.class);
+-    Attribute mockUidAttr = mock(Attribute.class);
+-    Attributes mockAttrs = mock(Attributes.class);
+-
+-    when(mockUidAttr.get()).thenReturn("some_user");
+-    when(mockUidNumberAttr.get()).thenReturn("700");
+-    when(mockGidNumberAttr.get()).thenReturn("600");
+-    when(mockAttrs.get(eq("uid"))).thenReturn(mockUidAttr);
+-    when(mockAttrs.get(eq("uidNumber"))).thenReturn(mockUidNumberAttr);
+-    when(mockAttrs.get(eq("gidNumber"))).thenReturn(mockGidNumberAttr);
+-
+-    when(mockUserResult.getAttributes()).thenReturn(mockAttrs);
++    Attribute uidNumberAttr = mock(Attribute.class);
++    Attribute gidNumberAttr = mock(Attribute.class);
++    Attribute uidAttr = mock(Attribute.class);
++    Attributes attributes = getAttributes();
++
++    when(uidAttr.get()).thenReturn("some_user");
++    when(uidNumberAttr.get()).thenReturn("700");
++    when(gidNumberAttr.get()).thenReturn("600");
++    when(attributes.get(eq("uid"))).thenReturn(uidAttr);
++    when(attributes.get(eq("uidNumber"))).thenReturn(uidNumberAttr);
++    when(attributes.get(eq("gidNumber"))).thenReturn(gidNumberAttr);
+   }
+ 
+   @Test
+   public void testGetGroups() throws IOException, NamingException {
+     // The search functionality of the mock context is reused, so we will
+     // return the user NamingEnumeration first, and then the group
+-    when(mockContext.search(anyString(), contains("posix"),
++    when(getContext().search(anyString(), contains("posix"),
+         any(Object[].class), any(SearchControls.class)))
+-        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
++        .thenReturn(getUserNames(), getGroupNames());
+ 
+     doTestGetGroups(Arrays.asList(testGroups), 2);
+   }
+@@ -92,19 +86,20 @@ private void doTestGetGroups(List<String> expectedGroups, int searchTimes)
+     conf.set(LdapGroupsMapping.POSIX_GID_ATTR_KEY, "gidNumber");
+     conf.set(LdapGroupsMapping.GROUP_NAME_ATTR_KEY, "cn");
+ 
+-    mappingSpy.setConf(conf);
++    LdapGroupsMapping groupsMapping = getGroupsMapping();
++    groupsMapping.setConf(conf);
+     // Username is arbitrary, since the spy is mocked to respond the same,
+     // regardless of input
+-    List<String> groups = mappingSpy.getGroups("some_user");
++    List<String> groups = groupsMapping.getGroups("some_user");
+ 
+     Assert.assertEquals(expectedGroups, groups);
+ 
+-    mappingSpy.getConf().set(LdapGroupsMapping.POSIX_UID_ATTR_KEY, "uid");
++    groupsMapping.getConf().set(LdapGroupsMapping.POSIX_UID_ATTR_KEY, "uid");
+ 
+     Assert.assertEquals(expectedGroups, groups);
+ 
+     // We should have searched for a user, and then two groups
+-    verify(mockContext, times(searchTimes)).search(anyString(),
++    verify(getContext(), times(searchTimes)).search(anyString(),
+         anyString(),
+         any(Object[].class),
+         any(SearchControls.class));
+-- 
+1.7.9.5
+

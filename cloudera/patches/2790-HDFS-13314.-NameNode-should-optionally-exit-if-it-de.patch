@@ -1,0 +1,304 @@
+From 0060fa9089d4190a0382ce187c16b3cabcd7cb84 Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Wed, 28 Mar 2018 11:37:34 -0700
+Subject: [PATCH 2790/2848] HDFS-13314. NameNode should optionally exit if it
+ detects FsImage corruption. Contributed by Arpit
+ Agarwal. (cherry picked from commit
+ f71128f056f5721596436659655a371022417327)
+
+(cherry picked from commit 2b6079a53e067e94a02272fb44a49e07dd9ecdce)
+
+Change-Id: I8f6ea265b33748d1973bc76c35b72114589199fc
+---
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   29 +++++++++--
+ .../server/namenode/FSImageFormatProtobuf.java     |   31 ++++++++---
+ .../namenode/snapshot/FSImageFormatPBSnapshot.java |   55 ++++++++++++++++++--
+ 3 files changed, 101 insertions(+), 14 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 1fc218d..905777a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -34,6 +34,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -67,6 +68,7 @@
+ import org.apache.hadoop.hdfs.util.Canceler;
+ import org.apache.hadoop.hdfs.util.MD5FileUtils;
+ import org.apache.hadoop.io.MD5Hash;
++import org.apache.hadoop.util.ExitUtil;
+ import org.apache.hadoop.util.Time;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -86,6 +88,10 @@
+   protected FSEditLog editLog = null;
+   private boolean isUpgradeFinalized = false;
+ 
++  // If true, then image corruption was detected. The NameNode process will
++  // exit immediately after saving the image.
++  private AtomicBoolean exitAfterSave = new AtomicBoolean(false);
++
+   protected NNStorage storage;
+   
+   /**
+@@ -969,8 +975,14 @@ void saveFSImage(SaveNamespaceContext context, StorageDirectory sd,
+     
+     FSImageFormatProtobuf.Saver saver = new FSImageFormatProtobuf.Saver(context);
+     FSImageCompression compression = FSImageCompression.createCompression(conf);
+-    saver.save(newFile, compression);
+-    
++    long numErrors = saver.save(newFile, compression);
++    if (numErrors > 0) {
++      // The image is likely corrupted.
++      LOG.error("Detected " + numErrors + " errors while saving FsImage " +
++          dstFile);
++      exitAfterSave.set(true);
++    }
++
+     MD5FileUtils.saveMD5File(dstFile, saver.getSavedDigest());
+     storage.setMostRecentCheckpointInfo(txid, Time.now());
+   }
+@@ -1105,6 +1117,12 @@ public synchronized void saveNamespace(FSNamesystem source, NameNodeFile nnf,
+     }
+     //Update NameDirSize Metric
+     getStorage().updateNameDirSize();
++
++    if (exitAfterSave.get()) {
++      LOG.fatal("NameNode process will exit now... The saved FsImage " +
++          nnf + " is potentially corrupted.");
++      ExitUtil.terminate(-1);
++    }
+   }
+ 
+   /**
+@@ -1172,8 +1190,11 @@ private synchronized void saveFSImageInAllDirs(FSNamesystem source,
+   
+       // Since we now have a new checkpoint, we can clean up some
+       // old edit logs and checkpoints.
+-      purgeOldStorage(nnf);
+-      archivalManager.purgeCheckpoints(NameNodeFile.IMAGE_NEW);
++      // Do not purge anything if we just wrote a corrupted FsImage.
++      if (!exitAfterSave.get()) {
++        purgeOldStorage(nnf);
++        archivalManager.purgeCheckpoints(NameNodeFile.IMAGE_NEW);
++      }
+     } finally {
+       // Notify any threads waiting on the checkpoint to be canceled
+       // that it is complete.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatProtobuf.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatProtobuf.java
+index 58aac79..0074719 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatProtobuf.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatProtobuf.java
+@@ -418,15 +418,22 @@ private void flushSectionOutputStream() throws IOException {
+       sectionOutputStream.flush();
+     }
+ 
+-    void save(File file, FSImageCompression compression) throws IOException {
++    /**
++     * @return number of non-fatal errors detected while writing the image.
++     * @throws IOException on fatal error.
++     */
++    long save(File file, FSImageCompression compression) throws IOException {
+       FileOutputStream fout = new FileOutputStream(file);
+       fileChannel = fout.getChannel();
+       try {
+         LOG.info("Saving image file {} using {}", file, compression);
+         long startTime = monotonicNow();
+-        saveInternal(fout, compression, file.getAbsolutePath());
+-        LOG.info("Image file {} of size {} bytes saved in {} seconds.", file,
+-            file.length(), (monotonicNow() - startTime) / 1000);
++        long numErrors = saveInternal(
++            fout, compression, file.getAbsolutePath());
++        LOG.info("Image file {} of size {} bytes saved in {} seconds {}.", file,
++            file.length(), (monotonicNow() - startTime) / 1000,
++            (numErrors > 0 ? (" with" + numErrors + " errors") : ""));
++        return numErrors;
+       } finally {
+         fout.close();
+       }
+@@ -450,7 +457,11 @@ private void saveInodes(FileSummary.Builder summary) throws IOException {
+       saver.serializeFilesUCSection(sectionOutputStream);
+     }
+ 
+-    private void saveSnapshots(FileSummary.Builder summary) throws IOException {
++    /**
++     * @return number of non-fatal errors detected while saving the image.
++     * @throws IOException on fatal error.
++     */
++    private long saveSnapshots(FileSummary.Builder summary) throws IOException {
+       FSImageFormatPBSnapshot.Saver snapshotSaver = new FSImageFormatPBSnapshot.Saver(
+           this, summary, context, context.getSourceNamesystem());
+ 
+@@ -461,9 +472,14 @@ private void saveSnapshots(FileSummary.Builder summary) throws IOException {
+         snapshotSaver.serializeSnapshotDiffSection(sectionOutputStream);
+       }
+       snapshotSaver.serializeINodeReferenceSection(sectionOutputStream);
++      return snapshotSaver.getNumImageErrors();
+     }
+ 
+-    private void saveInternal(FileOutputStream fout,
++    /**
++     * @return number of non-fatal errors detected while writing the FsImage.
++     * @throws IOException on fatal error.
++     */
++    private long saveInternal(FileOutputStream fout,
+         FSImageCompression compression, String filePath) throws IOException {
+       StartupProgress prog = NameNode.getStartupProgress();
+       MessageDigest digester = MD5Hash.getDigester();
+@@ -495,7 +511,7 @@ private void saveInternal(FileOutputStream fout,
+       Step step = new Step(StepType.INODES, filePath);
+       prog.beginStep(Phase.SAVING_CHECKPOINT, step);
+       saveInodes(b);
+-      saveSnapshots(b);
++      long numErrors = saveSnapshots(b);
+       prog.endStep(Phase.SAVING_CHECKPOINT, step);
+ 
+       step = new Step(StepType.DELEGATION_TOKENS, filePath);
+@@ -518,6 +534,7 @@ private void saveInternal(FileOutputStream fout,
+       saveFileSummary(underlyingOutputStream, summary);
+       underlyingOutputStream.close();
+       savedDigest = new MD5Hash(digester.digest());
++      return numErrors;
+     }
+ 
+     private void saveSecretManagerSection(FileSummary.Builder summary)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
+index 9de9c6d..10b5ec2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
+@@ -1,4 +1,4 @@
+-/**
++ /**
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -27,6 +27,7 @@
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashMap;
+@@ -39,6 +40,7 @@
+ import org.apache.hadoop.hdfs.server.namenode.AclEntryStatusFormat;
+ import org.apache.hadoop.hdfs.server.namenode.AclFeature;
+ import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
++import org.apache.hadoop.hdfs.server.namenode.FSImage;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageFormatPBINode;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageFormatProtobuf;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageFormatProtobuf.LoaderContext;
+@@ -356,6 +358,7 @@ private void loadDirectoryDiffList(InputStream in, INodeDirectory dir,
+     private final FileSummary.Builder headers;
+     private final FSImageFormatProtobuf.Saver parent;
+     private final SaveNamespaceContext context;
++    private long numImageErrors;
+ 
+     public Saver(FSImageFormatProtobuf.Saver parent,
+         FileSummary.Builder headers, SaveNamespaceContext context,
+@@ -364,6 +367,7 @@ public Saver(FSImageFormatProtobuf.Saver parent,
+       this.headers = headers;
+       this.context = context;
+       this.fsn = fsn;
++      this.numImageErrors = 0;
+     }
+ 
+     /**
+@@ -412,15 +416,17 @@ public void serializeINodeReferenceSection(OutputStream out)
+         throws IOException {
+       final List<INodeReference> refList = parent.getSaverContext()
+           .getRefList();
++      long i = 0;
+       for (INodeReference ref : refList) {
+-        INodeReferenceSection.INodeReference.Builder rb = buildINodeReference(ref);
++        INodeReferenceSection.INodeReference.Builder rb =
++            buildINodeReference(ref, i++);
+         rb.build().writeDelimitedTo(out);
+       }
+       parent.commitSection(headers, SectionName.INODE_REFERENCE);
+     }
+ 
+     private INodeReferenceSection.INodeReference.Builder buildINodeReference(
+-        INodeReference ref) throws IOException {
++        final INodeReference ref, final long refIndex) throws IOException {
+       INodeReferenceSection.INodeReference.Builder rb =
+           INodeReferenceSection.INodeReference.newBuilder().
+             setReferredId(ref.getId());
+@@ -430,6 +436,16 @@ public void serializeINodeReferenceSection(OutputStream out)
+       } else if (ref instanceof DstReference) {
+         rb.setDstSnapshotId(ref.getDstSnapshotId());
+       }
++
++      if (fsn.getFSDirectory().getInode(ref.getId()) == null) {
++        FSImage.LOG.error(
++            "FSImageFormatPBSnapshot: Missing referred INodeId " +
++            ref.getId() + " for INodeReference index " + refIndex +
++            "; path=" + ref.getFullPathName() +
++            "; parent=" + (ref.getParent() == null ? "null" :
++                ref.getParent().getFullPathName()));
++        ++numImageErrors;
++      }
+       return rb;
+     }
+ 
+@@ -520,7 +536,23 @@ private void serializeDirDiffList(INodeDirectory dir,
+               .getList(ListType.CREATED);
+           db.setCreatedListSize(created.size());
+           List<INode> deleted = diff.getChildrenDiff().getList(ListType.DELETED);
++          INode previousNode = null;
++          boolean misordered = false;
+           for (INode d : deleted) {
++            // getBytes() may return null below, and that is okay.
++            final int result = previousNode == null ? -1 :
++                previousNode.compareTo(d.getLocalNameBytes());
++            if (result == 0) {
++              FSImage.LOG.error(
++                  "Name '" + d.getLocalName() + "' is repeated in the " +
++                      "'deleted' difflist of directory " +
++                      dir.getFullPathName() + ", INodeId=" + dir.getId());
++              ++numImageErrors;
++            } else if (result > 0 && !misordered) {
++              misordered = true;
++              ++numImageErrors;
++            }
++            previousNode = d;
+             if (d.isReference()) {
+               refList.add(d.asReference());
+               db.addDeletedINodeRef(refList.size() - 1);
+@@ -528,11 +560,28 @@ private void serializeDirDiffList(INodeDirectory dir,
+               db.addDeletedINode(d.getId());
+             }
+           }
++          if (misordered) {
++            FSImage.LOG.error(
++                "Misordered entries in the 'deleted' difflist of directory " +
++                    dir.getFullPathName() + ", INodeId=" + dir.getId() +
++                    ". The full list is " +
++                    Arrays.toString(deleted.toArray()));
++          }
+           db.build().writeDelimitedTo(out);
+           saveCreatedList(created, out);
+         }
+       }
+     }
++
++
++    /**
++     * Number of non-fatal errors detected while writing the
++     * SnapshotDiff and INodeReference sections.
++     * @return the number of non-fatal errors detected.
++     */
++    public long getNumImageErrors() {
++      return numImageErrors;
++    }
+   }
+ 
+   private FSImageFormatPBSnapshot(){}
+-- 
+1.7.9.5
+

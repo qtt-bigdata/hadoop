@@ -1,0 +1,178 @@
+From cf9e757cec0551775af8350dc95c8978b5115ce9 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Thu, 29 Sep 2016 15:50:50 +0000
+Subject: [PATCH 1914/2848] MAPREDUCE-6771. RMContainerAllocator sends
+ container diagnostics event after corresponding
+ completion event. Contributed by Haibo Chen
+
+(cherry picked from commit c52ad9ee86f5033caca02a7af6aeccfc5c87a99e)
+
+Change-Id: Ic0642e99cc605ef28d064dd06186f302b71d2de0
+---
+ .../mapreduce/v2/app/rm/RMContainerAllocator.java  |   47 ++++++++++++--------
+ .../v2/app/rm/TestRMContainerAllocator.java        |   45 +++++++++++++++++++
+ 2 files changed, 74 insertions(+), 18 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+index 261c67b..11ca5fa 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+@@ -140,7 +140,7 @@ added to the pending and are ramped up (added to scheduled) based
+     new LinkedList<ContainerRequest>();
+ 
+   //holds information about the assigned containers to task attempts
+-  private final AssignedRequests assignedRequests = new AssignedRequests();
++  private final AssignedRequests assignedRequests;
+   
+   //holds scheduled requests to be fulfilled by RM
+   private final ScheduledRequests scheduledRequests = new ScheduledRequests();
+@@ -182,6 +182,11 @@ public RMContainerAllocator(ClientService clientService, AppContext context) {
+     super(clientService, context);
+     this.stopped = new AtomicBoolean(false);
+     this.clock = context.getClock();
++    this.assignedRequests = createAssignedRequests();
++  }
++
++  protected AssignedRequests createAssignedRequests() {
++    return new AssignedRequests();
+   }
+ 
+   @Override
+@@ -776,27 +781,33 @@ public void rampDownReduces(int rampDown) {
+     handleUpdatedNodes(response);
+ 
+     for (ContainerStatus cont : finishedContainers) {
+-      LOG.info("Received completed container " + cont.getContainerId());
+-      TaskAttemptId attemptID = assignedRequests.get(cont.getContainerId());
+-      if (attemptID == null) {
+-        LOG.error("Container complete event for unknown container id "
+-            + cont.getContainerId());
+-      } else {
+-        pendingRelease.remove(cont.getContainerId());
+-        assignedRequests.remove(attemptID);
+-        
+-        // send the container completed event to Task attempt
+-        eventHandler.handle(createContainerFinishedEvent(cont, attemptID));
+-        
+-        // Send the diagnostics
+-        String diagnostics = StringInterner.weakIntern(cont.getDiagnostics());
+-        eventHandler.handle(new TaskAttemptDiagnosticsUpdateEvent(attemptID,
+-            diagnostics));
+-      }      
++      processFinishedContainer(cont);
+     }
+     return newContainers;
+   }
+ 
++  @SuppressWarnings("unchecked")
++  @VisibleForTesting
++  void processFinishedContainer(ContainerStatus container) {
++    LOG.info("Received completed container " + container.getContainerId());
++    TaskAttemptId attemptID = assignedRequests.get(container.getContainerId());
++    if (attemptID == null) {
++      LOG.error("Container complete event for unknown container "
++          + container.getContainerId());
++    } else {
++      pendingRelease.remove(container.getContainerId());
++      assignedRequests.remove(attemptID);
++
++      // Send the diagnostics
++      String diagnostic = StringInterner.weakIntern(container.getDiagnostics());
++      eventHandler.handle(new TaskAttemptDiagnosticsUpdateEvent(attemptID,
++          diagnostic));
++
++      // send the container completed event to Task attempt
++      eventHandler.handle(createContainerFinishedEvent(container, attemptID));
++    }
++  }
++
+   private void applyConcurrentTaskLimits() {
+     int numScheduledMaps = scheduledRequests.maps.size();
+     if (maxRunningMaps > 0 && numScheduledMaps > 0) {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
+index 6cab037..dc1eb4c 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
+@@ -24,6 +24,7 @@
+ import static org.mockito.Matchers.isA;
+ import static org.mockito.Mockito.doCallRealMethod;
+ import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.inOrder;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.times;
+@@ -59,6 +60,7 @@
+ import org.apache.hadoop.mapreduce.v2.app.AppContext;
+ import org.apache.hadoop.mapreduce.v2.app.ClusterInfo;
+ import org.apache.hadoop.mapreduce.v2.app.MRApp;
++import org.apache.hadoop.mapreduce.v2.app.MRAppMaster;
+ import org.apache.hadoop.mapreduce.v2.app.client.ClientService;
+ import org.apache.hadoop.mapreduce.v2.app.job.Job;
+ import org.apache.hadoop.mapreduce.v2.app.job.JobStateInternal;
+@@ -69,6 +71,7 @@
+ import org.apache.hadoop.mapreduce.v2.app.job.event.JobEventType;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.JobUpdatedNodesEvent;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptContainerAssignedEvent;
++import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptDiagnosticsUpdateEvent;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEvent;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEventType;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptKillEvent;
+@@ -140,6 +143,7 @@
+ import org.junit.Test;
+ 
+ import com.google.common.base.Supplier;
++import org.mockito.InOrder;
+ 
+ @SuppressWarnings("unchecked")
+ public class TestRMContainerAllocator {
+@@ -2810,6 +2814,47 @@ public void testUpdateAskOnRampDownAllReduces() throws Exception {
+     }
+   }
+ 
++  /**
++   * MAPREDUCE-6771. Test if RMContainerAllocator generates the events in the
++   * right order while processing finished containers.
++   */
++  @Test
++  public void testHandlingFinishedContainers() {
++    EventHandler eventHandler = mock(EventHandler.class);
++
++    AppContext context = mock(MRAppMaster.RunningAppContext.class);
++    when(context.getClock()).thenReturn(new ControlledClock());
++    when(context.getClusterInfo()).thenReturn(
++        new ClusterInfo(Resource.newInstance(10240, 1)));
++    when(context.getEventHandler()).thenReturn(eventHandler);
++    RMContainerAllocator containerAllocator =
++        new RMContainerAllocatorForFinishedContainer(null, context);
++
++    ContainerStatus finishedContainer = ContainerStatus.newInstance(
++        mock(ContainerId.class), ContainerState.COMPLETE, "", 0);
++    containerAllocator.processFinishedContainer(finishedContainer);
++
++    InOrder inOrder = inOrder(eventHandler);
++    inOrder.verify(eventHandler).handle(
++        isA(TaskAttemptDiagnosticsUpdateEvent.class));
++    inOrder.verify(eventHandler).handle(isA(TaskAttemptEvent.class));
++    inOrder.verifyNoMoreInteractions();
++  }
++
++  private static class RMContainerAllocatorForFinishedContainer
++      extends RMContainerAllocator {
++    public RMContainerAllocatorForFinishedContainer(ClientService clientService,
++        AppContext context) {
++      super(clientService, context);
++    }
++    @Override
++    protected AssignedRequests createAssignedRequests() {
++      AssignedRequests assignedReqs = mock(AssignedRequests.class);
++      TaskAttemptId taskAttempt = mock(TaskAttemptId.class);
++      when(assignedReqs.get(any(ContainerId.class))).thenReturn(taskAttempt);
++      return assignedReqs;
++    }
++  }
+ 
+   @Test
+   public void testAvoidAskMoreReducersWhenReducerPreemptionIsRequired()
+-- 
+1.7.9.5
+

@@ -1,0 +1,275 @@
+From cdfe7c60326e989b024b9fa2706eece0721505a4 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Wed, 30 Sep 2015 16:12:09 +0000
+Subject: [PATCH 1123/2848] YARN-3727. For better error recovery, check if the
+ directory exists before using it for
+ localization. Contributed by Zhihai Xu (cherry
+ picked from commit
+ 854d25b0c30fd40f640c052e79a8747741492042)
+
+Conflicts:
+
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+(cherry picked from commit 493f07200837969d6e4d6af2cccc732e60f119ba)
+
+Conflicts:
+
+	hadoop-yarn-project/CHANGES.txt
+
+(cherry picked from commit 49335d9b2b915194ac09daadec740ed3bc86a351)
+
+Change-Id: I79424958fc47a2c02a64c1af7349a2a93648448d
+---
+ .../localizer/LocalResourcesTracker.java           |    3 +-
+ .../localizer/LocalResourcesTrackerImpl.java       |   24 ++++++--
+ .../localizer/ResourceLocalizationService.java     |    5 +-
+ .../localizer/TestLocalResourcesTrackerImpl.java   |   59 ++++++++++++++++++--
+ .../localizer/TestResourceLocalizationService.java |   16 +++---
+ 5 files changed, 87 insertions(+), 20 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTracker.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTracker.java
+index 14ec911..56e3de5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTracker.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTracker.java
+@@ -33,7 +33,8 @@
+ 
+   boolean remove(LocalizedResource req, DeletionService delService);
+ 
+-  Path getPathForLocalization(LocalResourceRequest req, Path localDirPath);
++  Path getPathForLocalization(LocalResourceRequest req, Path localDirPath,
++      DeletionService delService);
+ 
+   String getUser();
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
+index fb0b6a1..f9346d8 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
+@@ -402,10 +402,12 @@ public String getUser() {
+    * @param {@link LocalResourceRequest} Resource localization request to
+    *        localize the resource.
+    * @param {@link Path} local directory path
++   * @param {@link DeletionService} Deletion Service to delete existing
++   *        path for localization.
+    */
+   @Override
+-  public Path
+-      getPathForLocalization(LocalResourceRequest req, Path localDirPath) {
++  public Path getPathForLocalization(LocalResourceRequest req,
++      Path localDirPath, DeletionService delService) {
+     Path rPath = localDirPath;
+     if (useLocalCacheDirectoryManager && localDirPath != null) {
+ 
+@@ -425,8 +427,22 @@ public String getUser() {
+       inProgressLocalResourcesMap.put(req, rPath);
+     }
+ 
+-    rPath = new Path(rPath,
+-        Long.toString(uniqueNumberGenerator.incrementAndGet()));
++    while (true) {
++      Path uniquePath = new Path(rPath,
++          Long.toString(uniqueNumberGenerator.incrementAndGet()));
++      File file = new File(uniquePath.toUri().getRawPath());
++      if (!file.exists()) {
++        rPath = uniquePath;
++        break;
++      }
++      // If the directory already exists, delete it and move to next one.
++      LOG.warn("Directory " + uniquePath + " already exists, " +
++          "try next one.");
++      if (delService != null) {
++        delService.delete(getUser(), uniquePath);
++      }
++    }
++
+     Path localPath = new Path(rPath, req.getPath().getName());
+     LocalizedResource rsrc = localrsrc.get(req);
+     rsrc.setLocalPath(localPath);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ResourceLocalizationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ResourceLocalizationService.java
+index 5b6f1cc..4070fcc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ResourceLocalizationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ResourceLocalizationService.java
+@@ -826,7 +826,8 @@ public void addResource(LocalizerResourceRequestEvent request) {
+                     + ContainerLocalizer.FILECACHE,
+                   ContainerLocalizer.getEstimatedSize(resource), true);
+             Path publicDirDestPath =
+-                publicRsrc.getPathForLocalization(key, publicRootPath);
++                publicRsrc.getPathForLocalization(key, publicRootPath,
++                    delService);
+             if (!publicDirDestPath.getParent().equals(publicRootPath)) {
+               DiskChecker.checkDir(new File(publicDirDestPath.toUri().getPath()));
+             }
+@@ -1108,7 +1109,7 @@ private Path getPathForLocalization(LocalResource rsrc) throws IOException,
+           dirsHandler.getLocalPathForWrite(cacheDirectory,
+             ContainerLocalizer.getEstimatedSize(rsrc), false);
+       return tracker.getPathForLocalization(new LocalResourceRequest(rsrc),
+-          dirPath);
++          dirPath, delService);
+     }
+ 
+     @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+index c6922a1..e59a796 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+@@ -34,6 +34,7 @@
+ import org.junit.Assert;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+@@ -423,7 +424,7 @@ public void testHierarchicalLocalCacheDirectories() {
+       // Simulate the process of localization of lr1
+       // NOTE: Localization path from tracker has resource ID at end
+       Path hierarchicalPath1 =
+-          tracker.getPathForLocalization(lr1, localDir).getParent();
++          tracker.getPathForLocalization(lr1, localDir, null).getParent();
+       // Simulate lr1 getting localized
+       ResourceLocalizedEvent rle1 =
+           new ResourceLocalizedEvent(lr1,
+@@ -440,7 +441,7 @@ public void testHierarchicalLocalCacheDirectories() {
+       tracker.handle(reqEvent2);
+ 
+       Path hierarchicalPath2 =
+-          tracker.getPathForLocalization(lr2, localDir).getParent();
++          tracker.getPathForLocalization(lr2, localDir, null).getParent();
+       // localization failed.
+       ResourceFailedLocalizationEvent rfe2 =
+           new ResourceFailedLocalizationEvent(
+@@ -459,7 +460,7 @@ public void testHierarchicalLocalCacheDirectories() {
+           LocalResourceVisibility.PUBLIC, lc1);
+       tracker.handle(reqEvent3);
+       Path hierarchicalPath3 =
+-          tracker.getPathForLocalization(lr3, localDir).getParent();
++          tracker.getPathForLocalization(lr3, localDir, null).getParent();
+       // localization successful
+       ResourceLocalizedEvent rle3 =
+           new ResourceLocalizedEvent(lr3, new Path(hierarchicalPath3.toUri()
+@@ -538,7 +539,8 @@ public void testStateStoreSuccessfulLocalization() throws Exception {
+       dispatcher.await();
+ 
+       // Simulate the process of localization of lr1
+-      Path hierarchicalPath1 = tracker.getPathForLocalization(lr1, localDir);
++      Path hierarchicalPath1 = tracker.getPathForLocalization(lr1, localDir,
++          null);
+ 
+       ArgumentCaptor<LocalResourceProto> localResourceCaptor =
+           ArgumentCaptor.forClass(LocalResourceProto.class);
+@@ -618,7 +620,8 @@ public void testStateStoreFailedLocalization() throws Exception {
+       dispatcher.await();
+ 
+       // Simulate the process of localization of lr1
+-      Path hierarchicalPath1 = tracker.getPathForLocalization(lr1, localDir);
++      Path hierarchicalPath1 = tracker.getPathForLocalization(lr1, localDir,
++          null);
+ 
+       ArgumentCaptor<LocalResourceProto> localResourceCaptor =
+           ArgumentCaptor.forClass(LocalResourceProto.class);
+@@ -687,7 +690,8 @@ public void testRecoveredResource() throws Exception {
+           LocalResourceVisibility.APPLICATION, lc2);
+       tracker.handle(reqEvent2);
+       dispatcher.await();
+-      Path hierarchicalPath2 = tracker.getPathForLocalization(lr2, localDir);
++      Path hierarchicalPath2 = tracker.getPathForLocalization(lr2, localDir,
++          null);
+       long localizedId2 = Long.parseLong(hierarchicalPath2.getName());
+       Assert.assertEquals(localizedId1 + 1, localizedId2);
+     } finally {
+@@ -781,6 +785,49 @@ public void testRecoveredResourceWithDirCacheMgr() throws Exception {
+     }
+   }
+ 
++  @Test
++  @SuppressWarnings("unchecked")
++  public void testGetPathForLocalization() throws Exception {
++    FileContext lfs = FileContext.getLocalFSFileContext();
++    Path base_path = new Path("target",
++        TestLocalResourcesTrackerImpl.class.getSimpleName());
++    final String user = "someuser";
++    final ApplicationId appId = ApplicationId.newInstance(1, 1);
++    Configuration conf = new YarnConfiguration();
++    DrainDispatcher dispatcher = null;
++    dispatcher = createDispatcher(conf);
++    EventHandler<LocalizerEvent> localizerEventHandler =
++        mock(EventHandler.class);
++    EventHandler<LocalizerEvent> containerEventHandler =
++        mock(EventHandler.class);
++    dispatcher.register(LocalizerEventType.class, localizerEventHandler);
++    dispatcher.register(ContainerEventType.class, containerEventHandler);
++    NMStateStoreService stateStore = mock(NMStateStoreService.class);
++    DeletionService delService = mock(DeletionService.class);
++    try {
++      LocalResourceRequest req1 = createLocalResourceRequest(user, 1, 1,
++          LocalResourceVisibility.PUBLIC);
++      LocalizedResource lr1 = createLocalizedResource(req1, dispatcher);
++      ConcurrentMap<LocalResourceRequest, LocalizedResource> localrsrc =
++          new ConcurrentHashMap<LocalResourceRequest, LocalizedResource>();
++      localrsrc.put(req1, lr1);
++      LocalResourcesTrackerImpl tracker = new LocalResourcesTrackerImpl(user,
++          appId, dispatcher, localrsrc, true, conf, stateStore);
++      Path conflictPath = new Path(base_path, "10");
++      Path qualifiedConflictPath = lfs.makeQualified(conflictPath);
++      lfs.mkdir(qualifiedConflictPath, null, true);
++      Path rPath = tracker.getPathForLocalization(req1, base_path,
++          delService);
++      Assert.assertFalse(lfs.util().exists(rPath));
++      verify(delService, times(1)).delete(eq(user), eq(conflictPath));
++    } finally {
++      lfs.delete(base_path, true);
++      if (dispatcher != null) {
++        dispatcher.stop();
++      }
++    }
++  }
++
+   private boolean createdummylocalizefile(Path path) {
+     boolean ret = false;
+     File file = new File(path.toUri().getRawPath().toString());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
+index 180b156..09728e1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
+@@ -628,29 +628,31 @@ public void testRecovery() throws Exception {
+       // Simulate start of localization for all resources
+       privTracker1.getPathForLocalization(privReq1,
+           dirsHandler.getLocalPathForWrite(
+-              ContainerLocalizer.USERCACHE + user1));
++              ContainerLocalizer.USERCACHE + user1), null);
+       privTracker1.getPathForLocalization(privReq2,
+           dirsHandler.getLocalPathForWrite(
+-              ContainerLocalizer.USERCACHE + user1));
++              ContainerLocalizer.USERCACHE + user1), null);
+       LocalizedResource privLr1 = privTracker1.getLocalizedResource(privReq1);
+       LocalizedResource privLr2 = privTracker1.getLocalizedResource(privReq2);
+       appTracker1.getPathForLocalization(appReq1,
+           dirsHandler.getLocalPathForWrite(
+-              ContainerLocalizer.APPCACHE + appId1));
++              ContainerLocalizer.APPCACHE + appId1), null);
+       LocalizedResource appLr1 = appTracker1.getLocalizedResource(appReq1);
+       appTracker2.getPathForLocalization(appReq2,
+           dirsHandler.getLocalPathForWrite(
+-              ContainerLocalizer.APPCACHE + appId2));
++              ContainerLocalizer.APPCACHE + appId2), null);
+       LocalizedResource appLr2 = appTracker2.getLocalizedResource(appReq2);
+       appTracker2.getPathForLocalization(appReq3,
+           dirsHandler.getLocalPathForWrite(
+-              ContainerLocalizer.APPCACHE + appId2));
++              ContainerLocalizer.APPCACHE + appId2), null);
+       LocalizedResource appLr3 = appTracker2.getLocalizedResource(appReq3);
+       pubTracker.getPathForLocalization(pubReq1,
+-          dirsHandler.getLocalPathForWrite(ContainerLocalizer.FILECACHE));
++          dirsHandler.getLocalPathForWrite(ContainerLocalizer.FILECACHE),
++          null);
+       LocalizedResource pubLr1 = pubTracker.getLocalizedResource(pubReq1);
+       pubTracker.getPathForLocalization(pubReq2,
+-          dirsHandler.getLocalPathForWrite(ContainerLocalizer.FILECACHE));
++          dirsHandler.getLocalPathForWrite(ContainerLocalizer.FILECACHE),
++          null);
+       LocalizedResource pubLr2 = pubTracker.getLocalizedResource(pubReq2);
+ 
+       // Simulate completion of localization for most resources with
+-- 
+1.7.9.5
+

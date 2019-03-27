@@ -1,0 +1,400 @@
+From a8bf5b466b2b6b802c927df871c26d15d9bee4f6 Mon Sep 17 00:00:00 2001
+From: Yufei Gu <yufei.gu@cloudera.com>
+Date: Mon, 6 Feb 2017 17:20:43 -0800
+Subject: [PATCH 2200/2848] YARN-5830. FairScheduler: Avoid preempting AM
+ containers. (Yufei Gu via kasha)
+
+(cherry picked from commit abedb8a9d86b4593a37fd3d2313fbcb057c7846a)
+(cherry picked from commit 73497f08fcee24b2160e6686bdc73e9dd01eda94)
+
+Most conflicts are API incompatibilities. Solve them by using old APIs.
+
+Change-Id: I75884588a053b2fb822c5108f8fbd9baa1cb873d
+---
+ .../resourcemanager/scheduler/SchedulerNode.java   |   17 +++
+ .../scheduler/fair/FSPreemptionThread.java         |  135 +++++++++++++++-----
+ .../fair/TestFairSchedulerPreemption.java          |   99 +++++++++++---
+ 3 files changed, 202 insertions(+), 49 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerNode.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerNode.java
+index f4d8731..f286504 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerNode.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerNode.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler;
+ 
+ import java.util.ArrayList;
++import java.util.LinkedList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -260,6 +261,22 @@ public int getNumContainers() {
+     return new ArrayList<RMContainer>(launchedContainers.values());
+   }
+ 
++  /**
++   * Get the containers running on the node with AM containers at the end.
++   * @return A copy of running containers with AM containers at the end.
++   */
++  public synchronized List<RMContainer> getRunningContainersWithAMsAtTheEnd() {
++    LinkedList<RMContainer> result = new LinkedList<>();
++    for (RMContainer container : launchedContainers.values()) {
++      if(container.isAMContainer()) {
++        result.addLast(container);
++      } else {
++        result.addFirst(container);
++      }
++    }
++    return result;
++  }
++
+   public synchronized RMContainer getReservedContainer() {
+     return reservedContainer;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
+index f5c1f5b..25ce280 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
+@@ -63,10 +63,10 @@ public void run() {
+       try{
+         starvedApp = context.getStarvedApps().take();
+         if (!Resources.isNone(starvedApp.getStarvation())) {
+-          List<RMContainer> containers =
++          PreemptableContainers containers =
+               identifyContainersToPreempt(starvedApp);
+           if (containers != null) {
+-            preemptContainers(containers);
++            preemptContainers(containers.containers);
+           }
+         }
+       } catch (InterruptedException e) {
+@@ -85,9 +85,9 @@ public void run() {
+    * @return list of containers to preempt to satisfy starvedApp, null if the
+    * app cannot be satisfied by preempting any running containers
+    */
+-  private List<RMContainer> identifyContainersToPreempt(
++  private PreemptableContainers identifyContainersToPreempt(
+       FSAppAttempt starvedApp) {
+-    List<RMContainer> containers = new ArrayList<>(); // return value
++    PreemptableContainers bestContainers = null;
+ 
+     // Find the nodes that match the next resource request
+     ResourceRequest request = starvedApp.getNextResourceRequest();
+@@ -102,9 +102,6 @@ public void run() {
+     // From the potential nodes, pick a node that has enough containers
+     // from apps over their fairshare
+     for (FSSchedulerNode node : potentialNodes) {
+-      // Reset containers for the new node being considered.
+-      containers.clear();
+-
+       // TODO (YARN-5829): Attempt to reserve the node for starved app. The
+       // subsequent if-check needs to be reworked accordingly.
+       FSAppAttempt nodeReservedApp = node.getReservedAppSchedulable();
+@@ -114,39 +111,81 @@ public void run() {
+         continue;
+       }
+ 
+-      // Figure out list of containers to consider
+-      List<RMContainer> containersToCheck =
+-          node.getRunningContainers();
+-      containersToCheck.removeAll(node.getContainersForPreemption());
+-
+-      // Initialize potential with unallocated resources
+-      Resource potential = Resources.clone(node.getAvailableResource());
+-      for (RMContainer container : containersToCheck) {
+-        FSAppAttempt app =
+-            scheduler.getSchedulerApp(container.getApplicationAttemptId());
+-
+-        if (app.canContainerBePreempted(container)) {
+-          // Flag container for preemption
+-          containers.add(container);
+-          Resources.addTo(potential, container.getAllocatedResource());
++      int maxAMContainers = bestContainers == null ?
++          Integer.MAX_VALUE : bestContainers.numAMContainers;
++      PreemptableContainers preemptableContainers =
++          identifyContainersToPreemptOnNode(requestCapability, node,
++              maxAMContainers);
++      if (preemptableContainers != null) {
++        if (preemptableContainers.numAMContainers == 0) {
++          return preemptableContainers;
++        } else {
++          bestContainers = preemptableContainers;
+         }
++      }
++    }
+ 
+-        // Check if we have already identified enough containers
+-        if (Resources.fitsIn(requestCapability, potential)) {
+-          // Mark the containers as being considered for preemption on the node.
+-          // Make sure the containers are subsequently removed by calling
+-          // FSSchedulerNode#removeContainerForPreemption.
+-          node.addContainersForPreemption(containers);
+-          return containers;
+-        } else {
+-          // TODO (YARN-5829): Unreserve the node for the starved app.
++    return bestContainers;
++  }
++
++  /**
++   * Identify containers to preempt on a given node. Try to find a list with
++   * least AM containers to avoid preempting AM containers. This method returns
++   * a non-null set of containers only if the number of AM containers is less
++   * than maxAMContainers.
++   *
++   * @param request resource requested
++   * @param node the node to check
++   * @param maxAMContainers max allowed AM containers in the set
++   * @return list of preemptable containers with fewer AM containers than
++   *         maxAMContainers if such a list exists; null otherwise.
++   */
++  private PreemptableContainers identifyContainersToPreemptOnNode(
++      Resource request, FSSchedulerNode node, int maxAMContainers) {
++    PreemptableContainers preemptableContainers =
++        new PreemptableContainers(maxAMContainers);
++
++    // Figure out list of containers to consider
++    List<RMContainer> containersToCheck =
++        node.getRunningContainersWithAMsAtTheEnd();
++    containersToCheck.removeAll(node.getContainersForPreemption());
++
++    // Initialize potential with unallocated resources
++    Resource potential = Resources.clone(node.getAvailableResource());
++
++    for (RMContainer container : containersToCheck) {
++      FSAppAttempt app =
++          scheduler.getSchedulerApp(container.getApplicationAttemptId());
++
++      if (app.canContainerBePreempted(container)) {
++        // Flag container for preemption
++        if (!preemptableContainers.addContainer(container)) {
++          return null;
+         }
++
++        Resources.addTo(potential, container.getAllocatedResource());
++      }
++
++      // Check if we have already identified enough containers
++      if (Resources.fitsIn(request, potential)) {
++        return preemptableContainers;
++      } else {
++        // TODO (YARN-5829): Unreserve the node for the starved app.
+       }
+     }
+     return null;
+   }
+ 
+   private void preemptContainers(List<RMContainer> containers) {
++    // Mark the containers as being considered for preemption on the node.
++    // Make sure the containers are subsequently removed by calling
++    // FSSchedulerNode#removeContainerForPreemption.
++    if (containers.size() > 0) {
++      FSSchedulerNode node = (FSSchedulerNode) scheduler.getNodeTracker()
++          .getNode(containers.get(0).getAllocatedNode());
++      node.addContainersForPreemption(containers);
++    }
++
+     // Warn application about containers to be killed
+     for (RMContainer container : containers) {
+       ApplicationAttemptId appAttemptId = container.getApplicationAttemptId();
+@@ -185,4 +224,38 @@ public void run() {
+       }
+     }
+   }
++
++  /**
++   * A class to track preemptable containers.
++   */
++  private static class PreemptableContainers {
++    List<RMContainer> containers;
++    int numAMContainers;
++    int maxAMContainers;
++
++    PreemptableContainers(int maxAMContainers) {
++      containers = new ArrayList<>();
++      numAMContainers = 0;
++      this.maxAMContainers = maxAMContainers;
++    }
++
++    /**
++     * Add a container if the number of AM containers is less than
++     * maxAMContainers.
++     *
++     * @param container the container to add
++     * @return true if success; false otherwise
++     */
++    private boolean addContainer(RMContainer container) {
++      if (container.isAMContainer()) {
++        numAMContainers++;
++        if (numAMContainers >= maxAMContainers) {
++          return false;
++        }
++      }
++
++      containers.add(container);
++      return true;
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+index 36ee685..bd70a96 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+@@ -21,6 +21,8 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
+ import org.junit.After;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+@@ -33,8 +35,10 @@
+ import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.List;
+ 
+ /**
+  * Tests to verify fairshare and minshare preemption, using parameterization.
+@@ -42,6 +46,7 @@
+ @RunWith(Parameterized.class)
+ public class TestFairSchedulerPreemption extends FairSchedulerTestBase {
+   private static final File ALLOC_FILE = new File(TEST_DIR, "test-queues");
++  private static final int GB = 1024;
+ 
+   // Node Capacity = NODE_CAPACITY_MULTIPLE * (1 GB or 1 vcore)
+   private static final int NODE_CAPACITY_MULTIPLE = 4;
+@@ -164,8 +169,8 @@ private void setupCluster() throws IOException {
+     scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+ 
+     // Create and add two nodes to the cluster
+-    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
+-    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
++    addNode(NODE_CAPACITY_MULTIPLE * GB, NODE_CAPACITY_MULTIPLE);
++    addNode(NODE_CAPACITY_MULTIPLE * GB, NODE_CAPACITY_MULTIPLE);
+   }
+ 
+   private void sendEnoughNodeUpdatesToAssignFully() {
+@@ -179,37 +184,56 @@ private void sendEnoughNodeUpdatesToAssignFully() {
+   }
+ 
+   /**
+-   * Submit application to {@code queue1} and take over the entire cluster.
+-   * Submit application with larger containers to {@code queue2} that
+-   * requires preemption from the first application.
++   * Submit an application to a given queue and take over the entire cluster.
+    *
+-   * @param queue1 first queue
+-   * @param queue2 second queue
+-   * @throws InterruptedException if interrupted while waiting
++   * @param queueName queue name
+    */
+-  private void submitApps(String queue1, String queue2)
+-      throws InterruptedException {
++  private void takeAllResource(String queueName) {
+     // Create an app that takes up all the resources on the cluster
+-    ApplicationAttemptId appAttemptId1
+-        = createSchedulingRequest(1024, 1, queue1, "default",
++    ApplicationAttemptId appAttemptId
++        = createSchedulingRequest(GB, 1, queueName, "default",
+         NODE_CAPACITY_MULTIPLE * rmNodes.size());
+-    greedyApp = scheduler.getSchedulerApp(appAttemptId1);
++    greedyApp = scheduler.getSchedulerApp(appAttemptId);
+     scheduler.update();
+     sendEnoughNodeUpdatesToAssignFully();
+     assertEquals(8, greedyApp.getLiveContainers().size());
++  }
+ 
+-    // Create an app that takes up all the resources on the cluster
+-    ApplicationAttemptId appAttemptId2
+-        = createSchedulingRequest(2048, 2, queue2, "default",
++  /**
++   * Submit an application to a given queue and preempt half resources of the
++   * cluster.
++   *
++   * @param queueName queue name
++   * @throws InterruptedException
++   *         if any thread has interrupted the current thread.
++   */
++  private void preemptHalfResources(String queueName)
++      throws InterruptedException {
++    ApplicationAttemptId appAttemptId
++        = createSchedulingRequest(2 * GB, 2, queueName, "default",
+         NODE_CAPACITY_MULTIPLE * rmNodes.size() / 2);
+-    starvingApp = scheduler.getSchedulerApp(appAttemptId2);
++    starvingApp = scheduler.getSchedulerApp(appAttemptId);
+ 
+     // Sleep long enough to pass
+     Thread.sleep(10);
+-
+     scheduler.update();
+   }
+ 
++  /**
++   * Submit application to {@code queue1} and take over the entire cluster.
++   * Submit application with larger containers to {@code queue2} that
++   * requires preemption from the first application.
++   *
++   * @param queue1 first queue
++   * @param queue2 second queue
++   * @throws InterruptedException if interrupted while waiting
++   */
++  private void submitApps(String queue1, String queue2)
++      throws InterruptedException {
++    takeAllResource(queue1);
++    preemptHalfResources(queue2);
++  }
++
+   private void verifyPreemption() throws InterruptedException {
+     // Sleep long enough for four containers to be preempted. Note that the
+     // starved app must be queued four times for containers to be preempted.
+@@ -272,4 +296,43 @@ public void testNoPreemptionFromDisallowedQueue() throws Exception {
+     submitApps("root.nonpreemptable.child-1", "root.preemptable.child-1");
+     verifyNoPreemption();
+   }
++
++  /**
++   * Set the number of AM containers for each node.
++   *
++   * @param numAMContainersPerNode number of AM containers per node
++   */
++  private void setNumAMContainersPerNode(int numAMContainersPerNode) {
++    List<FSSchedulerNode> potentialNodes =
++        scheduler.getNodeTracker().getNodesByResourceName("*");
++    for (FSSchedulerNode node: potentialNodes) {
++      List<RMContainer> containers=
++          node.getRunningContainers();
++      // Change the first numAMContainersPerNode out of 4 containers to
++      // AM containers
++      for (int i = 0; i < numAMContainersPerNode; i++) {
++        ((RMContainerImpl) containers.get(i)).setAMContainer(true);
++      }
++    }
++  }
++
++  @Test
++  public void testPreemptionSelectNonAMContainer() throws Exception {
++    setupCluster();
++
++    takeAllResource("root.preemptable.child-1");
++    setNumAMContainersPerNode(2);
++    preemptHalfResources("root.preemptable.child-2");
++
++    verifyPreemption();
++
++    ArrayList<RMContainer> containers =
++        (ArrayList<RMContainer>) starvingApp.getLiveContainers();
++    String host0 = containers.get(0).getAllocatedNode().getHost();
++    String host1 = containers.get(1).getAllocatedNode().getHost();
++    // Each node provides two and only two non-AM containers to be preempted, so
++    // the preemption happens on both nodes.
++    assertTrue("Preempted containers should come from two different "
++        + "nodes.", !host0.equals(host1));
++  }
+ }
+-- 
+1.7.9.5
+

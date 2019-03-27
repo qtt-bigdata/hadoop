@@ -1,0 +1,230 @@
+From b370985edea2373ab33444f0cc51b97e4b5dd37e Mon Sep 17 00:00:00 2001
+From: Haohui Mai <wheat9@apache.org>
+Date: Wed, 1 Apr 2015 16:54:46 -0700
+Subject: [PATCH 1574/2848] HDFS-8008. Support client-side back off when the
+ datanodes are congested. Contributed by Haohui
+ Mai.
+
+(cherry picked from commit cfcf795492f960faa7891044cc79ea9d2051387b)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DataStreamer.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+
+Change-Id: I3afaeb921055fd472458b1039994018431e2a68b
+---
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   65 +++++++++++++++++++-
+ .../hdfs/protocol/datatransfer/PipelineAck.java    |    4 ++
+ .../apache/hadoop/hdfs/TestDFSOutputStream.java    |   46 ++++++++++++++
+ 3 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index 2e7ab27..0c3f351 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -490,6 +490,13 @@ public DatanodeInfo load(DatanodeInfo key) throws Exception {
+     private boolean isHflushed = false;
+     /** Append on an existing block? */
+     private final boolean isAppend;
++    // List of congested data nodes. The stream will back off if the DataNodes
++    // are congested
++    private final ArrayList<DatanodeInfo> congestedNodes = new ArrayList<>();
++    private static final int CONGESTION_BACKOFF_MEAN_TIME_IN_MS = 5000;
++    private static final int CONGESTION_BACK_OFF_MAX_TIME_IN_MS =
++        CONGESTION_BACKOFF_MEAN_TIME_IN_MS * 10;
++    private int lastCongestionBackoffTime;
+ 
+     /**
+      * construction with tracing info
+@@ -653,6 +660,11 @@ public void run() {
+               one = createHeartbeatPacket();
+               assert one != null;
+             } else {
++              try {
++                backOffIfNecessary();
++              } catch (InterruptedException e) {
++                DFSClient.LOG.warn("Caught exception ", e);
++              }
+               one = dataQueue.getFirst(); // regular data packet
+               SpanId parents[] = one.getTraceParents();
+               if (parents.length > 0) {
+@@ -985,9 +997,14 @@ public void run() {
+ 
+             long seqno = ack.getSeqno();
+             // processes response status from datanodes.
++            ArrayList<DatanodeInfo> congestedNodesFromAck = new ArrayList<>();
+             for (int i = ack.getNumOfReplies()-1; i >=0  && dfsClient.clientRunning; i--) {
+               final Status reply = PipelineAck.getStatusFromHeader(ack
+                 .getReply(i));
++              if (PipelineAck.getECNFromHeader(ack.getReply(i)) ==
++                  PipelineAck.ECN.CONGESTED) {
++                congestedNodesFromAck.add(targets[i]);
++              }
+               // Restart will not be treated differently unless it is
+               // the local node or the only one in the pipeline.
+               if (PipelineAck.isRestartOOBStatus(reply) &&
+@@ -1008,7 +1025,19 @@ public void run() {
+                     targets[i]);
+               }
+             }
+-            
++
++            if (!congestedNodesFromAck.isEmpty()) {
++              synchronized (congestedNodes) {
++                congestedNodes.clear();
++                congestedNodes.addAll(congestedNodesFromAck);
++              }
++            } else {
++              synchronized (congestedNodes) {
++                congestedNodes.clear();
++                lastCongestionBackoffTime = 0;
++              }
++            }
++
+             assert seqno != PipelineAck.UNKOWN_SEQNO : 
+               "Ack for unknown seqno should be a failed ack: " + ack;
+             if (seqno == Packet.HEART_BEAT_SEQNO) {  // a heartbeat ack
+@@ -1745,6 +1774,40 @@ private LocatedBlock locateFollowingBlock(long start,
+       } 
+     }
+ 
++    /**
++     * This function sleeps for a certain amount of time when the writing
++     * pipeline is congested. The function calculates the time based on a
++     * decorrelated filter.
++     *
++     * @see
++     * <a href="http://www.awsarchitectureblog.com/2015/03/backoff.html">
++     *   http://www.awsarchitectureblog.com/2015/03/backoff.html</a>
++     */
++    private void backOffIfNecessary() throws InterruptedException {
++      int t = 0;
++      synchronized (congestedNodes) {
++        if (!congestedNodes.isEmpty()) {
++          StringBuilder sb = new StringBuilder("DataNode");
++          for (DatanodeInfo i : congestedNodes) {
++            sb.append(' ').append(i);
++          }
++          int range = Math.abs(lastCongestionBackoffTime * 3 -
++              CONGESTION_BACKOFF_MEAN_TIME_IN_MS);
++          int base = Math.min(lastCongestionBackoffTime * 3,
++              CONGESTION_BACKOFF_MEAN_TIME_IN_MS);
++          t = Math.min(CONGESTION_BACK_OFF_MAX_TIME_IN_MS,
++              (int)(base + Math.random() * range));
++          lastCongestionBackoffTime = t;
++          sb.append(" are congested. Backing off for ").append(t).append(" ms");
++          DFSClient.LOG.info(sb.toString());
++          congestedNodes.clear();
++        }
++      }
++      if (t != 0) {
++        Thread.sleep(t);
++      }
++    }
++
+     ExtendedBlock getBlock() {
+       return block;
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/PipelineAck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/PipelineAck.java
+index 35e5bb8..fe9c8c5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/PipelineAck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/PipelineAck.java
+@@ -248,6 +248,10 @@ public static Status getStatusFromHeader(int header) {
+     return StatusFormat.getStatus(header);
+   }
+ 
++  public static ECN getECNFromHeader(int header) {
++    return StatusFormat.getECN(header);
++  }
++
+   public static int setStatusForHeader(int old, Status status) {
+     return StatusFormat.setStatus(old, status);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+index 99e9cda..4d2217f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+@@ -17,7 +17,12 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import java.io.DataOutputStream;
+ import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.LinkedList;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.EnumSet;
+ import java.util.Map;
+@@ -27,6 +32,10 @@
+ import org.apache.hadoop.fs.CreateFlag;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.hdfs.protocol.datatransfer.BlockConstructionStage;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+@@ -34,12 +43,17 @@
+ import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
+ import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
++import org.apache.htrace.core.SpanId;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ import org.mockito.internal.util.reflection.Whitebox;
+ 
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.when;
++
+ import static org.junit.Assert.assertEquals;
+ import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.spy;
+@@ -122,6 +136,38 @@ public void testNoLocalWriteFlag() throws IOException {
+     assertEquals(1, 3 - numDataNodesWithData);
+   }
+ 
++  @Test
++  public void testCongestionBackoff() throws IOException {
++    DFSClient.Conf dfsClientConf = mock(DFSClient.Conf.class);
++    DFSClient client = mock(DFSClient.class);
++    when(client.getConf()).thenReturn(dfsClientConf);
++    client.clientRunning = true;
++    DistributedFileSystem fs = cluster.getFileSystem();
++    FSDataOutputStream os = fs.create(new Path("/foo"));
++    DFSOutputStream dos = (DFSOutputStream) Whitebox.getInternalState(os,
++        "wrappedStream");
++    DFSOutputStream.DataStreamer stream = (DFSOutputStream.DataStreamer)
++        Whitebox.getInternalState(dos, "streamer");
++
++    DataOutputStream blockStream = mock(DataOutputStream.class);
++    doThrow(new IOException()).when(blockStream).flush();
++    Whitebox.setInternalState(stream, "blockStream", blockStream);
++    Whitebox.setInternalState(stream, "stage",
++                              BlockConstructionStage.PIPELINE_CLOSE);
++    @SuppressWarnings("unchecked")
++    LinkedList<DFSOutputStream.Packet> dataQueue = (LinkedList<DFSOutputStream.Packet>)
++        Whitebox.getInternalState(dos, "dataQueue");
++    @SuppressWarnings("unchecked")
++    ArrayList<DatanodeInfo> congestedNodes = (ArrayList<DatanodeInfo>)
++        Whitebox.getInternalState(stream, "congestedNodes");
++    congestedNodes.add(mock(DatanodeInfo.class));
++    DFSOutputStream.Packet packet = mock(DFSOutputStream.Packet.class);
++    when(packet.getTraceParents()).thenReturn(new SpanId[] {});
++    dataQueue.add(packet);
++    stream.run();
++    Assert.assertTrue(congestedNodes.isEmpty());
++  }
++
+   @AfterClass
+   public static void tearDown() {
+     cluster.shutdown();
+-- 
+1.7.9.5
+

@@ -1,0 +1,255 @@
+From add2de6c8af47726933414522f593bf282455aa5 Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Tue, 26 Jan 2016 11:24:57 -0800
+Subject: [PATCH 1213/2848] HDFS-9541. Add hdfsStreamBuilder API to libhdfs to
+ support defaultBlockSizes greater than 2 GB.
+ Contributed by Colin Patrick McCabe.
+
+(cherry picked from commit 2056dd7d3a7934442d032d212236fa75b2d58a94)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/hdfs.c
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/include/hdfs/hdfs.h
+
+Change-Id: Ifce1b9be534dc8f7e9d2634cd60e423921b9810f
+---
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.c     |   98 +++++++++++++++++++-
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.h     |   83 ++++++++++++++++-
+ 2 files changed, 178 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+index 93c6564..54c29ee 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+@@ -836,9 +836,95 @@ static jthrowable getDefaultBlockSize(JNIEnv *env, jobject jFS,
+     return NULL;
+ }
+ 
+-hdfsFile hdfsOpenFile(hdfsFS fs, const char *path, int flags, 
++hdfsFile hdfsOpenFile(hdfsFS fs, const char *path, int flags,
+                       int bufferSize, short replication, tSize blockSize)
+ {
++    struct hdfsStreamBuilder *bld = hdfsStreamBuilderAlloc(fs, path, flags);
++    if (bufferSize != 0) {
++      hdfsStreamBuilderSetBufferSize(bld, bufferSize);
++    }
++    if (replication != 0) {
++      hdfsStreamBuilderSetReplication(bld, replication);
++    }
++    if (blockSize != 0) {
++      hdfsStreamBuilderSetDefaultBlockSize(bld, blockSize);
++    }
++    return hdfsStreamBuilderBuild(bld);
++}
++
++struct hdfsStreamBuilder {
++    hdfsFS fs;
++    int flags;
++    int32_t bufferSize;
++    int16_t replication;
++    int64_t defaultBlockSize;
++    char path[1];
++};
++
++struct hdfsStreamBuilder *hdfsStreamBuilderAlloc(hdfsFS fs,
++                                            const char *path, int flags)
++{
++    int path_len = strlen(path);
++    struct hdfsStreamBuilder *bld;
++
++    // sizeof(hdfsStreamBuilder->path) includes one byte for the string
++    // terminator
++    bld = malloc(sizeof(struct hdfsStreamBuilder) + path_len);
++    if (!bld) {
++        errno = ENOMEM;
++        return NULL;
++    }
++    bld->fs = fs;
++    bld->flags = flags;
++    bld->bufferSize = 0;
++    bld->replication = 0;
++    bld->defaultBlockSize = 0;
++    memcpy(bld->path, path, path_len);
++    bld->path[path_len] = '\0';
++    return bld;
++}
++
++void hdfsStreamBuilderFree(struct hdfsStreamBuilder *bld)
++{
++    free(bld);
++}
++
++int hdfsStreamBuilderSetBufferSize(struct hdfsStreamBuilder *bld,
++                                   int32_t bufferSize)
++{
++    if ((bld->flags & O_ACCMODE) != O_WRONLY) {
++        errno = EINVAL;
++        return -1;
++    }
++    bld->bufferSize = bufferSize;
++    return 0;
++}
++
++int hdfsStreamBuilderSetReplication(struct hdfsStreamBuilder *bld,
++                                    int16_t replication)
++{
++    if ((bld->flags & O_ACCMODE) != O_WRONLY) {
++        errno = EINVAL;
++        return -1;
++    }
++    bld->replication = replication;
++    return 0;
++}
++
++int hdfsStreamBuilderSetDefaultBlockSize(struct hdfsStreamBuilder *bld,
++                                         int64_t defaultBlockSize)
++{
++    if ((bld->flags & O_ACCMODE) != O_WRONLY) {
++        errno = EINVAL;
++        return -1;
++    }
++    bld->defaultBlockSize = defaultBlockSize;
++    return 0;
++}
++
++static hdfsFile hdfsOpenFileImpl(hdfsFS fs, const char *path, int flags,
++                  int32_t bufferSize, int16_t replication, int64_t blockSize)
++{
+     /*
+       JAVA EQUIVALENT:
+        File f = new File(path);
+@@ -1037,6 +1123,16 @@ done:
+     return file;
+ }
+ 
++hdfsFile hdfsStreamBuilderBuild(struct hdfsStreamBuilder *bld)
++{
++    hdfsFile file = hdfsOpenFileImpl(bld->fs, bld->path, bld->flags,
++                  bld->bufferSize, bld->replication, bld->defaultBlockSize);
++    int prevErrno = errno;
++    hdfsStreamBuilderFree(bld);
++    errno = prevErrno;
++    return file;
++}
++
+ int hdfsUnbufferFile(hdfsFile file)
+ {
+     int ret;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+index e34c3ff..66ab31f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+@@ -56,6 +56,7 @@ extern  "C" {
+         kObjectKindFile = 'F',
+         kObjectKindDirectory = 'D',
+     } tObjectKind;
++    struct hdfsStreamBuilder;
+ 
+ 
+     /**
+@@ -329,9 +330,11 @@ extern  "C" {
+      */
+     int hdfsDisconnect(hdfsFS fs);
+         
+-
+     /** 
+      * hdfsOpenFile - Open a hdfs file in given mode.
++     * @deprecated    Use the hdfsStreamBuilder functions instead.
++     * This function does not support setting block sizes bigger than 2 GB.
++     *
+      * @param fs The configured filesystem handle.
+      * @param path The full path to the file.
+      * @param flags - an | of bits/fcntl.h file flags - supported flags are O_RDONLY, O_WRONLY (meaning create or overwrite i.e., implies O_TRUNCAT), 
+@@ -341,12 +344,88 @@ extern  "C" {
+      * @param replication Block replication - pass 0 if you want to use
+      * the default configured values.
+      * @param blocksize Size of block - pass 0 if you want to use the
+-     * default configured values.
++     * default configured values.  Note that if you want a block size bigger
++     * than 2 GB, you must use the hdfsStreamBuilder API rather than this
++     * deprecated function.
+      * @return Returns the handle to the open file or NULL on error.
+      */
+     hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+                           int bufferSize, short replication, tSize blocksize);
+ 
++     /**
++     * hdfsStreamBuilderAlloc - Allocate an HDFS stream builder.
++     *
++     * @param fs The configured filesystem handle.
++     * @param path The full path to the file.  Will be deep-copied.
++     * @param flags The open flags, as in hdfsOpenFile.
++     * @return Returns the hdfsStreamBuilder, or NULL on error.
++     */
++    struct hdfsStreamBuilder *hdfsStreamBuilderAlloc(hdfsFS fs,
++                                      const char *path, int flags);
++
++    /**
++     * hdfsStreamBuilderFree - Free an HDFS file builder.
++     *
++     * It is normally not necessary to call this function since
++     * hdfsStreamBuilderBuild frees the builder.
++     *
++     * @param bld The hdfsStreamBuilder to free.
++     */
++    void hdfsStreamBuilderFree(struct hdfsStreamBuilder *bld);
++
++    /**
++     * hdfsStreamBuilderSetBufferSize - Set the stream buffer size.
++     *
++     * @param bld The hdfs stream builder.
++     * @param bufferSize The buffer size to set.
++     *
++     * @return 0 on success, or -1 on error.  Errno will be set on error.
++     */
++    int hdfsStreamBuilderSetBufferSize(struct hdfsStreamBuilder *bld,
++                                       int32_t bufferSize);
++
++    /**
++     * hdfsStreamBuilderSetReplication - Set the replication for the stream.
++     * This is only relevant for output streams, which will create new blocks.
++     *
++     * @param bld The hdfs stream builder.
++     * @param replication The replication to set.
++     *
++     * @return 0 on success, or -1 on error.  Errno will be set on error.
++     *              If you call this on an input stream builder, you will get
++     *              EINVAL, because this configuration is not relevant to input
++     *              streams.
++     */
++    int hdfsStreamBuilderSetReplication(struct hdfsStreamBuilder *bld,
++                                        int16_t replication);
++
++    /**
++     * hdfsStreamBuilderSetDefaultBlockSize - Set the default block size for
++     * the stream.  This is only relevant for output streams, which will create
++     * new blocks.
++     *
++     * @param bld The hdfs stream builder.
++     * @param defaultBlockSize The default block size to set.
++     *
++     * @return 0 on success, or -1 on error.  Errno will be set on error.
++     *              If you call this on an input stream builder, you will get
++     *              EINVAL, because this configuration is not relevant to input
++     *              streams.
++     */
++    int hdfsStreamBuilderSetDefaultBlockSize(struct hdfsStreamBuilder *bld,
++                                       int64_t defaultBlockSize);
++
++    /**
++     * hdfsStreamBuilderBuild - Build the stream by calling open or create.
++     *
++     * @param bld The hdfs stream builder.  This pointer will be freed, whether
++     *            or not the open succeeds.
++     *
++     * @return the stream pointer on success, or NULL on error.  Errno will be
++     * set on error.
++     */
++    hdfsFile hdfsStreamBuilderBuild(struct hdfsStreamBuilder *bld);
++
+     /**
+      * hdfsUnbufferFile - Reduce the buffering done on a file.
+      *
+-- 
+1.7.9.5
+

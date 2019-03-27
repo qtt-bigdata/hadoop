@@ -1,0 +1,197 @@
+From c481d87bfb1224153335aae1f0cbe8d974c0aefb Mon Sep 17 00:00:00 2001
+From: Aaron Fabbri <fabbri@apache.org>
+Date: Mon, 30 Jan 2017 21:01:40 -0800
+Subject: [PATCH 2272/2848] HADOOP-14020 Optimize dirListingUnion (Sean
+ Mackrory)
+
+Instead of always pushing full directory listings into the MetadataStore at the
+end of listStatus(), only do it if authoritative mode is enabled, and something
+in the Directory Listing Metadata has actually changed from what we retrieved
+from the MetadataStore.
+
+(cherry picked from commit ab213fbd0c2c6d41688fb69ec66a6bd57c6e5deb)
+
+Change-Id: I7e881a5ee67600581cd93b76833231b0655f8add
+---
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |    3 +-
+ .../hadoop/fs/s3a/s3guard/DirListingMetadata.java  |   12 +++-
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |   18 +++---
+ .../hadoop/fs/s3a/ITestS3GuardListConsistency.java |   64 ++++++++++++++++++++
+ 4 files changed, 86 insertions(+), 11 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 7d9fc2b..356bd42 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -1492,7 +1492,8 @@ private void createFakeDirectoryIfNecessary(Path f)
+       while (files.hasNext()) {
+         result.add(files.next());
+       }
+-      return S3Guard.dirListingUnion(metadataStore, path, result, dirMeta);
++      return S3Guard.dirListingUnion(metadataStore, path, result, dirMeta,
++          allowAuthoritative);
+     } else {
+       LOG.debug("Adding: rd (not a dir): {}", path);
+       FileStatus[] stats = new FileStatus[1];
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+index 4a9df55..5ac7759 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+@@ -149,12 +149,20 @@ public void remove(Path childPath) {
+    * {@code FileStatus} with the same path, it will be replaced.
+    *
+    * @param childFileStatus entry to add to this directory listing.
++   * @return true if the status was added or replaced with a new value. False
++   * if the same FileStatus value was already present.
+    */
+-  public void put(FileStatus childFileStatus) {
++  public boolean put(FileStatus childFileStatus) {
+     Preconditions.checkNotNull(childFileStatus,
+         "childFileStatus must be non-null");
+     Path childPath = childStatusToPathKey(childFileStatus);
+-    listMap.put(childPath, new PathMetadata(childFileStatus));
++    PathMetadata newValue = new PathMetadata(childFileStatus);
++    PathMetadata oldValue = listMap.put(childPath, newValue);
++    if (oldValue == null) {
++      return true;
++    } else {
++      return !oldValue.equals(newValue);
++    }
+   }
+ 
+   @Override
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index afc76b5..a3b6203 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -155,12 +155,13 @@ public static S3AFileStatus putAndReturn(MetadataStore ms,
+    * @param path path to directory
+    * @param backingStatuses Directory listing from the backing store.
+    * @param dirMeta  Directory listing from MetadataStore.  May be null.
++   * @param isAuthoritative State of authoritative mode
+    * @return Final result of directory listing.
+    * @throws IOException if metadata store update failed
+    */
+   public static FileStatus[] dirListingUnion(MetadataStore ms, Path path,
+-      List<FileStatus> backingStatuses, DirListingMetadata dirMeta)
+-      throws IOException {
++      List<FileStatus> backingStatuses, DirListingMetadata dirMeta,
++      boolean isAuthoritative) throws IOException {
+ 
+     // Fast-path for NullMetadataStore
+     if (ms instanceof NullMetadataStore) {
+@@ -184,6 +185,7 @@ public static S3AFileStatus putAndReturn(MetadataStore ms,
+ 
+     // HADOOP-13760: filter out deleted files via PathMetadata#isDeleted() here
+ 
++    boolean changed = false;
+     for (FileStatus s : backingStatuses) {
+ 
+       // Minor race condition here.  Multiple threads could add to this
+@@ -193,14 +195,14 @@ public static S3AFileStatus putAndReturn(MetadataStore ms,
+       // Any FileSystem has similar race conditions, but we could persist
+       // a stale entry longer.  We could expose an atomic
+       // DirListingMetadata#putIfNotPresent()
+-      if (dirMeta.get(s.getPath()) == null) {
+-        dirMeta.put(s);
+-      }
++      changed = changed || dirMeta.put(s);
++    }
++
++    if (changed && isAuthoritative) {
++      dirMeta.setAuthoritative(true); // This is the full directory contents
++      ms.put(dirMeta);
+     }
+ 
+-    // TODO optimize for when allowAuthoritative = false
+-    dirMeta.setAuthoritative(true); // This is the full directory contents
+-    ms.put(dirMeta);
+     return dirMetaToStatuses(dirMeta);
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+index 22c17fb..f59b80d 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+@@ -20,9 +20,12 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.contract.AbstractFSContract;
+ import org.apache.hadoop.fs.contract.s3a.S3AContract;
++import org.apache.hadoop.fs.s3a.s3guard.DirListingMetadata;
++import org.apache.hadoop.fs.s3a.s3guard.S3Guard;
+ import org.junit.Assume;
+ import org.junit.Test;
+ 
+@@ -76,4 +79,65 @@ public void testConsistentList() throws Exception {
+     // This should fail without S3Guard, and succeed with it.
+     assertTrue(list.contains(inconsistentPath));
+   }
++
++  @Test
++  public void testListStatusWriteBack() throws Exception {
++    Assume.assumeTrue(getFileSystem().hasMetadataStore());
++
++    Configuration conf;
++    Path directory = path("ListStatusWriteBack");
++
++    // Create a FileSystem that is S3-backed only
++    conf = createConfiguration();
++    conf.setBoolean("fs.s3a.impl.disable.cache", true);
++    conf.set(Constants.S3_METADATA_STORE_IMPL,
++        Constants.S3GUARD_METASTORE_NULL);
++    FileSystem noS3Guard = FileSystem.get(directory.toUri(), conf);
++
++    // Create a FileSystem with S3Guard and write-back disabled
++    conf = createConfiguration();
++    S3ATestUtils.maybeEnableS3Guard(conf);
++    conf.setBoolean("fs.s3a.impl.disable.cache", true);
++    conf.setBoolean(Constants.METADATASTORE_AUTHORITATIVE, false);
++    FileSystem noWriteBack = FileSystem.get(directory.toUri(), conf);
++
++    // Create a FileSystem with S3Guard and write-back enabled
++    conf = createConfiguration();
++    S3ATestUtils.maybeEnableS3Guard(conf);
++    conf.setBoolean("fs.s3a.impl.disable.cache", true);
++    conf.setBoolean(Constants.METADATASTORE_AUTHORITATIVE, true);
++    FileSystem yesWriteBack = FileSystem.get(directory.toUri(), conf);
++
++    // Create a directory on S3 only
++    noS3Guard.mkdirs(new Path(directory, "123"));
++    // Create a directory on metastore only
++    noWriteBack.mkdirs(new Path(directory, "XYZ"));
++
++    FileStatus[] fsResults;
++    DirListingMetadata mdResults;
++
++    // FS should return both
++    fsResults = noWriteBack.listStatus(directory);
++    assertTrue("Unexpected number of results from filesystem. " +
++            "Should have /XYZ and /123: " + fsResults.toString(),
++        fsResults.length == 2);
++
++    // Metastore without write-back should still only contain 1
++    mdResults = S3Guard.getMetadataStore(noWriteBack).listChildren(directory);
++    assertTrue("Unexpected number of results from metastore. " +
++            "Metastore should only know about /XYZ: " + mdResults.toString(),
++        mdResults.numEntries() == 1);
++
++    // FS should return both (and will write it back)
++    fsResults = yesWriteBack.listStatus(directory);
++    assertTrue("Unexpected number of results from filesystem. " +
++            "Should have /XYZ and /123: " + fsResults.toString(),
++        fsResults.length == 2);
++
++    // Metastore should not contain both
++    mdResults = S3Guard.getMetadataStore(yesWriteBack).listChildren(directory);
++    assertTrue("Unexpected number of results from metastore. " +
++            "Should have /XYZ and /123: " + mdResults.toString(),
++        mdResults.numEntries() == 2);
++  }
+ }
+-- 
+1.7.9.5
+

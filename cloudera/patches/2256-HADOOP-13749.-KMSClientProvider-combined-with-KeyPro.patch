@@ -1,0 +1,170 @@
+From 113e2210ff272434997dec7c77a746ec0e09ec48 Mon Sep 17 00:00:00 2001
+From: Xiaoyu Yao <xyao@apache.org>
+Date: Sun, 23 Oct 2016 10:58:36 -0700
+Subject: [PATCH 2256/2848] HADOOP-13749. KMSClientProvider combined with
+ KeyProviderCache can result in wrong UGI being
+ used. Contributed by Xiaoyu Yao.
+
+(cherry picked from commit d0a347984da175948b553a675dc357491df2fd0f)
+(cherry picked from commit 48c9064b33dd07fd158b0415b0cd6d1a0a6ef06d)
+
+Change-Id: Ib24d1ef14fceb9afc19a0d4f60f399a3979f7c51
+---
+ .../hadoop/crypto/key/kms/KMSClientProvider.java   |   52 ++++++++++----------
+ .../hadoop/security/UserGroupInformation.java      |   14 ++++++
+ .../hadoop/crypto/key/kms/server/TestKMS.java      |    2 +
+ 3 files changed, 42 insertions(+), 26 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+index ca642fc..64695a8 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+@@ -384,7 +384,6 @@ public static String checkNotEmpty(String s, String name)
+   private ConnectionConfigurator configurator;
+   private DelegationTokenAuthenticatedURL.Token authToken;
+   private final int authRetry;
+-  private final UserGroupInformation actualUgi;
+ 
+   @Override
+   public String toString() {
+@@ -466,15 +465,6 @@ public KMSClientProvider(URI uri, Configuration conf) throws IOException {
+                     KMS_CLIENT_ENC_KEY_CACHE_NUM_REFILL_THREADS_DEFAULT),
+             new EncryptedQueueRefiller());
+     authToken = new DelegationTokenAuthenticatedURL.Token();
+-    UserGroupInformation.AuthenticationMethod authMethod =
+-        UserGroupInformation.getCurrentUser().getAuthenticationMethod();
+-    if (authMethod == UserGroupInformation.AuthenticationMethod.PROXY) {
+-      actualUgi = UserGroupInformation.getCurrentUser().getRealUser();
+-    } else if (authMethod == UserGroupInformation.AuthenticationMethod.TOKEN) {
+-      actualUgi = UserGroupInformation.getLoginUser();
+-    } else {
+-      actualUgi =UserGroupInformation.getCurrentUser();
+-    }
+   }
+ 
+   private static Path extractKMSPath(URI uri) throws MalformedURLException, IOException {
+@@ -541,19 +531,9 @@ private HttpURLConnection createConnection(final URL url, String method)
+       throws IOException {
+     HttpURLConnection conn;
+     try {
+-      // if current UGI is different from UGI at constructor time, behave as
+-      // proxyuser
+-      UserGroupInformation currentUgi = UserGroupInformation.getCurrentUser();
+-      final String doAsUser = (currentUgi.getAuthenticationMethod() ==
+-          UserGroupInformation.AuthenticationMethod.PROXY)
+-                              ? currentUgi.getShortUserName() : null;
+-
+-      // If current UGI contains kms-dt && is not proxy, doAs it to use its dt.
+-      // Otherwise, create the HTTP connection using the UGI at constructor time
+-      UserGroupInformation ugiToUse =
+-          (currentUgiContainsKmsDt() && doAsUser == null) ?
+-              currentUgi : actualUgi;
+-      conn = ugiToUse.doAs(new PrivilegedExceptionAction<HttpURLConnection>() {
++      final String doAsUser = getDoAsUser();
++      conn = getActualUgi().doAs(new PrivilegedExceptionAction
++          <HttpURLConnection>() {
+         @Override
+         public HttpURLConnection run() throws Exception {
+           DelegationTokenAuthenticatedURL authUrl =
+@@ -928,7 +908,7 @@ public long renewDelegationToken(final Token<?> dToken) throws IOException {
+           token, url, doAsUser);
+       final DelegationTokenAuthenticatedURL authUrl =
+           new DelegationTokenAuthenticatedURL(configurator);
+-      return actualUgi.doAs(
++      return getActualUgi().doAs(
+           new PrivilegedExceptionAction<Long>() {
+             @Override
+             public Long run() throws Exception {
+@@ -951,7 +931,7 @@ public Void cancelDelegationToken(final Token<?> dToken) throws IOException {
+       final String doAsUser = getDoAsUser();
+       final DelegationTokenAuthenticatedURL.Token token =
+           generateDelegationToken(dToken);
+-      return actualUgi.doAs(
++      return getActualUgi().doAs(
+           new PrivilegedExceptionAction<Void>() {
+             @Override
+             public Void run() throws Exception {
+@@ -1023,7 +1003,7 @@ private String getDoAsUser() throws IOException {
+           new DelegationTokenAuthenticatedURL(configurator);
+       try {
+         final String doAsUser = getDoAsUser();
+-        token = actualUgi.doAs(new PrivilegedExceptionAction<Token<?>>() {
++        token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
+           @Override
+           public Token<?> run() throws Exception {
+             // Not using the cached token here.. Creating a new token here
+@@ -1069,6 +1049,26 @@ private boolean currentUgiContainsKmsDt() throws IOException {
+     return false;
+   }
+ 
++  private UserGroupInformation getActualUgi() throws IOException {
++    final UserGroupInformation currentUgi = UserGroupInformation
++        .getCurrentUser();
++    if (LOG.isDebugEnabled()) {
++      UserGroupInformation.logAllUserInfo(currentUgi);
++    }
++    // Use current user by default
++    UserGroupInformation actualUgi = currentUgi;
++    if (currentUgi.getRealUser() != null) {
++      // Use real user for proxy user
++      actualUgi = currentUgi.getRealUser();
++    } else if (!currentUgiContainsKmsDt() &&
++        !currentUgi.hasKerberosCredentials()) {
++      // Use login user for user that does not have either
++      // Kerberos credential or KMS delegation token for KMS operations
++      actualUgi = currentUgi.getLoginUser();
++    }
++    return actualUgi;
++  }
++
+   /**
+    * Shutdown valueQueue executor threads
+    */
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+index 995c9b1..4769641 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+@@ -1943,6 +1943,20 @@ private void logPrivilegedAction(Subject subject, Object action) {
+     }
+   }
+ 
++  public static void logAllUserInfo(UserGroupInformation ugi) throws
++      IOException {
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("UGI: " + ugi);
++      if (ugi.getRealUser() != null) {
++        LOG.debug("+RealUGI: " + ugi.getRealUser());
++      }
++      LOG.debug("+LoginUGI: " + ugi.getLoginUser());
++      for (Token<?> token : ugi.getTokens()) {
++        LOG.debug("+UGI token:" + token);
++      }
++    }
++  }
++
+   private void print() throws IOException {
+     System.out.println("User: " + getUserName());
+     System.out.print("Group Ids: ");
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+index 6e110a9..afc12e0 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+@@ -1869,6 +1869,7 @@ public Void run() throws Exception {
+             } else {
+               otherUgi = UserGroupInformation.createUserForTesting("client1",
+                   new String[] {"other group"});
++              UserGroupInformation.setLoginUser(otherUgi);
+             }
+             try {
+               // test delegation token renewal via renewer
+@@ -2209,6 +2210,7 @@ public Void call() throws Exception {
+               loginUserFromKeytabAndReturnUGI("client", keytab.getAbsolutePath());
+         } else {
+           proxyUgi = UserGroupInformation.createRemoteUser("client");
++          UserGroupInformation.setLoginUser(proxyUgi);
+         }
+ 
+         final UserGroupInformation clientUgi = proxyUgi; 
+-- 
+1.7.9.5
+

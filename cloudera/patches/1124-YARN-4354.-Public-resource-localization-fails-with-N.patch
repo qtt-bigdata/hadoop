@@ -1,0 +1,155 @@
+From 7672699457238ecb2b1e960633fbd8efb871bcea Mon Sep 17 00:00:00 2001
+From: Junping Du <junping_du@apache.org>
+Date: Sun, 15 Nov 2015 04:43:57 -0800
+Subject: [PATCH 1124/2848] YARN-4354. Public resource localization fails with
+ NPE. Contributed by Jason Lowe. (cherry picked
+ from commit
+ 855d52927b6115e2cfbd97a94d6c1a3ddf0e94bb) (cherry
+ picked from commit
+ 1d107d805841e9b39db01aa236068a0ff1ca46d1)
+
+Conflicts:
+
+	hadoop-yarn-project/CHANGES.txt
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+
+(cherry picked from commit cfbb0354203f885f5c408123bbcd5e9039db18bb)
+
+Change-Id: I24ed8e435d0a2e628798a0485f31ad59f65edaee
+---
+ .../localizer/LocalResourcesTrackerImpl.java       |   10 +++-
+ .../localizer/TestLocalResourcesTrackerImpl.java   |   56 ++++++++++++++++++--
+ .../localizer/TestResourceLocalizationService.java |    4 +-
+ 3 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
+index f9346d8..60a9529 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/LocalResourcesTrackerImpl.java
+@@ -171,14 +171,22 @@ public synchronized void handle(ResourceEvent event) {
+       break;
+     }
+ 
++    if (rsrc == null) {
++      LOG.warn("Received " + event.getType() + " event for request " + req
++          + " but localized resource is missing");
++      return;
++    }
+     rsrc.handle(event);
+ 
+     // Remove the resource if its downloading and its reference count has
+     // become 0 after RELEASE. This maybe because a container was killed while
+     // localizing and no other container is referring to the resource.
++    // NOTE: This should NOT be done for public resources since the
++    //       download is not associated with a container-specific localizer.
+     if (event.getType() == ResourceEventType.RELEASE) {
+       if (rsrc.getState() == ResourceState.DOWNLOADING &&
+-          rsrc.getRefCount() <= 0) {
++          rsrc.getRefCount() <= 0 &&
++          rsrc.getRequest().getVisibility() != LocalResourceVisibility.PUBLIC) {
+         removeResource(req);
+       }
+     }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+index e59a796..8cf3b2e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestLocalResourcesTrackerImpl.java
+@@ -137,12 +137,12 @@ public void test() {
+       tracker.handle(rel21Event);
+ 
+       dispatcher.await();
+-      verifyTrackedResourceCount(tracker, 1);
++      verifyTrackedResourceCount(tracker, 2);
+ 
+       // Verify resource with non zero ref count is not removed.
+       Assert.assertEquals(2, lr1.getRefCount());
+       Assert.assertFalse(tracker.remove(lr1, mockDelService));
+-      verifyTrackedResourceCount(tracker, 1);
++      verifyTrackedResourceCount(tracker, 2);
+ 
+       // Localize resource1
+       ResourceLocalizedEvent rle =
+@@ -157,7 +157,7 @@ public void test() {
+ 
+       // Verify resources in state LOCALIZED with ref-count=0 is removed.
+       Assert.assertTrue(tracker.remove(lr1, mockDelService));
+-      verifyTrackedResourceCount(tracker, 0);
++      verifyTrackedResourceCount(tracker, 1);
+     } finally {
+       if (dispatcher != null) {
+         dispatcher.stop();
+@@ -828,6 +828,56 @@ public void testGetPathForLocalization() throws Exception {
+     }
+   }
+ 
++  @Test
++  @SuppressWarnings("unchecked")
++  public void testReleaseWhileDownloading() throws Exception {
++    String user = "testuser";
++    DrainDispatcher dispatcher = null;
++    try {
++      Configuration conf = new Configuration();
++      dispatcher = createDispatcher(conf);
++      EventHandler<LocalizerEvent> localizerEventHandler =
++          mock(EventHandler.class);
++      EventHandler<LocalizerEvent> containerEventHandler =
++          mock(EventHandler.class);
++      dispatcher.register(LocalizerEventType.class, localizerEventHandler);
++      dispatcher.register(ContainerEventType.class, containerEventHandler);
++
++      ContainerId cId = BuilderUtils.newContainerId(1, 1, 1, 1);
++      LocalizerContext lc = new LocalizerContext(user, cId, null);
++
++      LocalResourceRequest req =
++          createLocalResourceRequest(user, 1, 1, LocalResourceVisibility.PUBLIC);
++      LocalizedResource lr = createLocalizedResource(req, dispatcher);
++      ConcurrentMap<LocalResourceRequest, LocalizedResource> localrsrc =
++          new ConcurrentHashMap<LocalResourceRequest, LocalizedResource>();
++      localrsrc.put(req, lr);
++      LocalResourcesTracker tracker =
++          new LocalResourcesTrackerImpl(user, null, dispatcher, localrsrc,
++              false, conf, new NMNullStateStoreService());
++
++      // request the resource
++      ResourceEvent reqEvent =
++          new ResourceRequestEvent(req, LocalResourceVisibility.PUBLIC, lc);
++      tracker.handle(reqEvent);
++
++      // release the resource
++      ResourceEvent relEvent = new ResourceReleaseEvent(req, cId);
++      tracker.handle(relEvent);
++
++      // download completing after release
++      ResourceLocalizedEvent rle =
++          new ResourceLocalizedEvent(req, new Path("file:///tmp/r1"), 1);
++      tracker.handle(rle);
++
++      dispatcher.await();
++    } finally {
++      if (dispatcher != null) {
++        dispatcher.stop();
++      }
++    }
++  }
++
+   private boolean createdummylocalizefile(Path path) {
+     boolean ret = false;
+     File file = new File(path.toUri().getRawPath().toString());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
+index 09728e1..1cc5372 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestResourceLocalizationService.java
+@@ -487,8 +487,8 @@ public void testResourceRelease() throws Exception {
+         Assert.assertEquals("Incorrect reference count", 0, lr.getRefCount());
+         pubRsrcs.remove(lr.getRequest());
+       }
+-      Assert.assertEquals(2, pubRsrcs.size());
+-      Assert.assertEquals(0, pubRsrcCount);
++      Assert.assertEquals(0, pubRsrcs.size());
++      Assert.assertEquals(2, pubRsrcCount);
+ 
+       appRsrcCount = 0;
+       for (LocalizedResource lr : appTracker) {
+-- 
+1.7.9.5
+

@@ -1,0 +1,96 @@
+From 2bdd53660a82a2299237bcc762382db2fece636d Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Mon, 28 Sep 2015 15:19:57 -0500
+Subject: [PATCH 1193/2848] HDFS-9106. Transfer failure during pipeline
+ recovery causes permanent write failures.
+ Contributed by Kihwal Lee.
+
+(cherry picked from commit 6e7c76a5bd6e3376efad6763308932ae02917002)
+
+Change-Id: I965a2e20ac3e44175313a9ebbf1b4d590a662387
+---
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   58 +++++++++++++++-----
+ 1 file changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index 4cd3a2c..652114b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -1216,22 +1216,46 @@ private void addDatanode2ExistingPipeline() throws IOException {
+         return;
+       }
+ 
+-      //get a new datanode
++      int tried = 0;
+       final DatanodeInfo[] original = nodes;
+-      final LocatedBlock lb = dfsClient.namenode.getAdditionalDatanode(
+-          src, fileId, block, nodes, storageIDs,
+-          failed.toArray(new DatanodeInfo[failed.size()]),
+-          1, dfsClient.clientName);
+-      setPipeline(lb);
++      final StorageType[] originalTypes = storageTypes;
++      final String[] originalIDs = storageIDs;
++      IOException caughtException = null;
++      ArrayList<DatanodeInfo> exclude = new ArrayList<DatanodeInfo>(failed);
++      while (tried < 3) {
++        LocatedBlock lb;
++        //get a new datanode
++        lb = dfsClient.namenode.getAdditionalDatanode(
++            src, fileId, block, nodes, storageIDs,
++            exclude.toArray(new DatanodeInfo[exclude.size()]),
++            1, dfsClient.clientName);
++        // a new node was allocated by the namenode. Update nodes.
++        setPipeline(lb);
++
++        //find the new datanode
++        final int d = findNewDatanode(original);
++        //transfer replica. pick a source from the original nodes
++        final DatanodeInfo src = original[tried % original.length];
++        final DatanodeInfo[] targets = {nodes[d]};
++        final StorageType[] targetStorageTypes = {storageTypes[d]};
+ 
+-      //find the new datanode
+-      final int d = findNewDatanode(original);
+-
+-      //transfer replica
+-      final DatanodeInfo src = d == 0? nodes[1]: nodes[d - 1];
+-      final DatanodeInfo[] targets = {nodes[d]};
+-      final StorageType[] targetStorageTypes = {storageTypes[d]};
+-      transfer(src, targets, targetStorageTypes, lb.getBlockToken());
++        try {
++          transfer(src, targets, targetStorageTypes, lb.getBlockToken());
++        } catch (IOException ioe) {
++          DFSClient.LOG.warn("Error transferring data from " + src + " to " +
++              nodes[d] + ": " + ioe.getMessage());
++          caughtException = ioe;
++          // add the allocated node to the exclude list.
++          exclude.add(nodes[d]);
++          setPipeline(original, originalTypes, originalIDs);
++          tried++;
++          continue;
++        }
++        return; // finished successfully
++      }
++      // All retries failed
++      throw (caughtException != null) ? caughtException :
++         new IOException("Failed to add a node");
+     }
+ 
+     private void transfer(final DatanodeInfo src, final DatanodeInfo[] targets,
+@@ -1244,8 +1268,12 @@ private void transfer(final DatanodeInfo src, final DatanodeInfo[] targets,
+       try {
+         sock = createSocketForPipeline(src, 2, dfsClient);
+         final long writeTimeout = dfsClient.getDatanodeWriteTimeout(2);
+-        final long readTimeout = dfsClient.getDatanodeReadTimeout(2);
+         
++        // transfer timeout multiplier based on the transfer size
++        // One per 200 packets = 12.8MB. Minimum is 2.
++        int multi = 2 + (int)(bytesSent/dfsClient.getConf().writePacketSize)/200;
++        final long readTimeout = dfsClient.getDatanodeReadTimeout(multi);
++
+         OutputStream unbufOut = NetUtils.getOutputStream(sock, writeTimeout);
+         InputStream unbufIn = NetUtils.getInputStream(sock, readTimeout);
+         IOStreamPair saslStreams = dfsClient.saslClient.socketSend(sock,
+-- 
+1.7.9.5
+

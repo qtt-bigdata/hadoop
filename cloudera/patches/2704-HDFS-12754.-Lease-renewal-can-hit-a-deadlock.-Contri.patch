@@ -1,0 +1,394 @@
+From 4497c6a499b32e46601f6b47c93a5cbee9188da1 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Wed, 22 Nov 2017 13:01:07 -0600
+Subject: [PATCH 2704/2848] HDFS-12754. Lease renewal can hit a deadlock.
+ Contributed by Kuhu Shukla.
+
+(cherry picked from commit 738d1a206aba05f0b4be7d633b17db7fcd1c74bc)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/impl/LeaseRenewer.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/test/java/org/apache/hadoop/hdfs/client/impl/TestLeaseRenewer.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDistributedFileSystem.java
+
+Change-Id: I245b9fecd826f1528165f81a8f574ea84f2c6eae
+---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |   15 +++-
+ .../apache/hadoop/hdfs/DFSClientFaultInjector.java |    2 +
+ .../java/org/apache/hadoop/hdfs/LeaseRenewer.java  |   54 +++++--------
+ .../apache/hadoop/hdfs/TestDFSClientRetries.java   |   80 ++++++++++++++++++++
+ .../hadoop/hdfs/TestDistributedFileSystem.java     |    3 +-
+ .../org/apache/hadoop/hdfs/TestLeaseRenewer.java   |   22 ++----
+ 6 files changed, 123 insertions(+), 53 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 9acce96..19ffc1a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -879,12 +879,21 @@ public LeaseRenewer getLeaseRenewer() {
+   /** Get a lease and start automatic renewal */
+   private void beginFileLease(final long inodeId, final DFSOutputStream out)
+       throws IOException {
+-    getLeaseRenewer().put(inodeId, out, this);
++    synchronized (filesBeingWritten) {
++      putFileBeingWritten(inodeId, out);
++      getLeaseRenewer().put(this);
++    }
+   }
+ 
+   /** Stop renewal of lease for the file. */
+   void endFileLease(final long inodeId) {
+-    getLeaseRenewer().closeFile(inodeId, this);
++    synchronized (filesBeingWritten) {
++      removeFileBeingWritten(inodeId);
++      // remove client from renewer if no files are open
++      if (filesBeingWritten.isEmpty()) {
++        getLeaseRenewer().closeClient(this);
++      }
++    }
+   }
+     
+ 
+@@ -1009,9 +1018,9 @@ public void closeAllFilesBeingWritten(final boolean abort) {
+   @Override
+   public synchronized void close() throws IOException {
+     if(clientRunning) {
++      // lease renewal stops when all files are closed
+       closeAllFilesBeingWritten(false);
+       clientRunning = false;
+-      getLeaseRenewer().closeClient(this);
+       // close connections to the namenode
+       closeConnectionToNamenode();
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+index 1a90d14..ff3fe52 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+@@ -59,4 +59,6 @@ public void fetchFromDatanodeException() {}
+   public void readFromDatanodeDelay() {}
+ 
+   public void sleepBeforeHedgedGet() {}
++
++  public void delayWhenRenewLeaseTimeout() {}
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
+index 0f39d1c..4bac795 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
+@@ -30,6 +30,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
++import org.apache.hadoop.hdfs.DFSClientFaultInjector;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.Daemon;
+@@ -71,7 +72,7 @@
+ class LeaseRenewer {
+   static final Log LOG = LogFactory.getLog(LeaseRenewer.class);
+ 
+-  static final long LEASE_RENEWER_GRACE_DEFAULT = 60*1000L;
++  private static long leaseRenewerGraceDefault = 60*1000L;
+   static final long LEASE_RENEWER_SLEEP_DEFAULT = 1000L;
+ 
+   /** Get a {@link LeaseRenewer} instance */
+@@ -151,9 +152,7 @@ private synchronized void remove(final LeaseRenewer r) {
+       final LeaseRenewer stored = renewers.get(r.factorykey);
+       //Since a renewer may expire, the stored renewer can be different.
+       if (r == stored) {
+-        if (!r.clientsRunning()) {
+-          renewers.remove(r.factorykey);
+-        }
++        renewers.remove(r.factorykey);
+       }
+     }
+   }
+@@ -196,7 +195,7 @@ private synchronized void remove(final LeaseRenewer r) {
+ 
+   private LeaseRenewer(Factory.Key factorykey) {
+     this.factorykey = factorykey;
+-    unsyncSetGraceSleepPeriod(LEASE_RENEWER_GRACE_DEFAULT);
++    unsyncSetGraceSleepPeriod(leaseRenewerGraceDefault);
+     
+     if (LOG.isTraceEnabled()) {
+       instantiationTrace = StringUtils.stringifyException(
+@@ -287,8 +286,7 @@ private synchronized boolean isRenewerExpired() {
+         && Time.now() - emptyTime > gracePeriod;
+   }
+ 
+-  synchronized void put(final long inodeId, final DFSOutputStream out,
+-      final DFSClient dfsc) {
++  public synchronized void put(final DFSClient dfsc) {
+     if (dfsc.isClientRunning()) {
+       if (!isRunning() || isRenewerExpired()) {
+         //start a new deamon with a new id.
+@@ -325,7 +323,6 @@ public String toString() {
+         });
+         daemon.start();
+       }
+-      dfsc.putFileBeingWritten(inodeId, out);
+       emptyTime = Long.MAX_VALUE;
+     }
+   }
+@@ -335,28 +332,6 @@ synchronized void setEmptyTime(long time) {
+     emptyTime = time;
+   }
+ 
+-  /** Close a file. */
+-  void closeFile(final long inodeId, final DFSClient dfsc) {
+-    dfsc.removeFileBeingWritten(inodeId);
+-
+-    synchronized(this) {
+-      if (dfsc.isFilesBeingWrittenEmpty()) {
+-        dfsclients.remove(dfsc);
+-      }
+-      //update emptyTime if necessary
+-      if (emptyTime == Long.MAX_VALUE) {
+-        for(DFSClient c : dfsclients) {
+-          if (!c.isFilesBeingWrittenEmpty()) {
+-            //found a non-empty file-being-written map
+-            return;
+-          }
+-        }
+-        //discover the first time that all file-being-written maps are empty.
+-        emptyTime = Time.now();
+-      }
+-    }
+-  }
+-
+   /** Close the given client. */
+   synchronized void closeClient(final DFSClient dfsc) {
+     dfsclients.remove(dfsc);
+@@ -454,14 +429,17 @@ private void run(final int id) throws InterruptedException {
+         } catch (SocketTimeoutException ie) {
+           LOG.warn("Failed to renew lease for " + clientsString() + " for "
+               + (elapsed/1000) + " seconds.  Aborting ...", ie);
++          List<DFSClient> dfsclientsCopy;
+           synchronized (this) {
+-            while (!dfsclients.isEmpty()) {
+-              DFSClient dfsClient = dfsclients.get(0);
+-              dfsClient.closeAllFilesBeingWritten(true);
+-              closeClient(dfsClient);
+-            }
++            DFSClientFaultInjector.get().delayWhenRenewLeaseTimeout();
++            dfsclientsCopy = new ArrayList<>(dfsclients);
++            dfsclients.clear();
+             //Expire the current LeaseRenewer thread.
+             emptyTime = 0;
++            Factory.INSTANCE.remove(LeaseRenewer.this);
++          }
++          for (DFSClient dfsClient : dfsclientsCopy) {
++            dfsClient.closeAllFilesBeingWritten(true);
+           }
+           break;
+         } catch (IOException ie) {
+@@ -518,4 +496,10 @@ private synchronized String clientsString() {
+       return b.append("]").toString();
+     }
+   }
++
++  @VisibleForTesting
++  public static void setLeaseRenewerGraceDefault(
++      long leaseRenewerGraceDefault) {
++    LeaseRenewer.leaseRenewerGraceDefault = leaseRenewerGraceDefault;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
+index e90ee0a..1e708f4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientRetries.java
+@@ -48,6 +48,7 @@
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.Random;
++import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.commons.logging.Log;
+@@ -1192,4 +1193,83 @@ public void testRetryOnChecksumFailure() throws Exception {
+       cluster.shutdown();
+     }
+   }
++
++  @Test(timeout=120000)
++  public void testLeaseRenewAndDFSOutputStreamDeadLock() throws Exception {
++    final CountDownLatch testLatch = new CountDownLatch(1);
++    DFSClientFaultInjector.set(new DFSClientFaultInjector() {
++      public void delayWhenRenewLeaseTimeout() {
++        try {
++          testLatch.await();
++        } catch (InterruptedException e) {
++          e.printStackTrace();
++        }
++      }
++    });
++    String file1 = "/testFile1";
++    // Set short retry timeouts so this test runs faster
++    conf.setInt(DFS_CLIENT_SOCKET_TIMEOUT_KEY, 1000);
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
++    try {
++      cluster.waitActive();
++      final NamenodeProtocols spyNN = spy(cluster.getNameNodeRpc());
++
++      doAnswer(new SleepFixedTimeAnswer(1500, testLatch)).when(spyNN).complete(
++          anyString(), anyString(), any(ExtendedBlock.class), anyLong());
++      DFSClient client = new DFSClient(null, spyNN, conf, null);
++      // Get hold of the lease renewer instance used by the client
++      LeaseRenewer leaseRenewer = client.getLeaseRenewer();
++      leaseRenewer.setRenewalTime(100);
++      final OutputStream out1 = client.create(file1, false);
++
++      out1.write(new byte[256]);
++
++      Thread closeThread = new Thread(new Runnable() {
++        @Override public void run() {
++          try {
++            //1. trigger get LeaseRenewer lock
++            Mockito.doThrow(new SocketTimeoutException()).when(spyNN)
++                .renewLease(Mockito.anyString());
++          } catch (IOException e) {
++            e.printStackTrace();
++          }
++        }
++      });
++      closeThread.start();
++
++      //2. trigger get DFSOutputStream lock
++      out1.close();
++
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
++  private static class SleepFixedTimeAnswer implements Answer<Object> {
++    private final int sleepTime;
++    private final CountDownLatch testLatch;
++
++    SleepFixedTimeAnswer(int sleepTime, CountDownLatch latch) {
++      this.sleepTime = sleepTime;
++      this.testLatch = latch;
++    }
++
++    @Override
++    public Object answer(InvocationOnMock invocation) throws Throwable {
++      boolean interrupted = false;
++      try {
++        Thread.sleep(sleepTime);
++      } catch (InterruptedException ie) {
++        interrupted = true;
++      }
++      try {
++        return invocation.callRealMethod();
++      } finally {
++        testLatch.countDown();
++        if (interrupted) {
++          Thread.currentThread().interrupt();
++        }
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDistributedFileSystem.java
+index 336c164..310a133 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDistributedFileSystem.java
+@@ -126,7 +126,7 @@ private HdfsConfiguration getTestConfiguration() {
+        conf = new HdfsConfiguration(false);
+        String namenodeDir = new File(MiniDFSCluster.getBaseDirectory(), "name").getAbsolutePath();
+        conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY, namenodeDir);
+-       conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY, namenodeDir);     
++       conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY, namenodeDir);
+     } else {
+        conf = new HdfsConfiguration();
+     }
+@@ -276,6 +276,7 @@ public void testDFSClient() throws Exception {
+     Configuration conf = getTestConfiguration();
+     final long grace = 1000L;
+     MiniDFSCluster cluster = null;
++    LeaseRenewer.setLeaseRenewerGraceDefault(grace);
+ 
+     try {
+       cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRenewer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRenewer.java
+index 8ca4576a..1f9daad 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRenewer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRenewer.java
+@@ -108,7 +108,7 @@ public Boolean answer(InvocationOnMock invocation) throws Throwable {
+     // Set up a file so that we start renewing our lease.
+     DFSOutputStream mockStream = Mockito.mock(DFSOutputStream.class);
+     long fileId = 123L;
+-    renewer.put(fileId, mockStream, MOCK_DFSCLIENT);
++    renewer.put(MOCK_DFSCLIENT);
+ 
+     // Wait for lease to get renewed
+     long failTime = Time.now() + 5000;
+@@ -120,7 +120,7 @@ public Boolean answer(InvocationOnMock invocation) throws Throwable {
+       Assert.fail("Did not renew lease at all!");
+     }
+ 
+-    renewer.closeFile(fileId, MOCK_DFSCLIENT);
++    renewer.closeClient(MOCK_DFSCLIENT);
+   }
+   
+   /**
+@@ -136,10 +136,8 @@ public void testManyDfsClientsWhereSomeNotOpen() throws Exception {
+     assertSame(renewer, LeaseRenewer.getInstance(
+         FAKE_AUTHORITY, FAKE_UGI_A, mockClient1));
+     
+-    // Set up a file so that we start renewing our lease.
+-    DFSOutputStream mockStream1 = Mockito.mock(DFSOutputStream.class);
+     long fileId = 456L;
+-    renewer.put(fileId, mockStream1, mockClient1);
++    renewer.put(mockClient1);
+ 
+     // Second DFSClient does renew lease
+     final DFSClient mockClient2 = createMockClient();
+@@ -147,9 +145,7 @@ public void testManyDfsClientsWhereSomeNotOpen() throws Exception {
+     assertSame(renewer, LeaseRenewer.getInstance(
+         FAKE_AUTHORITY, FAKE_UGI_A, mockClient2));
+ 
+-    // Set up a file so that we start renewing our lease.
+-    DFSOutputStream mockStream2 = Mockito.mock(DFSOutputStream.class);
+-    renewer.put(fileId, mockStream2, mockClient2);
++    renewer.put(mockClient2);
+ 
+     
+     // Wait for lease to get renewed
+@@ -170,19 +166,17 @@ public Boolean get() {
+       }
+     }, 100, 10000);
+ 
+-    renewer.closeFile(fileId, mockClient1);
+-    renewer.closeFile(fileId, mockClient2);
++    renewer.closeClient(mockClient1);
++    renewer.closeClient(mockClient2);
+   }
+   
+   @Test
+   public void testThreadName() throws Exception {
+-    DFSOutputStream mockStream = Mockito.mock(DFSOutputStream.class);
+-    long fileId = 789L;
+     Assert.assertFalse("Renewer not initially running",
+         renewer.isRunning());
+     
+     // Pretend to open a file
+-    renewer.put(fileId, mockStream, MOCK_DFSCLIENT);
++    renewer.put(MOCK_DFSCLIENT);
+     
+     Assert.assertTrue("Renewer should have started running",
+         renewer.isRunning());
+@@ -192,7 +186,7 @@ public void testThreadName() throws Exception {
+     Assert.assertEquals("LeaseRenewer:myuser@hdfs://nn1/", threadName);
+     
+     // Pretend to close the file
+-    renewer.closeFile(fileId, MOCK_DFSCLIENT);
++    renewer.closeClient(MOCK_DFSCLIENT);
+     renewer.setEmptyTime(Time.now());
+     
+     // Should stop the renewer running within a few seconds
+-- 
+1.7.9.5
+

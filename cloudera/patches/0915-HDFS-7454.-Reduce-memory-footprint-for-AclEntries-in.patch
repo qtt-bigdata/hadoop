@@ -1,0 +1,536 @@
+From 38b62e8cd5afe1648130c81b7eb1e60f20c4a2f2 Mon Sep 17 00:00:00 2001
+From: Haohui Mai <wheat9@apache.org>
+Date: Thu, 4 Dec 2014 20:49:45 -0800
+Subject: [PATCH 0915/2848] HDFS-7454. Reduce memory footprint for AclEntries
+ in NameNode. Contributed by Vinayakumar B.
+
+(cherry picked from commit b4478f069a6b9da6e6e8242711bd7b4f94380903)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
+
+The authorization plugin moved a bunch of code from FSPermissionChecker to DefaultAuthorizationProvider, so I had to apply the changes there.
+
+Change-Id: Id276e7dd090641c4d73187da911ae052a7962fb2
+---
+ .../hdfs/server/namenode/AclEntryStatusFormat.java |  136 ++++++++++++++++++++
+ .../hadoop/hdfs/server/namenode/AclFeature.java    |   24 +++-
+ .../hadoop/hdfs/server/namenode/AclStorage.java    |   30 ++++-
+ .../namenode/DefaultAuthorizationProvider.java     |   41 +++---
+ .../hdfs/server/namenode/FSImageFormatPBINode.java |   22 ++--
+ .../hdfs/server/namenode/FSPermissionChecker.java  |   14 ++
+ .../namenode/snapshot/FSImageFormatPBSnapshot.java |   13 +-
+ .../hadoop/hdfs/server/namenode/FSAclBaseTest.java |    4 +-
+ .../server/namenode/TestAuthorizationProvider.java |    2 +-
+ 9 files changed, 235 insertions(+), 51 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclEntryStatusFormat.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclEntryStatusFormat.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclEntryStatusFormat.java
+new file mode 100644
+index 0000000..82aa214
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclEntryStatusFormat.java
+@@ -0,0 +1,136 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hdfs.server.namenode;
++
++import java.util.List;
++
++import org.apache.hadoop.fs.permission.AclEntry;
++import org.apache.hadoop.fs.permission.AclEntryScope;
++import org.apache.hadoop.fs.permission.AclEntryType;
++import org.apache.hadoop.fs.permission.FsAction;
++import org.apache.hadoop.hdfs.util.LongBitFormat;
++
++import com.google.common.collect.ImmutableList;
++
++/**
++ * Class to pack an AclEntry into an integer. <br>
++ * An ACL entry is represented by a 32-bit integer in Big Endian format. <br>
++ * The bits can be divided in four segments: <br>
++ * [0:1) || [1:3) || [3:6) || [6:7) || [7:32) <br>
++ * <br>
++ * [0:1) -- the scope of the entry (AclEntryScope) <br>
++ * [1:3) -- the type of the entry (AclEntryType) <br>
++ * [3:6) -- the permission of the entry (FsAction) <br>
++ * [6:7) -- A flag to indicate whether Named entry or not <br>
++ * [7:32) -- the name of the entry, which is an ID that points to a <br>
++ * string in the StringTableSection. <br>
++ */
++public enum AclEntryStatusFormat {
++
++  SCOPE(null, 1),
++  TYPE(SCOPE.BITS, 2),
++  PERMISSION(TYPE.BITS, 3),
++  NAMED_ENTRY_CHECK(PERMISSION.BITS, 1),
++  NAME(NAMED_ENTRY_CHECK.BITS, 25);
++
++  private final LongBitFormat BITS;
++
++  private AclEntryStatusFormat(LongBitFormat previous, int length) {
++    BITS = new LongBitFormat(name(), previous, length, 0);
++  }
++
++  static AclEntryScope getScope(int aclEntry) {
++    int ordinal = (int) SCOPE.BITS.retrieve(aclEntry);
++    return AclEntryScope.values()[ordinal];
++  }
++
++  static AclEntryType getType(int aclEntry) {
++    int ordinal = (int) TYPE.BITS.retrieve(aclEntry);
++    return AclEntryType.values()[ordinal];
++  }
++
++  static FsAction getPermission(int aclEntry) {
++    int ordinal = (int) PERMISSION.BITS.retrieve(aclEntry);
++    return FsAction.values()[ordinal];
++  }
++
++  static String getName(int aclEntry) {
++    int nameExists = (int) NAMED_ENTRY_CHECK.BITS.retrieve(aclEntry);
++    if (nameExists == 0) {
++      return null;
++    }
++    int id = (int) NAME.BITS.retrieve(aclEntry);
++    AclEntryType type = getType(aclEntry);
++    if (type == AclEntryType.USER) {
++      return SerialNumberManager.INSTANCE.getUser(id);
++    } else if (type == AclEntryType.GROUP) {
++      return SerialNumberManager.INSTANCE.getGroup(id);
++    }
++    return null;
++  }
++
++  static int toInt(AclEntry aclEntry) {
++    long aclEntryInt = 0;
++    aclEntryInt = SCOPE.BITS
++        .combine(aclEntry.getScope().ordinal(), aclEntryInt);
++    aclEntryInt = TYPE.BITS.combine(aclEntry.getType().ordinal(), aclEntryInt);
++    aclEntryInt = PERMISSION.BITS.combine(aclEntry.getPermission().ordinal(),
++        aclEntryInt);
++    if (aclEntry.getName() != null) {
++      aclEntryInt = NAMED_ENTRY_CHECK.BITS.combine(1, aclEntryInt);
++      if (aclEntry.getType() == AclEntryType.USER) {
++        int userId = SerialNumberManager.INSTANCE.getUserSerialNumber(aclEntry
++            .getName());
++        aclEntryInt = NAME.BITS.combine(userId, aclEntryInt);
++      } else if (aclEntry.getType() == AclEntryType.GROUP) {
++        int groupId = SerialNumberManager.INSTANCE
++            .getGroupSerialNumber(aclEntry.getName());
++        aclEntryInt = NAME.BITS.combine(groupId, aclEntryInt);
++      }
++    }
++    return (int) aclEntryInt;
++  }
++
++  static AclEntry toAclEntry(int aclEntry) {
++    AclEntry.Builder builder = new AclEntry.Builder();
++    builder.setScope(getScope(aclEntry)).setType(getType(aclEntry))
++        .setPermission(getPermission(aclEntry));
++    if (getName(aclEntry) != null) {
++      builder.setName(getName(aclEntry));
++    }
++    return builder.build();
++  }
++
++  public static int[] toInt(List<AclEntry> aclEntries) {
++    int[] entries = new int[aclEntries.size()];
++    for (int i = 0; i < entries.length; i++) {
++      entries[i] = toInt(aclEntries.get(i));
++    }
++    return entries;
++  }
++
++  public static ImmutableList<AclEntry> toAclEntries(int[] entries) {
++    ImmutableList.Builder<AclEntry> b = new ImmutableList.Builder<AclEntry>();
++    for (int entry : entries) {
++      AclEntry aclEntry = toAclEntry(entry);
++      b.add(aclEntry);
++    }
++    return b.build();
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclFeature.java
+index 1c5f469..e097b05 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclFeature.java
+@@ -21,6 +21,7 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.permission.AclEntry;
+ 
++import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableList;
+ 
+ /**
+@@ -31,13 +32,28 @@
+   public static final ImmutableList<AclEntry> EMPTY_ENTRY_LIST =
+     ImmutableList.of();
+ 
+-  private final ImmutableList<AclEntry> entries;
++  private final int [] entries;
+ 
+-  public AclFeature(ImmutableList<AclEntry> entries) {
++  public AclFeature(int[] entries) {
+     this.entries = entries;
+   }
+ 
+-  public ImmutableList<AclEntry> getEntries() {
+-    return entries;
++  /**
++   * Get the number of entries present
++   */
++  int getEntriesSize() {
++    return entries.length;
++  }
++
++  /**
++   * Get the entry at the specified position
++   * @param pos Position of the entry to be obtained
++   * @return integer representation of AclEntry
++   * @throws IndexOutOfBoundsException if pos out of bound
++   */
++  int getEntryAt(int pos) {
++    Preconditions.checkPositionIndex(pos, entries.length,
++        "Invalid position for AclEntry");
++    return entries[pos];
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclStorage.java
+index c15d64e..ac30597 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclStorage.java
+@@ -20,6 +20,7 @@
+ import java.util.Collections;
+ import java.util.List;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.Lists;
+ 
+@@ -76,7 +77,8 @@ public static void copyINodeDefaultAcl(INode child) {
+     }
+ 
+     // Split parent's entries into access vs. default.
+-    List<AclEntry> featureEntries = parent.getAclFeature().getEntries();
++    List<AclEntry> featureEntries = getEntriesFromAclFeature(parent
++        .getAclFeature());
+     ScopedAclEntries scopedEntries = new ScopedAclEntries(featureEntries);
+     List<AclEntry> parentDefaultEntries = scopedEntries.getDefaultEntries();
+ 
+@@ -153,7 +155,25 @@ public static void copyINodeDefaultAcl(INode child) {
+    */
+   public static List<AclEntry> readINodeAcl(INode inode, int snapshotId) {
+     AclFeature f = inode.getAclFeature(snapshotId);
+-    return f == null ? ImmutableList.<AclEntry> of() : f.getEntries();
++    return getEntriesFromAclFeature(f);
++  }
++
++  /**
++   * Build list of AclEntries from the AclFeature
++   * @param aclFeature AclFeature
++   * @return List of entries
++   */
++  @VisibleForTesting
++  static ImmutableList<AclEntry> getEntriesFromAclFeature(AclFeature aclFeature) {
++    if (aclFeature == null) {
++      return ImmutableList.<AclEntry> of();
++    }
++    ImmutableList.Builder<AclEntry> b = new ImmutableList.Builder<AclEntry>();
++    for (int pos = 0, entry; pos < aclFeature.getEntriesSize(); pos++) {
++      entry = aclFeature.getEntryAt(pos);
++      b.add(AclEntryStatusFormat.toAclEntry(entry));
++    }
++    return b.build();
+   }
+ 
+   /**
+@@ -179,7 +199,7 @@ public static void copyINodeDefaultAcl(INode child) {
+ 
+     final List<AclEntry> existingAcl;
+     // Split ACL entries stored in the feature into access vs. default.
+-    List<AclEntry> featureEntries = f.getEntries();
++    List<AclEntry> featureEntries = getEntriesFromAclFeature(f);
+     ScopedAclEntries scoped = new ScopedAclEntries(featureEntries);
+     List<AclEntry> accessEntries = scoped.getAccessEntries();
+     List<AclEntry> defaultEntries = scoped.getDefaultEntries();
+@@ -235,7 +255,7 @@ public static void removeINodeAcl(INode inode, int snapshotId)
+     }
+ 
+     FsPermission perm = inode.getFsPermission();
+-    List<AclEntry> featureEntries = f.getEntries();
++    List<AclEntry> featureEntries = getEntriesFromAclFeature(f);
+     if (featureEntries.get(0).getScope() == AclEntryScope.ACCESS) {
+       // Restore group permissions from the feature's entry to permission
+       // bits, overwriting the mask, which is not part of a minimal ACL.
+@@ -330,7 +350,7 @@ private static AclFeature createAclFeature(List<AclEntry> accessEntries,
+ 
+     // Add all default entries to the feature.
+     featureEntries.addAll(defaultEntries);
+-    return new AclFeature(ImmutableList.copyOf(featureEntries));
++    return new AclFeature(AclEntryStatusFormat.toInt(featureEntries));
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DefaultAuthorizationProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DefaultAuthorizationProvider.java
+index c11b9c4..420fbb4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DefaultAuthorizationProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/DefaultAuthorizationProvider.java
+@@ -251,11 +251,9 @@ private void check(String user, Set<String> groups, INode inode,
+     FsPermission mode = inode.getFsPermission(snapshotId);
+     AclFeature aclFeature = inode.getAclFeature(snapshotId);
+     if (aclFeature != null) {
+-      List<AclEntry> featureEntries = aclFeature.getEntries();
+-      // It's possible that the inode has a default ACL but no access ACL.
+-      if (featureEntries.get(0).getScope() == AclEntryScope.ACCESS) {
+-        checkAccessAcl(user, groups, inode, snapshotId, access, mode,
+-            featureEntries);
++      int firstEntry = aclFeature.getEntryAt(0);
++      if (AclEntryStatusFormat.getScope(firstEntry) == AclEntryScope.ACCESS) {
++        checkAccessAcl(user, groups, inode, snapshotId, access, mode, aclFeature);
+         return;
+       }
+     }
+@@ -302,12 +300,12 @@ private void checkFsPermission(String user, Set<String> groups, INode inode,
+    * @param snapshotId int snapshot ID
+    * @param access FsAction requested permission
+    * @param mode FsPermission mode from inode
+-   * @param featureEntries List<AclEntry> ACL entries from AclFeature of inode
++   * @param aclFeature AclFeature of inode
+    * @throws AccessControlException if the ACL denies permission
+    */
+   private void checkAccessAcl(String user, Set<String> groups, INode inode,
+       int snapshotId,  FsAction access, FsPermission mode,
+-      List<AclEntry> featureEntries) throws AccessControlException {
++      AclFeature aclFeature) throws AccessControlException {
+     boolean foundMatch = false;
+ 
+     // Use owner entry from permission bits if user is owner.
+@@ -320,17 +318,19 @@ private void checkAccessAcl(String user, Set<String> groups, INode inode,
+ 
+     // Check named user and group entries if user was not denied by owner entry.
+     if (!foundMatch) {
+-      for (AclEntry entry : featureEntries) {
+-        if (entry.getScope() == AclEntryScope.DEFAULT) {
++      for (int pos = 0, entry; pos < aclFeature.getEntriesSize(); pos++) {
++        entry = aclFeature.getEntryAt(pos);
++        if (AclEntryStatusFormat.getScope(entry) == AclEntryScope.DEFAULT) {
+           break;
+         }
+-        AclEntryType type = entry.getType();
+-        String name = entry.getName();
++        AclEntryType type = AclEntryStatusFormat.getType(entry);
++        String name = AclEntryStatusFormat.getName(entry);
+         if (type == AclEntryType.USER) {
+           // Use named user entry with mask from permission bits applied if user
+           // matches name.
+           if (user.equals(name)) {
+-            FsAction masked = entry.getPermission().and(mode.getGroupAction());
++            FsAction masked = AclEntryStatusFormat.getPermission(entry).and(
++                mode.getGroupAction());
+             if (masked.implies(access)) {
+               return;
+             }
+@@ -344,7 +344,8 @@ private void checkAccessAcl(String user, Set<String> groups, INode inode,
+           // it doesn't matter which is chosen, so exit early after first match.
+           String group = name == null ? inode.getGroupName(snapshotId) : name;
+           if (groups.contains(group)) {
+-            FsAction masked = entry.getPermission().and(mode.getGroupAction());
++            FsAction masked = AclEntryStatusFormat.getPermission(entry).and(
++                mode.getGroupAction());
+             if (masked.implies(access)) {
+               return;
+             }
+@@ -360,8 +361,7 @@ private void checkAccessAcl(String user, Set<String> groups, INode inode,
+     }
+ 
+     throw new AccessControlException(
+-        toAccessControlString(user, inode, snapshotId, access, mode,
+-            featureEntries));
++        toAccessControlString(user, inode, snapshotId, access, mode));
+   }
+ 
+   /**
+@@ -392,14 +392,6 @@ private void checkStickyBit(String user, INode parent, INode inode,
+    */
+   private String toAccessControlString(String user, INode inode, int snapshotId,
+       FsAction access, FsPermission mode) {
+-    return toAccessControlString(user, inode, snapshotId, access, mode, null);
+-  }
+-
+-  /**
+-   * @return a string for throwing {@link AccessControlException}
+-   */
+-  private String toAccessControlString(String user, INode inode, int snapshotId,
+-      FsAction access, FsPermission mode, List<AclEntry> featureEntries) {
+     StringBuilder sb = new StringBuilder("Permission denied: ")
+         .append("user=").append(user).append(", ")
+         .append("access=").append(access).append(", ")
+@@ -408,9 +400,6 @@ private String toAccessControlString(String user, INode inode, int snapshotId,
+         .append(inode.getGroupName(snapshotId)).append(':')
+         .append(inode.isDirectory() ? 'd' : '-')
+         .append(mode);
+-    if (featureEntries != null) {
+-      sb.append(':').append(StringUtils.join(",", featureEntries));
+-    }
+     return sb.toString();
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatPBINode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatPBINode.java
+index 5631b2b..b1fb1a0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatPBINode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatPBINode.java
+@@ -156,8 +156,9 @@ public static INodeDirectory loadINodeDirectory(INodeSection.INode n,
+       }
+ 
+       if (d.hasAcl()) {
+-        dir.addAclFeature(new AclFeature(loadAclEntries(d.getAcl(),
+-            state.getStringTable())));
++        int[] entries = AclEntryStatusFormat.toInt(loadAclEntries(
++            d.getAcl(), state.getStringTable()));
++        dir.addAclFeature(new AclFeature(entries));
+       }
+       if (d.hasXAttrs()) {
+         dir.addXAttrFeature(new XAttrFeature(
+@@ -293,8 +294,9 @@ private INodeFile loadINodeFile(INodeSection.INode n) {
+           (byte)f.getStoragePolicyID());
+ 
+       if (f.hasAcl()) {
+-        file.addAclFeature(new AclFeature(loadAclEntries(f.getAcl(),
+-            state.getStringTable())));
++        int[] entries = AclEntryStatusFormat.toInt(loadAclEntries(
++            f.getAcl(), state.getStringTable()));
++        file.addAclFeature(new AclFeature(entries));
+       }
+       
+       if (f.hasXAttrs()) {
+@@ -359,11 +361,13 @@ private static long buildPermissionStatus(INodeAttributes n,
+     private static AclFeatureProto.Builder buildAclEntries(AclFeature f,
+         final SaverContext.DeduplicationMap<String> map) {
+       AclFeatureProto.Builder b = AclFeatureProto.newBuilder();
+-      for (AclEntry e : f.getEntries()) {
+-        int v = ((map.getId(e.getName()) & ACL_ENTRY_NAME_MASK) << ACL_ENTRY_NAME_OFFSET)
+-            | (e.getType().ordinal() << ACL_ENTRY_TYPE_OFFSET)
+-            | (e.getScope().ordinal() << ACL_ENTRY_SCOPE_OFFSET)
+-            | (e.getPermission().ordinal());
++      for (int pos = 0, e; pos < f.getEntriesSize(); pos++) {
++        e = f.getEntryAt(pos);
++        int nameId = map.getId(AclEntryStatusFormat.getName(e));
++        int v = ((nameId & ACL_ENTRY_NAME_MASK) << ACL_ENTRY_NAME_OFFSET)
++            | (AclEntryStatusFormat.getType(e).ordinal() << ACL_ENTRY_TYPE_OFFSET)
++            | (AclEntryStatusFormat.getScope(e).ordinal() << ACL_ENTRY_SCOPE_OFFSET)
++            | (AclEntryStatusFormat.getPermission(e).ordinal());
+         b.addEntries(v);
+       }
+       return b;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
+index 75f4b7a..7e2e173 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSPermissionChecker.java
+@@ -40,6 +40,20 @@
+ class FSPermissionChecker {
+   static final Log LOG = LogFactory.getLog(UserGroupInformation.class);
+ 
++  /** @return a string for throwing {@link AccessControlException} */
++  private String toAccessControlString(INode inode, int snapshotId,
++      FsAction access, FsPermission mode) {
++    StringBuilder sb = new StringBuilder("Permission denied: ")
++      .append("user=").append(user).append(", ")
++      .append("access=").append(access).append(", ")
++      .append("inode=\"").append(inode.getFullPathName()).append("\":")
++      .append(inode.getUserName(snapshotId)).append(':')
++      .append(inode.getGroupName(snapshotId)).append(':')
++      .append(inode.isDirectory() ? 'd' : '-')
++      .append(mode);
++    return sb.toString();
++  }
++
+   private final UserGroupInformation ugi;
+   private final String user;  
+   /** A set with group namess. Not synchronized since it is unmodifiable */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
+index e7598d8..9de9c6d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
+@@ -36,6 +36,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
++import org.apache.hadoop.hdfs.server.namenode.AclEntryStatusFormat;
+ import org.apache.hadoop.hdfs.server.namenode.AclFeature;
+ import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageFormatPBINode;
+@@ -208,8 +209,10 @@ private void loadFileDiffList(InputStream in, INodeFile file, int size)
+ 
+           AclFeature acl = null;
+           if (fileInPb.hasAcl()) {
+-            acl = new AclFeature(FSImageFormatPBINode.Loader.loadAclEntries(
+-                fileInPb.getAcl(), state.getStringTable()));
++            int[] entries = AclEntryStatusFormat
++                .toInt(FSImageFormatPBINode.Loader.loadAclEntries(
++                    fileInPb.getAcl(), state.getStringTable()));
++            acl = new AclFeature(entries);
+           }
+           XAttrFeature xAttrs = null;
+           if (fileInPb.hasXAttrs()) {
+@@ -310,8 +313,10 @@ private void loadDirectoryDiffList(InputStream in, INodeDirectory dir,
+               dirCopyInPb.getPermission(), state.getStringTable());
+           AclFeature acl = null;
+           if (dirCopyInPb.hasAcl()) {
+-            acl = new AclFeature(FSImageFormatPBINode.Loader.loadAclEntries(
+-                dirCopyInPb.getAcl(), state.getStringTable()));
++            int[] entries = AclEntryStatusFormat
++                .toInt(FSImageFormatPBINode.Loader.loadAclEntries(
++                    dirCopyInPb.getAcl(), state.getStringTable()));
++            acl = new AclFeature(entries);
+           }
+           XAttrFeature xAttrs = null;
+           if (dirCopyInPb.hasXAttrs()) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
+index d95a4bd..4eec908 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
+@@ -1420,8 +1420,8 @@ private static void assertAclFeature(Path pathToCheck,
+       // Intentionally capturing a reference to the entries, not using nested
+       // calls.  This way, we get compile-time enforcement that the entries are
+       // stored in an ImmutableList.
+-      ImmutableList<AclEntry> entries = aclFeature.getEntries();
+-      assertNotNull(entries);
++      ImmutableList<AclEntry> entries = AclStorage
++          .getEntriesFromAclFeature(aclFeature);
+       assertFalse(entries.isEmpty());
+     } else {
+       assertNull(aclFeature);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
+index 763fad6..8f26b61 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuthorizationProvider.java
+@@ -201,7 +201,7 @@ public AclFeature getAclFeature(INodeAuthorizationInfo node,
+       } else {
+         AclEntry acl = new AclEntry.Builder().setType(AclEntryType.GROUP).
+             setPermission(FsAction.ALL).setName("xxx").build();
+-        f = new AclFeature(ImmutableList.of(acl));
++        f = new AclFeature(AclEntryStatusFormat.toInt(ImmutableList.of(acl)));
+       }
+       return f;
+     }
+-- 
+1.7.9.5
+

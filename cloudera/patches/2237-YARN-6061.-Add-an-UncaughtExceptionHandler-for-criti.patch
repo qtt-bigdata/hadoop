@@ -1,0 +1,446 @@
+From 05e5e409c0b2c3f08641b0baa9856d88e1c73847 Mon Sep 17 00:00:00 2001
+From: Yufei Gu <yufei.gu@cloudera.com>
+Date: Wed, 15 Feb 2017 14:38:02 -0800
+Subject: [PATCH 2237/2848] YARN-6061. Add an UncaughtExceptionHandler for
+ critical threads in RM. (Yufei Gu via kasha)
+
+(cherry picked from commit 652679aa8ad6f9e61b8ed8e2b04b3e0332025e94)
+(cherry picked from commit 37921b3fef26e74a1daccaa278e895bc01d45a1e)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+
+Modifications:
+1. No EmbeddedElector interface in CDH, use the old way in StandByTransitionRunnable#run of ResourceManager.
+2. Add one method to set exitOnDispatchException in class AsyncDispatcher.
+3. Include YARN-6061. Addendum. Remove extraneous change.
+
+Change-Id: I3a3113227217d5621f5896a77491917fdf8d251a
+---
+ .../apache/hadoop/yarn/client/TestRMFailover.java  |  104 +++++++++++++++++++-
+ .../apache/hadoop/yarn/event/AsyncDispatcher.java  |    5 +
+ .../yarn/server/resourcemanager/RMContext.java     |    2 +
+ .../yarn/server/resourcemanager/RMContextImpl.java |   10 ++
+ .../RMCriticalThreadUncaughtExceptionHandler.java  |   58 +++++++++++
+ .../server/resourcemanager/RMFatalEventType.java   |    5 +-
+ .../server/resourcemanager/ResourceManager.java    |   60 ++++++++---
+ .../resourcemanager/recovery/RMStateStore.java     |   13 +--
+ 8 files changed, 231 insertions(+), 26 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMCriticalThreadUncaughtExceptionHandler.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+index 5725b7e..d3ea447d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+@@ -22,7 +22,10 @@
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertSame;
+ import static org.junit.Assert.fail;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.verify;
+ 
+ import java.io.IOException;
+ import java.net.HttpURLConnection;
+@@ -36,14 +39,18 @@
+ import org.apache.hadoop.ha.HAServiceProtocol;
+ import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
+ import org.apache.hadoop.service.Service.STATE;
++import org.apache.hadoop.util.ExitUtil;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.client.api.YarnClient;
+ import org.apache.hadoop.yarn.conf.HAUtil;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.event.AsyncDispatcher;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.server.MiniYARNCluster;
+ import org.apache.hadoop.yarn.server.resourcemanager.AdminService;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
++import org.apache.hadoop.yarn.server.resourcemanager.RMCriticalThreadUncaughtExceptionHandler;
++import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+ import org.apache.hadoop.yarn.server.webproxy.WebAppProxyServer;
+ import org.apache.hadoop.yarn.webapp.YarnWebParams;
+ import org.junit.After;
+@@ -195,7 +202,7 @@ public void testAutomaticFailover()
+     // so it transitions to standby.
+     ResourceManager rm = cluster.getResourceManager(
+         cluster.getActiveRMIndex());
+-    rm.handleTransitionToStandBy();
++    rm.handleTransitionToStandByInNewThread();
+     int maxWaitingAttempts = 2000;
+     while (maxWaitingAttempts-- > 0 ) {
+       if (rm.getRMContext().getHAServiceState() == HAServiceState.STANDBY) {
+@@ -370,4 +377,99 @@ static String getRefreshURL(String url) {
+     }
+     return redirectUrl;
+   }
++
++  /**
++   * Throw {@link RuntimeException} inside a thread of
++   * {@link ResourceManager} with HA enabled and check if the
++   * {@link ResourceManager} is transited to standby state.
++   *
++   * @throws InterruptedException if any
++   */
++  @Test
++  public void testUncaughtExceptionHandlerWithHAEnabled()
++      throws InterruptedException {
++    conf.set(YarnConfiguration.RM_CLUSTER_ID, "yarn-test-cluster");
++    conf.set(YarnConfiguration.RM_ZK_ADDRESS, hostPort);
++    cluster.init(conf);
++    cluster.start();
++    assertFalse("RM never turned active", -1 == cluster.getActiveRMIndex());
++
++    ResourceManager resourceManager = cluster.getResourceManager(
++        cluster.getActiveRMIndex());
++
++    final RMCriticalThreadUncaughtExceptionHandler exHandler =
++        new RMCriticalThreadUncaughtExceptionHandler(
++            resourceManager.getRMContext());
++
++    // Create a thread and throw a RTE inside it
++    final RuntimeException rte = new RuntimeException("TestRuntimeException");
++    final Thread testThread = new Thread(new Runnable() {
++      @Override
++      public void run() {
++        throw rte;
++      }
++    });
++    testThread.setName("TestThread");
++    testThread.setUncaughtExceptionHandler(exHandler);
++    testThread.start();
++    testThread.join();
++
++    int maxWaitingAttempts = 2000;
++    while (maxWaitingAttempts-- > 0) {
++      if (resourceManager.getRMContext().getHAServiceState()
++          == HAServiceState.STANDBY) {
++        break;
++      }
++      Thread.sleep(1);
++    }
++    assertFalse("RM didn't transition to Standby ", maxWaitingAttempts < 0);
++  }
++
++  /**
++   * Throw {@link RuntimeException} inside a thread of
++   * {@link ResourceManager} with HA disabled and check
++   * {@link RMCriticalThreadUncaughtExceptionHandler} instance.
++   *
++   * Used {@link ExitUtil} class to avoid jvm exit through
++   * {@code System.exit(-1)}.
++   *
++   * @throws InterruptedException if any
++   */
++  @Test
++  public void testUncaughtExceptionHandlerWithoutHA()
++      throws InterruptedException {
++    ExitUtil.disableSystemExit();
++
++    // Create a MockRM and start it
++    ResourceManager resourceManager = new MockRM();
++    ((AsyncDispatcher) resourceManager.getRMContext().getDispatcher()).start();
++    AsyncDispatcher dispatcher = (AsyncDispatcher) resourceManager.
++        getRMContext().getDispatcher();
++    dispatcher.setExitOnDispatchException(false);
++    dispatcher.start();
++    resourceManager.getRMContext().getStateStore().start();
++    resourceManager.getRMContext().getContainerTokenSecretManager().
++        rollMasterKey();
++
++    final RMCriticalThreadUncaughtExceptionHandler exHandler =
++        new RMCriticalThreadUncaughtExceptionHandler(
++            resourceManager.getRMContext());
++    final RMCriticalThreadUncaughtExceptionHandler spyRTEHandler =
++        spy(exHandler);
++
++    // Create a thread and throw a RTE inside it
++    final RuntimeException rte = new RuntimeException("TestRuntimeException");
++    final Thread testThread = new Thread(new Runnable() {
++      @Override public void run() {
++        throw rte;
++      }
++    });
++    testThread.setName("TestThread");
++    testThread.setUncaughtExceptionHandler(spyRTEHandler);
++    assertSame(spyRTEHandler, testThread.getUncaughtExceptionHandler());
++    testThread.start();
++    testThread.join();
++
++    verify(spyRTEHandler).uncaughtException(testThread, rte);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
+index 6ac071b..0d819b5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
+@@ -121,6 +121,11 @@ protected void serviceInit(Configuration conf) throws Exception {
+     super.serviceInit(conf);
+   }
+ 
++  @VisibleForTesting
++  public void setExitOnDispatchException(boolean exitOnDispatchException) {
++    this.exitOnDispatchException = exitOnDispatchException;
++  }
++
+   @Override
+   protected void serviceStart() throws Exception {
+     //start all the components
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+index bc50268..3041f6b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+@@ -124,4 +124,6 @@ void setRMApplicationHistoryWriter(
+   boolean isSchedulerReadyForAllocatingContainers();
+   
+   Configuration getYarnConfiguration();
++
++  ResourceManager getResourceManager();
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+index 281c121..b033b58 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+@@ -68,6 +68,7 @@
+ 
+   private Configuration yarnConfiguration;
+ 
++  private ResourceManager resourceManager;
+   /**
+    * Default constructor. To be used in conjunction with setter methods for
+    * individual fields.
+@@ -410,4 +411,13 @@ public Configuration getYarnConfiguration() {
+   public void setYarnConfiguration(Configuration yarnConfiguration) {
+     this.yarnConfiguration=yarnConfiguration;
+   }
++
++  @Override
++  public ResourceManager getResourceManager() {
++    return resourceManager;
++  }
++
++  public void setResourceManager(ResourceManager rm) {
++    this.resourceManager = rm;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMCriticalThreadUncaughtExceptionHandler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMCriticalThreadUncaughtExceptionHandler.java
+new file mode 100644
+index 0000000..c5c6087
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMCriticalThreadUncaughtExceptionHandler.java
+@@ -0,0 +1,58 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager;
++
++import java.lang.Thread.UncaughtExceptionHandler;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.classification.InterfaceAudience.Private;
++import org.apache.hadoop.yarn.conf.HAUtil;
++
++/**
++ * This class either shuts down {@link ResourceManager} or transitions the
++ * {@link ResourceManager} to standby state if a critical thread throws an
++ * uncaught exception. It is intended to be installed by calling
++ * {@code setUncaughtExceptionHandler(Thread.UncaughtExceptionHandler)}
++ * in the thread entry point or after creation of threads.
++ */
++@Private
++public class RMCriticalThreadUncaughtExceptionHandler
++    implements UncaughtExceptionHandler {
++  private static final Log LOG = LogFactory.getLog(
++      RMCriticalThreadUncaughtExceptionHandler.class);
++  private RMContext rmContext;
++
++  public RMCriticalThreadUncaughtExceptionHandler(RMContext rmContext) {
++    this.rmContext = rmContext;
++  }
++
++  @Override
++  public void uncaughtException(Thread t, Throwable e) {
++    LOG.fatal("Critical thread " + t.getName() + " crashed!", e);
++
++    if (HAUtil.isHAEnabled(rmContext.getYarnConfiguration())) {
++      rmContext.getResourceManager().handleTransitionToStandByInNewThread();
++    } else {
++      rmContext.getDispatcher().getEventHandler().handle(
++          new RMFatalEvent(RMFatalEventType.CRITICAL_THREAD_CRASH,
++              new Exception(e)));
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+index 87cc496..b6f6b3c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+@@ -29,5 +29,8 @@
+   EMBEDDED_ELECTOR_FAILED,
+ 
+   // Source <- Admin Service
+-  TRANSITION_TO_ACTIVE_FAILED
++  TRANSITION_TO_ACTIVE_FAILED,
++
++  // Source <- Critical Thread Crash
++  CRITICAL_THREAD_CRASH
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+index 2eb2684..9f39be1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+@@ -27,6 +27,7 @@
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.io.PrintStream;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -175,7 +176,7 @@
+   private Configuration conf;
+ 
+   private UserGroupInformation rmLoginUGI;
+-  
++
+   public ResourceManager() {
+     super("ResourceManager");
+   }
+@@ -202,7 +203,8 @@ Dispatcher getRmDispatcher() {
+   protected void serviceInit(Configuration conf) throws Exception {
+     this.conf = conf;
+     this.rmContext = new RMContextImpl();
+-    
++    rmContext.setResourceManager(this);
++
+     this.configurationProvider =
+         ConfigurationProviderFactory.getConfigurationProvider(conf);
+     this.configurationProvider.init(this.conf);
+@@ -414,6 +416,7 @@ protected static void validateConfigs(Configuration conf) {
+     private ResourceManager rm;
+     private boolean recoveryEnabled;
+     private RMActiveServiceContext activeServiceContext;
++    private StandByTransitionRunnable standByTransitionRunnable;
+ 
+     RMActiveServices(ResourceManager rm) {
+       super("RMActiveServices");
+@@ -422,6 +425,8 @@ protected static void validateConfigs(Configuration conf) {
+ 
+     @Override
+     protected void serviceInit(Configuration configuration) throws Exception {
++      standByTransitionRunnable = new StandByTransitionRunnable();
++
+       activeServiceContext = new RMActiveServiceContext();
+       rmContext.setActiveServiceContext(activeServiceContext);
+ 
+@@ -768,17 +773,48 @@ public void handle(RMFatalEvent event) {
+     }
+   }
+ 
+-  public void handleTransitionToStandBy() {
+-    if (rmContext.isHAEnabled()) {
+-      try {
+-        // Transition to standby and reinit active services
+-        LOG.info("Transitioning RM to Standby mode");
+-        transitionToStandby(true);
+-        adminService.resetLeaderElection();
++  /**
++   * Transition to standby state in a new thread. The transition operation is
++   * asynchronous to avoid deadlock caused by cyclic dependency.
++   */
++  public void handleTransitionToStandByInNewThread() {
++    Thread standByTransitionThread =
++        new Thread(activeServices.standByTransitionRunnable);
++    standByTransitionThread.setName("StandByTransitionThread");
++    standByTransitionThread.start();
++  }
++
++  /**
++   * The class to transition RM to standby state. The same
++   * {@link StandByTransitionRunnable} object could be used in multiple threads,
++   * but runs only once. That's because RM can go back to active state after
++   * transition to standby state, the same runnable in the old context can't
++   * transition RM to standby state again. A new runnable is created every time
++   * RM transitions to active state.
++   */
++  private class StandByTransitionRunnable implements Runnable {
++    // The atomic variable to make sure multiple threads with the same runnable
++    // run only once.
++    private AtomicBoolean hasAlreadyRun = new AtomicBoolean(false);
++
++    @Override
++    public void run() {
++      // Run this only once, even if multiple threads end up triggering
++      // this simultaneously.
++      if (hasAlreadyRun.getAndSet(true)) {
+         return;
+-      } catch (Exception e) {
+-        LOG.fatal("Failed to transition RM to Standby mode.");
+-        ExitUtil.terminate(1, e);
++      }
++
++      if (rmContext.isHAEnabled()) {
++        try {
++          // Transition to standby and reinit active services
++          LOG.info("Transitioning RM to Standby mode");
++          transitionToStandby(true);
++          adminService.resetLeaderElection();
++        } catch (Exception e) {
++          LOG.fatal("Failed to transition RM to Standby mode.", e);
++          ExitUtil.terminate(1, e);
++        }
+       }
+     }
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+index 04a3a46..be111d2 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+@@ -665,10 +665,7 @@ protected void notifyStoreOperationFailed(Exception failureCause) {
+     LOG.error("State store operation failed ", failureCause);
+     if (HAUtil.isHAEnabled(getConfig())) {
+       LOG.warn("State-store fenced ! Transitioning RM to standby");
+-      Thread standByTransitionThread =
+-          new Thread(new StandByTransitionThread());
+-      standByTransitionThread.setName("StandByTransitionThread Handler");
+-      standByTransitionThread.start();
++      resourceManager.handleTransitionToStandByInNewThread();
+     } else if (YarnConfiguration.shouldRMFailFast(getConfig())) {
+       LOG.fatal("Fail RM now due to state-store error!");
+       rmDispatcher.getEventHandler().handle(
+@@ -731,12 +728,4 @@ public abstract void removeApplication(ApplicationId removeAppId)
+   public void setResourceManager(ResourceManager rm) {
+     this.resourceManager = rm;
+   }
+-
+-  private class StandByTransitionThread implements Runnable {
+-    @Override
+-    public void run() {
+-      LOG.info("RMStateStore has been fenced");
+-      resourceManager.handleTransitionToStandBy();
+-    }
+-  }
+ }
+-- 
+1.7.9.5
+

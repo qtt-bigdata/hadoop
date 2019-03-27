@@ -1,0 +1,529 @@
+From 46ea9e0271b14df7a3a539edabeae89a672df54c Mon Sep 17 00:00:00 2001
+From: Chris Nauroth <cnauroth@apache.org>
+Date: Wed, 19 Oct 2016 16:32:46 -0700
+Subject: [PATCH 2215/2848] HADOOP-13452. S3Guard: Implement access policy for
+ intra-client consistency with in-memory metadata
+ store. Contributed by Aaron Fabbri.
+
+(cherry picked from commit 05767451d147dfdd333d56322ec1fc5d9adb1e12)
+
+Change-Id: Ibab5d1baa0dca4b4bbd13dd177c69158edbe6e90
+---
+ .../hadoop/fs/s3a/s3guard/DirListingMetadata.java  |    9 +
+ .../hadoop/fs/s3a/s3guard/LocalMetadataStore.java  |  216 ++++++++++++++++++++
+ .../apache/hadoop/fs/s3a/s3guard/LruHashMap.java   |   50 +++++
+ .../hadoop/fs/s3a/s3guard/MetadataStore.java       |   14 +-
+ .../apache/hadoop/fs/s3a/s3guard/PathMetadata.java |    7 +-
+ .../hadoop/fs/s3a/s3guard/AbstractMSContract.java  |    5 +-
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |    8 +-
+ .../fs/s3a/s3guard/TestLocalMetadataStore.java     |   65 ++++++
+ 8 files changed, 359 insertions(+), 15 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+ create mode 100644 hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LruHashMap.java
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+index acb3e51..1838f42 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+@@ -38,6 +38,13 @@
+ @InterfaceStability.Evolving
+ public class DirListingMetadata {
+ 
++  /**
++   * Convenience parameter for passing into
++   * {@link DirListingMetadata#DirListingMetadata(Path, Collection, boolean)}.
++   */
++  public static final Collection<PathMetadata> EMPTY_DIR =
++      Collections.emptyList();
++
+   private final Path path;
+ 
+   /** Using a map for fast find / remove with large directories. */
+@@ -151,6 +158,8 @@ public String toString() {
+    */
+   private void checkChildPath(Path childPath) {
+     Preconditions.checkNotNull(childPath, "childPath must be non-null");
++    Preconditions.checkArgument(childPath.isAbsolute(), "childPath must be " +
++        "absolute");
+     Preconditions.checkArgument(!childPath.isRoot(),
+         "childPath cannot be the root path");
+     Preconditions.checkArgument(childPath.getParent().equals(path),
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+new file mode 100644
+index 0000000..d47d85e
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+@@ -0,0 +1,216 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.s3guard;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.util.Iterator;
++import java.util.Map;
++
++/**
++ * This is a local, in-memory, implementation of MetadataStore.
++ * This is *not* a coherent cache across processes.  It is only
++ * locally-coherent.
++ *
++ * The purpose of this is for unit testing.  It could also be used to accelerate
++ * local-only operations where only one process is operating on a given object
++ * store, or multiple processes are accessing a read-only storage bucket.
++ *
++ * This MetadataStore does not enforce filesystem rules such as disallowing
++ * non-recursive removal of non-empty directories.  It is assumed the caller
++ * already has to perform these sorts of checks.
++ */
++public class LocalMetadataStore implements MetadataStore {
++
++  public static final Logger LOG = LoggerFactory.getLogger(MetadataStore.class);
++  public static final int DEFAULT_MAX_RECORDS = 128;
++  public static final String CONF_MAX_RECORDS =
++      "fs.metadatastore.local.max_records";
++
++  /** Contains directories and files. */
++  private LruHashMap<Path, PathMetadata> fileHash;
++
++  /** Contains directory listings. */
++  private LruHashMap<Path, DirListingMetadata> dirHash;
++
++  private FileSystem fs;
++
++  @Override
++  public void initialize(FileSystem fileSystem) throws IOException {
++    Preconditions.checkNotNull(fileSystem);
++    fs = fileSystem;
++    Configuration conf = fs.getConf();
++    Preconditions.checkNotNull(conf);
++    int maxRecords = conf.getInt(CONF_MAX_RECORDS, DEFAULT_MAX_RECORDS);
++    if (maxRecords < 4) {
++      maxRecords = 4;
++    }
++    // Start w/ less than max capacity.  Space / time trade off.
++    fileHash = new LruHashMap<>(maxRecords/2, maxRecords);
++    dirHash = new LruHashMap<>(maxRecords/4, maxRecords);
++  }
++
++  @Override
++  public void delete(Path path) throws IOException {
++    doDelete(path, false);
++  }
++
++  @Override
++  public void deleteSubtree(Path path) throws IOException {
++    doDelete(path, true);
++  }
++
++  private synchronized void doDelete(Path path, boolean recursive) {
++
++    // We could implement positive hit for 'deleted' files.  For now we
++    // do not track them.
++
++    // Delete entry from file cache, then from cached parent directory, if any
++
++    // Remove target file/dir
++    fileHash.remove(path);
++
++    // Update parent dir listing, if any
++    dirHashDeleteFile(path);
++
++    if (recursive) {
++      // Remove all entries that have this dir as path prefix.
++      clearHashByAncestor(path, dirHash);
++      clearHashByAncestor(path, fileHash);
++    }
++  }
++
++  @Override
++  public synchronized PathMetadata get(Path path) throws IOException {
++    return fileHash.mruGet(path);
++  }
++
++  @Override
++  public synchronized DirListingMetadata listChildren(Path path) throws
++      IOException {
++    return dirHash.mruGet(path);
++  }
++
++  @Override
++  public void move(Path src, Path dst) throws IOException {
++    // TODO implement me
++    throw new IOException("LocalMetadataStore#move() not implemented yet");
++  }
++
++  @Override
++  public void put(PathMetadata meta) throws IOException {
++
++    FileStatus status = meta.getFileStatus();
++    Path path = status.getPath();
++    synchronized (this) {
++
++      /* Add entry for this file. */
++      fileHash.put(path, meta);
++
++      /* Directory case:
++       * We also make sure we have an entry in the dirHash, so subsequent
++       * listStatus(path) at least see the directory.
++       *
++       * If we had a boolean flag argument "isNew", we would know whether this
++       * is an existing directory the client discovered via getFileStatus(),
++       * or if it is a newly-created directory.  In the latter case, we would
++       * be able to mark the directory as authoritative (fully-cached),
++       * saving round trips to underlying store for subsequent listStatus()
++       */
++
++      /* If directory, go ahead and cache the fact that it is empty. */
++      if (status.isDirectory()) {
++        DirListingMetadata dir = dirHash.mruGet(path);
++        if (dir == null) {
++          dirHash.put(path, new DirListingMetadata(path, DirListingMetadata
++              .EMPTY_DIR, false));
++        }
++      }
++
++      /* Update cached parent dir. */
++      Path parentPath = path.getParent();
++      DirListingMetadata parent = dirHash.mruGet(parentPath);
++      if (parent == null) {
++        /* Track this new file's listing in parent.  Parent is not
++         * authoritative, since there may be other items in it we don't know
++         * about. */
++        parent = new DirListingMetadata(parentPath,
++            DirListingMetadata.EMPTY_DIR, false);
++        dirHash.put(parentPath, parent);
++      }
++      parent.put(status);
++    }
++  }
++
++  @Override
++  public synchronized void put(DirListingMetadata meta) throws IOException {
++    dirHash.put(meta.getPath(), meta);
++  }
++
++  @Override
++  public void close() throws IOException {
++
++  }
++
++  @VisibleForTesting
++  static <T> void clearHashByAncestor(Path ancestor, Map<Path, T> hash) {
++    for (Iterator<Map.Entry<Path, T>> it = hash.entrySet().iterator();
++         it.hasNext();) {
++      Map.Entry<Path, T> entry = it.next();
++      Path f = entry.getKey();
++      if (isAncestorOf(ancestor, f)) {
++        it.remove();
++      }
++    }
++  }
++
++  /**
++   * @return true iff 'ancestor' is ancestor dir in path 'f'.
++   * All paths here are absolute.  Dir does not count as its own ancestor.
++   */
++  private static boolean isAncestorOf(Path ancestor, Path f) {
++    String aStr = ancestor.toString();
++    if (!ancestor.isRoot()) {
++      aStr += "/";
++    }
++    String fStr = f.toString();
++    return (fStr.startsWith(aStr));
++  }
++
++  /**
++   * Update dirHash to reflect deletion of file 'f'.  Call with lock held.
++   */
++  private void dirHashDeleteFile(Path path) {
++    Path parent = path.getParent();
++    if (parent != null) {
++      DirListingMetadata dir = dirHash.get(parent);
++      if (dir != null) {
++        dir.remove(path);
++      }
++    }
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LruHashMap.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LruHashMap.java
+new file mode 100644
+index 0000000..e355095
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LruHashMap.java
+@@ -0,0 +1,50 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.hadoop.fs.s3a.s3guard;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * LinkedHashMap that implements a maximum size and LRU eviction policy.
++ */
++public class LruHashMap<K, V> extends LinkedHashMap<K, V> {
++  private final int maxSize;
++  public LruHashMap(int initialCapacity, int maxSize) {
++    super(initialCapacity);
++    this.maxSize = maxSize;
++  }
++
++  @Override
++  protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
++    return size() > maxSize;
++  }
++
++  /**
++   * get() plus side-effect of making the element Most Recently Used.
++   * @param key lookup key
++   * @return value
++   */
++
++  public V mruGet(K key) {
++    V val = remove(key);
++    if (val != null) {
++      put(key, val);
++    }
++    return val;
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+index c034b9a..a6d29da 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+@@ -21,15 +21,15 @@
+ import java.io.Closeable;
+ import java.io.IOException;
+ 
+-import org.apache.hadoop.conf.Configuration;
+-
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ 
+ /**
+  * {@code MetadataStore} defines the set of operations that any metadata store
+- * implementation must provide.
++ * implementation must provide.  Note that all {@link Path} objects provided
++ * to methods must be absolute, not relative paths.
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+@@ -38,10 +38,10 @@
+   /**
+    * Performs one-time initialization of the metadata store.
+    *
+-   * @param conf {@code Configuration}
++   * @param fs {@code FileSystem} associated with the MetadataStore
+    * @throws IOException if there is an error
+    */
+-  void initialize(Configuration conf) throws IOException;
++  void initialize(FileSystem fs) throws IOException;
+ 
+   /**
+    * Deletes exactly one path.
+@@ -88,7 +88,7 @@
+    * recursively.
+    *
+    * @param src the source path
+-   * @param dst the destination path
++   * @param dst the new path of the file/dir after the move
+    * @throws IOException if there is an error
+    */
+   void move(Path src, Path dst) throws IOException;
+@@ -99,7 +99,7 @@
+    * saving the full path ancestry.
+    *
+    * Implementations must update any {@code DirListingMetadata} objects which
+-   * track the parent of this file.
++   * track the immediate parent of this file.
+    *
+    * @param meta the metadata to save
+    * @throws IOException if there is an error
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadata.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadata.java
+index 37fbfec..eb2e520 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadata.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadata.java
+@@ -35,11 +35,14 @@
+ 
+   /**
+    * Creates a new {@code PathMetadata} containing given {@code FileStatus}.
+-   *
+-   * @param fileStatus file status
++   * @param fileStatus file status containing an absolute path.
+    */
+   public PathMetadata(FileStatus fileStatus) {
+     Preconditions.checkNotNull(fileStatus, "fileStatus must be non-null");
++    Preconditions.checkNotNull(fileStatus.getPath(), "fileStatus path must be" +
++        " non-null");
++    Preconditions.checkArgument(fileStatus.getPath().isAbsolute(), "path must" +
++        " be absolute");
+     this.fileStatus = fileStatus;
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractMSContract.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractMSContract.java
+index 7cb540a..9a1b590 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractMSContract.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractMSContract.java
+@@ -18,7 +18,7 @@
+ 
+ package org.apache.hadoop.fs.s3a.s3guard;
+ 
+-import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.fs.FileSystem;
+ 
+ import java.io.IOException;
+ 
+@@ -26,7 +26,8 @@
+  * Test specification for MetadataStore contract tests. Supplies configuration
+  * and MetadataStore instance.
+  */
+-public abstract class AbstractMSContract extends Configured {
++public abstract class AbstractMSContract {
+ 
++  public abstract FileSystem getFileSystem();
+   public abstract MetadataStore getMetadataStore() throws IOException;
+ }
+\ No newline at end of file
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index ac27696..701f355 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -72,7 +72,8 @@ public void setUp() throws Exception {
+     contract = createContract();
+     ms = contract.getMetadataStore();
+     assertNotNull("null MetadataStore", ms);
+-    ms.initialize(contract.getConf());
++    assertNotNull("null FileSystem", contract.getFileSystem());
++    ms.initialize(contract.getFileSystem());
+   }
+ 
+   @After
+@@ -146,9 +147,8 @@ public void testRootDirPutNew() throws Exception {
+     assertFalse("Root not fully cached", dir.isAuthoritative());
+     assertNotNull("have root dir file listing", dir.getListing());
+     assertEquals("One file in root dir", 1, dir.getListing().size());
+-    assertEquals("file1 in root dir", "/file1",
+-        dir.getListing().iterator().next().getFileStatus().getPath()
+-            .toString());
++    assertEquals("file1 in root dir", "/file1", dir.getListing().iterator()
++        .next().getFileStatus().getPath().toString());
+   }
+ 
+   @Test
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+new file mode 100644
+index 0000000..c8b3a85
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+@@ -0,0 +1,65 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.s3guard;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.RawLocalFileSystem;
++
++import java.io.IOException;
++
++/**
++ * MetadataStore unit test for {@link LocalMetadataStore}.
++ */
++public class TestLocalMetadataStore extends MetadataStoreTestBase {
++
++  private static final String MAX_ENTRIES_STR = "16";
++
++  private static class LocalMSContract extends AbstractMSContract {
++
++    private FileSystem fs;
++
++    public LocalMSContract() {
++      fs = new RawLocalFileSystem();
++      Configuration config = fs.getConf();
++      if (config == null) {
++        config = new Configuration();
++      }
++      config.set(LocalMetadataStore.CONF_MAX_RECORDS, MAX_ENTRIES_STR);
++      fs.setConf(config);
++    }
++
++    @Override
++    public FileSystem getFileSystem() {
++      return fs;
++    }
++
++    @Override
++    public MetadataStore getMetadataStore() throws IOException {
++      LocalMetadataStore lms = new LocalMetadataStore();
++      return lms;
++    }
++  }
++
++  @Override
++  public AbstractMSContract createContract() {
++    return new LocalMSContract();
++  }
++
++}
+\ No newline at end of file
+-- 
+1.7.9.5
+

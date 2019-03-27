@@ -1,0 +1,206 @@
+From f6074ab12bd0c02a3c0098e61334e4d59fab248c Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Mon, 10 Jul 2017 12:30:35 -0700
+Subject: [PATCH 2538/2848] HDFS-8856. Make LeaseManager#countPath O(1).
+ (Contributed by Arpit Agarwal)
+
+(cherry picked from commit 6d4eee718a3fe1450a627128eb94728011bd9b68)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+
+Change-Id: Ie7fc02aefb4bad10d86c1bc2cfc5a946cf4bebb4
+---
+ .../hadoop/hdfs/server/namenode/Checkpointer.java  |    4 ++-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   14 ++++----
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   14 ++++++--
+ .../hdfs/server/namenode/TestLeaseManager.java     |   37 ++++++++++++++++++--
+ 4 files changed, 58 insertions(+), 11 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+index 1594002..e321784 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+@@ -254,7 +254,9 @@ void doCheckpoint() throws IOException {
+     try {
+       backupNode.namesystem.setImageLoaded();
+       if(backupNode.namesystem.getBlocksTotal() > 0) {
+-        backupNode.namesystem.setBlockTotal();
++        long completeBlocksTotal =
++            backupNode.namesystem.getCompleteBlocksTotal();
++        backupNode.namesystem.setBlockTotal(completeBlocksTotal);
+       }
+       bnImage.saveFSImageInAllDirs(backupNode.getNamesystem(), txid);
+       bnStorage.writeAll();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 377f44e..a963476 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1210,9 +1210,10 @@ void startCommonServices(Configuration conf, HAContext haContext) throws IOExcep
+       assert safeMode != null && !isPopulatingReplQueues();
+       StartupProgress prog = NameNode.getStartupProgress();
+       prog.beginPhase(Phase.SAFEMODE);
++      long completeBlocksTotal = getCompleteBlocksTotal();
+       prog.setTotal(Phase.SAFEMODE, STEP_AWAITING_REPORTED_BLOCKS,
+-        getCompleteBlocksTotal());
+-      setBlockTotal();
++          completeBlocksTotal);
++      setBlockTotal(completeBlocksTotal);
+       blockManager.activate(conf);
+     } finally {
+       writeUnlock();
+@@ -6427,12 +6428,12 @@ public void adjustSafeModeBlockTotals(int deltaSafe, int deltaTotal) {
+   /**
+    * Set the total number of blocks in the system. 
+    */
+-  public void setBlockTotal() {
++  public void setBlockTotal(long completeBlocksTotal) {
+     // safeMode is volatile, and may be set to null at any time
+     SafeModeInfo safeMode = this.safeMode;
+     if (safeMode == null)
+       return;
+-    safeMode.setBlockTotal((int)getCompleteBlocksTotal());
++    safeMode.setBlockTotal((int) completeBlocksTotal);
+   }
+ 
+   /**
+@@ -6447,13 +6448,14 @@ public long getBlocksTotal() {
+   /**
+    * Get the total number of COMPLETE blocks in the system.
+    * For safe mode only complete blocks are counted.
++   * This is invoked only during NN startup and checkpointing.
+    */
+-  private long getCompleteBlocksTotal() {
++  public long getCompleteBlocksTotal() {
+     // Calculate number of blocks under construction
+     long numUCBlocks = 0;
+     readLock();
+-    numUCBlocks = leaseManager.getNumUnderConstructionBlocks();
+     try {
++      numUCBlocks = leaseManager.getNumUnderConstructionBlocks();
+       return getBlocksTotal() - numUCBlocks;
+     } finally {
+       readUnlock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 167bdf1..99cb90c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -23,6 +23,7 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -233,7 +234,14 @@ synchronized long getNumUnderConstructionBlocks() {
+ 
+   /** @return the number of leases currently in the system */
+   @VisibleForTesting
+-  public synchronized int countLease() {return sortedLeases.size();}
++  public synchronized int countLease() {
++    return sortedLeases.size();
++  }
++
++  /** @return the number of paths contained in all leases */
++  synchronized long countPath() {
++    return leasesById.size();
++  }
+ 
+   /**
+    * Adds (or re-adds) the lease for the specified file.
+@@ -376,7 +384,9 @@ public int hashCode() {
+       return holder.hashCode();
+     }
+     
+-    private Collection<Long> getFiles() { return files; }
++    private Collection<Long> getFiles() {
++      return Collections.unmodifiableCollection(files);
++    }
+ 
+     String getHolder() {
+       return holder;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+index 5fc2651..367b480 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+@@ -17,9 +17,10 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
++import static org.hamcrest.CoreMatchers.is;
+ import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ 
+ import org.apache.hadoop.fs.FSDataOutputStream;
+@@ -35,7 +36,9 @@
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -49,6 +52,9 @@
+ import static org.mockito.Mockito.*;
+ 
+ public class TestLeaseManager {
++  @Rule
++  public Timeout timeout = new Timeout(300000);
++
+   private static final long GRANDFATHER_INODE_ID = 0;
+ 
+   public static long maxLockHoldToReleaseLeaseMs = 100;
+@@ -73,7 +79,7 @@ public void testRemoveLeases() throws Exception {
+ 
+   /** Check that LeaseManager.checkLease release some leases
+    */
+-  @Test(timeout = 30000)
++  @Test
+   public void testCheckLease() throws InterruptedException {
+     LeaseManager lm = new LeaseManager(makeMockFsNameSystem());
+     final long numLease = 100;
+@@ -95,6 +101,33 @@ public void testCheckLease() throws InterruptedException {
+     assertTrue(lm.countLease() < numLease);
+   }
+ 
++  @Test
++  public void testCountPath() {
++    LeaseManager lm = new LeaseManager(makeMockFsNameSystem());
++
++    lm.addLease("holder1", 1);
++    assertThat(lm.countPath(), is(1L));
++
++    lm.addLease("holder2", 2);
++    assertThat(lm.countPath(), is(2L));
++    lm.addLease("holder2", 2);                   // Duplicate addition
++    assertThat(lm.countPath(), is(2L));
++
++    assertThat(lm.countPath(), is(2L));
++
++    // Remove a couple of non-existing leases. countPath should not change.
++    lm.removeLease("holder2", stubInodeFile(3));
++    lm.removeLease("InvalidLeaseHolder", stubInodeFile(1));
++    assertThat(lm.countPath(), is(2L));
++
++    INodeFile file = stubInodeFile(1);
++    lm.reassignLease(lm.getLease(file), file, "holder2");
++    assertThat(lm.countPath(), is(2L));          // Count unchanged on reassign
++
++    lm.removeLease("holder2", stubInodeFile(2)); // Remove existing
++    assertThat(lm.countPath(), is(1L));
++  }
++
+   /**
+    * Make sure the lease is restored even if only the inode has the record.
+    */
+-- 
+1.7.9.5
+

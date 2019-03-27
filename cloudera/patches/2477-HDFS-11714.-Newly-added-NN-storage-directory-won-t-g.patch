@@ -1,0 +1,173 @@
+From deef07568ab90a40fae93c638de9a56325317b6a Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Fri, 26 May 2017 10:40:51 -0700
+Subject: [PATCH 2477/2848] HDFS-11714. Newly added NN storage directory won't
+ get initialized and cause space exhaustion.
+ Contributed by Kihwal Lee. Added a CHANGES.txt
+ entry (cherry picked from commit
+ f77d138725662197ca0be874e9ec4dc430db2a4f)
+
+(cherry picked from commit 130a0e2156861acf4f2eff2845643bc470672af2)
+
+Change-Id: I36a41a2ad1ff968da7f11a9617b0264ebb0fea53
+(cherry picked from commit 3df4060b57c2c15e5adb85776026df1020b5a92d)
+---
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   52 +++++++++++++++++++-
+ .../server/namenode/ha/TestStandbyCheckpoints.java |   40 +++++++++++++++
+ 2 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 43b87ab..4e1dc13 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -99,6 +99,16 @@
+ 
+   protected NNStorageRetentionManager archivalManager;
+ 
++  /**
++   * The collection of newly added storage directories. These are partially
++   * formatted then later fully populated along with a VERSION file.
++   * For HA, the second part is done when the next checkpoint is saved.
++   * This set will be cleared once a VERSION file is created.
++   * For non-HA, a new fsimage will be locally generated along with a new
++   * VERSION file. This set is not used for non-HA mode.
++   */
++  private Set<StorageDirectory> newDirs = null;
++
+   /* Used to make sure there are no concurrent checkpoints for a given txid
+    * The checkpoint here could be one of the following operations.
+    * a. checkpoint when NN is in standby.
+@@ -262,9 +272,26 @@ boolean recoverTransitionRead(StartupOption startOpt, FSNamesystem target,
+         throw new IOException(StorageState.NON_EXISTENT + 
+                               " state cannot be here");
+       case NOT_FORMATTED:
++        // Create a dir structure, but not the VERSION file. The presence of
++        // VERSION is checked in the inspector's needToSave() method and
++        // saveNamespace is triggered if it is absent. This will bring
++        // the storage state uptodate along with a new VERSION file.
++        // If HA is enabled, NNs start up as standby so saveNamespace is not
++        // triggered.
+         LOG.info("Storage directory " + sd.getRoot() + " is not formatted.");
+         LOG.info("Formatting ...");
+         sd.clearDirectory(); // create empty currrent dir
++        // For non-HA, no further action is needed here, as saveNamespace will
++        // take care of the rest.
++        if (!target.isHaEnabled()) {
++          continue;
++        }
++        // If HA is enabled, save the dirs to create a version file later when
++        // a checkpoint image is saved.
++        if (newDirs == null) {
++          newDirs = new HashSet<StorageDirectory>();
++        }
++        newDirs.add(sd);
+         break;
+       default:
+         break;
+@@ -290,7 +317,27 @@ boolean recoverTransitionRead(StartupOption startOpt, FSNamesystem target,
+     
+     return loadFSImage(target, startOpt, recovery);
+   }
+-  
++
++  /**
++   * Create a VERSION file in the newly added storage directories.
++   */
++  private void initNewDirs() {
++    if (newDirs == null) {
++      return;
++    }
++    for (StorageDirectory sd : newDirs) {
++      try {
++        storage.writeProperties(sd);
++        LOG.info("Wrote VERSION in the new storage, " + sd.getCurrentDir());
++      } catch (IOException e) {
++        // Failed to create a VERSION file. Report the error.
++        storage.reportErrorOnFile(sd.getVersionFile());
++      }
++    }
++    newDirs.clear();
++    newDirs = null;
++  }
++
+   /**
+    * For each storage directory, performs recovery of incomplete transitions
+    * (eg. upgrade, rollback, checkpoint) and inserts the directory's storage
+@@ -1387,6 +1434,9 @@ public synchronized void saveDigestAndRenameCheckpointImage(NameNodeFile nnf,
+     if (txid > storage.getMostRecentCheckpointTxId()) {
+       storage.setMostRecentCheckpointInfo(txid, Time.now());
+     }
++
++    // Create a version file in any new storage directory.
++    initNewDirs();
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+index 78783e5..47233fe 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+@@ -32,6 +32,7 @@
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
++import org.apache.hadoop.hdfs.server.common.Util;
+ import org.apache.hadoop.hdfs.server.namenode.*;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeFile;
+ import org.apache.hadoop.hdfs.util.Canceler;
+@@ -41,6 +42,7 @@
+ import org.apache.hadoop.ipc.StandbyException;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
++import org.apache.hadoop.test.PathUtils;
+ import org.apache.hadoop.util.ThreadUtil;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -167,6 +169,44 @@ public Boolean get() {
+       purgeLogsOlderThan(Mockito.anyLong());
+   }
+ 
++  @Test
++  public void testNewDirInitAfterCheckpointing() throws Exception {
++    File hdfsDir = new File(PathUtils.getTestDir(TestStandbyCheckpoints.class),
++        "testNewDirInitAfterCheckpointing");
++    File nameDir = new File(hdfsDir, "name1");
++    assert nameDir.mkdirs();
++
++    // Restart nn0 with an additional name dir.
++    String existingDir = cluster.getConfiguration(0).
++        get(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY);
++    cluster.getConfiguration(0).set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,
++        existingDir + "," + Util.fileAsURI(nameDir).toString());
++    cluster.restartNameNode(0);
++    nn0 = cluster.getNameNode(0);
++    cluster.transitionToActive(0);
++
++    // "current" is created, but current/VERSION isn't.
++    File currDir = new File(nameDir, "current");
++    File versionFile = new File(currDir, "VERSION");
++    assert currDir.exists();
++    assert !versionFile.exists();
++
++    // Trigger a checkpointing and upload.
++    doEdits(0, 10);
++    HATestUtil.waitForStandbyToCatchUp(nn0, nn1);
++
++    // The version file will be created if a checkpoint is uploaded.
++    // Wait for it to happen up to 10 seconds.
++    for (int i = 0; i < 20; i++) {
++      if (versionFile.exists()) {
++        break;
++      }
++      Thread.sleep(500);
++    }
++    // VERSION must have been created.
++    assert versionFile.exists();
++  }
++
+   /**
+    * Test for the case when both of the NNs in the cluster are
+    * in the standby state, and thus are both creating checkpoints
+-- 
+1.7.9.5
+

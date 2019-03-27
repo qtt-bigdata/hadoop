@@ -1,0 +1,182 @@
+From 309b67eb5766704fd406a717c12f61d03ad1bcc8 Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Mon, 29 Jun 2015 13:37:32 -0700
+Subject: [PATCH 1358/2848] YARN-3695. ServerProxy (NMProxy, etc.) shouldn't
+ retry forever for non network exception.
+ Contributed by Raju Bairishetti (cherry picked
+ from commit
+ 62e583c7dcbb30d95d8b32a4978fbdb3b98d67cc)
+
+(cherry picked from commit 0100995c5ee780b022b72435d906dea6f64485e5)
+
+Change-Id: I3e7357bce6e983926fa9011c57c0e1caeb2ee424
+---
+ .../org/apache/hadoop/yarn/client/ServerProxy.java |   21 ++---
+ .../nodemanager/containermanager/TestNMProxy.java  |   81 +++++++++++++-------
+ 2 files changed, 67 insertions(+), 35 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/ServerProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/ServerProxy.java
+index e9bcf8d..de7fc7d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/ServerProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/ServerProxy.java
+@@ -53,19 +53,22 @@ protected static RetryPolicy createRetryPolicy(Configuration conf,
+     long maxWaitTime = conf.getLong(maxWaitTimeStr, defMaxWaitTime);
+     long retryIntervalMS =
+         conf.getLong(connectRetryIntervalStr, defRetryInterval);
+-    if (maxWaitTime == -1) {
+-      // wait forever.
+-      return RetryPolicies.RETRY_FOREVER;
+-    }
+ 
+-    Preconditions.checkArgument(maxWaitTime > 0, "Invalid Configuration. "
+-        + maxWaitTimeStr + " should be a positive value.");
++    Preconditions.checkArgument((maxWaitTime == -1 || maxWaitTime > 0),
++        "Invalid Configuration. " + maxWaitTimeStr + " should be either"
++            + " positive value or -1.");
+     Preconditions.checkArgument(retryIntervalMS > 0, "Invalid Configuration. "
+         + connectRetryIntervalStr + "should be a positive value.");
+ 
+-    RetryPolicy retryPolicy =
+-        RetryPolicies.retryUpToMaximumTimeWithFixedSleep(maxWaitTime,
+-          retryIntervalMS, TimeUnit.MILLISECONDS);
++    RetryPolicy retryPolicy = null;
++    if (maxWaitTime == -1) {
++      // wait forever.
++      retryPolicy = RetryPolicies.RETRY_FOREVER;
++    } else {
++      retryPolicy =
++          RetryPolicies.retryUpToMaximumTimeWithFixedSleep(maxWaitTime,
++              retryIntervalMS, TimeUnit.MILLISECONDS);
++    }
+ 
+     Map<Class<? extends Exception>, RetryPolicy> exceptionToPolicyMap =
+         new HashMap<Class<? extends Exception>, RetryPolicy>();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestNMProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestNMProxy.java
+index 0b372be..102c9c6 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestNMProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestNMProxy.java
+@@ -22,6 +22,7 @@
+ import java.net.InetSocketAddress;
+ 
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
++import org.apache.hadoop.io.retry.UnreliableInterface;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+@@ -58,8 +59,8 @@ public TestNMProxy() throws UnsupportedFileSystemException {
+ 
+   @Before
+   public void setUp() throws Exception {
+-    conf.setLong(YarnConfiguration.CLIENT_NM_CONNECT_MAX_WAIT_MS, 10000);
+-    conf.setLong(YarnConfiguration.CLIENT_NM_CONNECT_RETRY_INTERVAL_MS, 100);
++    containerManager.start();
++    containerManager.setBlockNewContainerRequests(false);
+   }
+ 
+   @Override
+@@ -77,7 +78,13 @@ public StartContainersResponse startContainers(
+             // This causes super to throw an NMNotYetReadyException
+             containerManager.setBlockNewContainerRequests(true);
+           } else {
+-            throw new java.net.ConnectException("start container exception");
++            if (isRetryPolicyRetryForEver()) {
++              // Throw non network exception
++              throw new IOException(
++                  new UnreliableInterface.UnreliableException());
++            } else {
++              throw new java.net.ConnectException("start container exception");
++            }
+           }
+         } else {
+           // This stops super from throwing an NMNotYetReadyException
+@@ -86,6 +93,11 @@ public StartContainersResponse startContainers(
+         return super.startContainers(requests);
+       }
+ 
++      private boolean isRetryPolicyRetryForEver() {
++        return conf.getLong(
++            YarnConfiguration.CLIENT_NM_CONNECT_MAX_WAIT_MS, 1000) == -1;
++      }
++
+       @Override
+       public StopContainersResponse stopContainers(
+           StopContainersRequest requests) throws YarnException, IOException {
+@@ -110,30 +122,13 @@ public GetContainerStatusesResponse getContainerStatuses(
+   }
+ 
+   @Test(timeout = 20000)
+-  public void testNMProxyRetry() throws Exception {
+-    containerManager.start();
+-    containerManager.setBlockNewContainerRequests(false);
+-    StartContainersRequest allRequests =
+-        Records.newRecord(StartContainersRequest.class);
+-    ApplicationId appId = ApplicationId.newInstance(1, 1);
+-    ApplicationAttemptId attemptId = ApplicationAttemptId.newInstance(appId, 1);
++   public void testNMProxyRetry() throws Exception {
++     conf.setLong(YarnConfiguration.CLIENT_NM_CONNECT_MAX_WAIT_MS, 10000);
++     conf.setLong(YarnConfiguration.CLIENT_NM_CONNECT_RETRY_INTERVAL_MS, 100);
++     StartContainersRequest allRequests =
++         Records.newRecord(StartContainersRequest.class);
+ 
+-    org.apache.hadoop.yarn.api.records.Token nmToken =
+-        context.getNMTokenSecretManager().createNMToken(attemptId,
+-          context.getNodeId(), user);
+-    final InetSocketAddress address =
+-        conf.getSocketAddr(YarnConfiguration.NM_BIND_HOST,
+-          YarnConfiguration.NM_ADDRESS, YarnConfiguration.DEFAULT_NM_ADDRESS,
+-          YarnConfiguration.DEFAULT_NM_PORT);
+-    Token<NMTokenIdentifier> token =
+-        ConverterUtils.convertFromYarn(nmToken,
+-          SecurityUtil.buildTokenService(address));
+-    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(user);
+-    ugi.addToken(token);
+-
+-    ContainerManagementProtocol proxy =
+-        NMProxy.createNMProxy(conf, ContainerManagementProtocol.class, ugi,
+-          YarnRPC.create(conf), address);
++    ContainerManagementProtocol proxy = getNMProxy();
+ 
+     retryCount = 0;
+     shouldThrowNMNotYetReadyException = false;
+@@ -156,4 +151,38 @@ public void testNMProxyRetry() throws Exception {
+     proxy.startContainers(allRequests);
+     Assert.assertEquals(5, retryCount);
+   }
++
++  @Test(timeout = 20000, expected = IOException.class)
++  public void testShouldNotRetryForeverForNonNetworkExceptionsOnNMConnections()
++      throws Exception {
++    conf.setLong(YarnConfiguration.CLIENT_NM_CONNECT_MAX_WAIT_MS, -1);
++    StartContainersRequest allRequests =
++        Records.newRecord(StartContainersRequest.class);
++
++    ContainerManagementProtocol proxy = getNMProxy();
++
++    shouldThrowNMNotYetReadyException = false;
++    retryCount = 0;
++    proxy.startContainers(allRequests);
++  }
++
++  private ContainerManagementProtocol getNMProxy() {
++    ApplicationId appId = ApplicationId.newInstance(1, 1);
++    ApplicationAttemptId attemptId = ApplicationAttemptId.newInstance(appId, 1);
++
++    org.apache.hadoop.yarn.api.records.Token nmToken =
++        context.getNMTokenSecretManager().createNMToken(attemptId,
++            context.getNodeId(), user);
++    final InetSocketAddress address =
++        conf.getSocketAddr(YarnConfiguration.NM_BIND_HOST,
++            YarnConfiguration.NM_ADDRESS, YarnConfiguration.DEFAULT_NM_ADDRESS,
++            YarnConfiguration.DEFAULT_NM_PORT);
++    Token<NMTokenIdentifier> token =
++        ConverterUtils.convertFromYarn(nmToken,
++            SecurityUtil.buildTokenService(address));
++    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(user);
++    ugi.addToken(token);
++    return NMProxy.createNMProxy(conf, ContainerManagementProtocol.class, ugi,
++        YarnRPC.create(conf), address);
++  }
+ }
+-- 
+1.7.9.5
+

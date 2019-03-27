@@ -1,0 +1,245 @@
+From 5fafacbe95dc370c4f9a6c25fce92fb884a25500 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 28 Dec 2017 11:53:49 -0800
+Subject: [PATCH 2764/2848] HDFS-9023. When NN is not able to identify DN for
+ replication, reason behind it can be logged.
+
+(cherry picked from commit 50b233d35692d249d2115a2481cde770f50cf7a7)
+
+Change-Id: I5109fc4eefd61a1e2330f27b0383474db9d53643
+---
+ .../blockmanagement/BlockPlacementPolicy.java      |    8 +-
+ .../BlockPlacementPolicyDefault.java               |   79 +++++++++++++++++---
+ .../server/blockmanagement/DatanodeDescriptor.java |    2 +-
+ .../blockmanagement/TestReplicationPolicy.java     |    4 +-
+ 4 files changed, 76 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+index 01ab07e..ea6c5d0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+@@ -24,8 +24,6 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.AddBlockFlag;
+@@ -38,13 +36,17 @@
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ /** 
+  * This interface is used for choosing the desired number of targets
+  * for placing block replicas.
+  */
+ @InterfaceAudience.Private
+ public abstract class BlockPlacementPolicy {
+-  static final Log LOG = LogFactory.getLog(BlockPlacementPolicy.class);
++  public static final Logger LOG =
++      LoggerFactory.getLogger(BlockPlacementPolicy.class);
+ 
+   @InterfaceAudience.Private
+   public static class NotEnoughReplicasException extends Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index 7c0cde6..039d1a3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -61,6 +61,33 @@ protected StringBuilder initialValue() {
+         }
+       };
+ 
++  private static final ThreadLocal<HashMap<NodeNotChosenReason, Integer>>
++      CHOOSE_RANDOM_REASONS =
++      new ThreadLocal<HashMap<NodeNotChosenReason, Integer>>() {
++        @Override
++        protected HashMap<NodeNotChosenReason, Integer> initialValue() {
++          return new HashMap<>();
++        }
++      };
++
++  private enum NodeNotChosenReason {
++    NOT_IN_SERVICE("the node isn't in service"),
++    NODE_STALE("the node is stale"),
++    NODE_TOO_BUSY("the node is too busy"),
++    TOO_MANY_NODES_ON_RACK("the rack has too many chosen nodes"),
++    NOT_ENOUGH_STORAGE_SPACE("no enough storage space to place the block");
++
++    private final String text;
++
++    NodeNotChosenReason(final String logText) {
++      text = logText;
++    }
++
++    private String getText() {
++      return text;
++    }
++  }
++
+   protected boolean considerLoad; 
+   private boolean preferLocalNode;
+   protected NetworkTopology clusterMap;
+@@ -687,6 +714,7 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+       builder.setLength(0);
+       builder.append("[");
+     }
++    CHOOSE_RANDOM_REASONS.get().clear();
+     boolean badTarget = false;
+     DatanodeStorageInfo firstChosen = null;
+     while (numOfReplicas > 0) {
+@@ -735,14 +763,24 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+     }
+     if (numOfReplicas>0) {
+       String detail = enableDebugLogging;
+-      if (LOG.isDebugEnabled()) {
+-        if (badTarget && builder != null) {
+-          detail = builder.toString();
++      if (LOG.isDebugEnabled() && builder != null) {
++        detail = builder.toString();
++        if (badTarget) {
+           builder.setLength(0);
+         } else {
++          if (detail.length() > 1) {
++            // only log if there's more than "[", which is always appended at
++            // the beginning of this method.
++            LOG.debug(detail);
++          }
+           detail = "";
+         }
+       }
++      final HashMap<NodeNotChosenReason, Integer> reasonMap =
++          CHOOSE_RANDOM_REASONS.get();
++      if (!reasonMap.isEmpty()) {
++        LOG.info("Not enough replicas was chosen. Reason:{}", reasonMap);
++      }
+       throw new NotEnoughReplicasException(detail);
+     }
+     
+@@ -777,19 +815,38 @@ DatanodeStorageInfo chooseStorage4Block(DatanodeDescriptor dnd,
+     if (storage != null) {
+       results.add(storage);
+     } else {
+-      logNodeIsNotChosen(dnd, "no good storage to place the block ");
++      logNodeIsNotChosen(dnd, NodeNotChosenReason.NOT_ENOUGH_STORAGE_SPACE,
++          " for storage type " + storageType);
+     }
+     return storage;
+   }
+ 
+   private static void logNodeIsNotChosen(DatanodeDescriptor node,
+-      String reason) {
++      NodeNotChosenReason reason) {
++    logNodeIsNotChosen(node, reason, null);
++  }
++
++  private static void logNodeIsNotChosen(DatanodeDescriptor node,
++      NodeNotChosenReason reason, String reasonDetails) {
++    assert reason != null;
+     if (LOG.isDebugEnabled()) {
+       // build the error message for later use.
+       debugLoggingBuilder.get()
+           .append("\n  Datanode ").append(node)
+-          .append(" is not chosen since ").append(reason).append(".");
++          .append(" is not chosen since ").append(reason.getText());
++      if (reasonDetails != null) {
++        debugLoggingBuilder.get().append(" ").append(reasonDetails);
++      }
++      debugLoggingBuilder.get().append(".");
++    }
++    // always populate reason map to log high level reasons.
++    final HashMap<NodeNotChosenReason, Integer> reasonMap =
++        CHOOSE_RANDOM_REASONS.get();
++    Integer base = reasonMap.get(reason);
++    if (base == null) {
++      base = 0;
+     }
++    reasonMap.put(reason, base + 1);
+   }
+ 
+   /**
+@@ -811,13 +868,13 @@ boolean isGoodDatanode(DatanodeDescriptor node,
+                          boolean avoidStaleNodes) {
+     // check if the node is (being) decommissioned
+     if (!node.isInService()) {
+-      logNodeIsNotChosen(node, "the node isn't in service.");
++      logNodeIsNotChosen(node, NodeNotChosenReason.NOT_IN_SERVICE);
+       return false;
+     }
+ 
+     if (avoidStaleNodes) {
+       if (node.isStale(this.staleInterval)) {
+-        logNodeIsNotChosen(node, "the node is stale ");
++        logNodeIsNotChosen(node, NodeNotChosenReason.NODE_STALE);
+         return false;
+       }
+     }
+@@ -827,8 +884,8 @@ boolean isGoodDatanode(DatanodeDescriptor node,
+       final double maxLoad = 2.0 * stats.getInServiceXceiverAverage();
+       final int nodeLoad = node.getXceiverCount();
+       if (nodeLoad > maxLoad) {
+-        logNodeIsNotChosen(node, "the node is too busy (load: " + nodeLoad
+-            + " > " + maxLoad + ") ");
++        logNodeIsNotChosen(node, NodeNotChosenReason.NODE_TOO_BUSY,
++            "(load: " + nodeLoad + " > " + maxLoad + ")");
+         return false;
+       }
+     }
+@@ -843,7 +900,7 @@ boolean isGoodDatanode(DatanodeDescriptor node,
+       }
+     }
+     if (counter > maxTargetPerRack) {
+-      logNodeIsNotChosen(node, "the rack has too many chosen nodes ");
++      logNodeIsNotChosen(node, NodeNotChosenReason.TOO_MANY_NODES_ON_RACK);
+       return false;
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+index a411ef5..34b3275 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+@@ -640,7 +640,7 @@ public DatanodeStorageInfo chooseStorage4Block(StorageType t,
+       }
+     }
+     if (requiredSize > remaining - scheduledSize) {
+-      LOG.debug(
++      BlockPlacementPolicy.LOG.debug(
+           "The node {} does not have enough {} space (required={},"
+           + " scheduled={}, remaining={}).",
+           this, t, requiredSize, scheduledSize, remaining);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 6a99702..fb188cc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -41,7 +41,6 @@
+ import java.util.Set;
+ import java.util.concurrent.ThreadLocalRandom;
+ 
+-import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -71,6 +70,7 @@
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
+ import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.net.Node;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.PathUtils;
+ import org.apache.hadoop.util.Time;
+ import org.apache.log4j.Level;
+@@ -84,7 +84,7 @@
+ 
+ public class TestReplicationPolicy {
+   {
+-    ((Log4JLogger)BlockPlacementPolicy.LOG).getLogger().setLevel(Level.ALL);
++    GenericTestUtils.setLogLevel(BlockPlacementPolicy.LOG, Level.ALL);
+   }
+ 
+   private final Random random = DFSUtil.getRandom();
+-- 
+1.7.9.5
+

@@ -1,0 +1,167 @@
+From fb04403cd1c5a6adb7632773c3c19cc9f5a7f456 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 28 Jul 2016 16:29:22 -0700
+Subject: [PATCH 1684/2848] HDFS-9276. Failed to Update HDFS Delegation Token
+ for long running application in HA mode.
+ Contributed by Liangliang Gu and John Zhuge
+
+(cherry picked from commit d9aae22fdf2ab22ae8ce4a9d32ac71b3dde084d3)
+
+Change-Id: I7164fae643538a6723aa4d61fdb5bf519f6dfd58
+---
+ .../org/apache/hadoop/security/Credentials.java    |   22 +++++++++---
+ .../org/apache/hadoop/security/token/Token.java    |   37 +++++++++++++++++---
+ .../namenode/ha/TestDelegationTokensWithHA.java    |   32 +++++++++++++++++
+ 3 files changed, 83 insertions(+), 8 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Credentials.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Credentials.java
+index b796743..e95850b 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Credentials.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Credentials.java
+@@ -90,10 +90,24 @@ public Credentials(Credentials credentials) {
+    * @param t the token object
+    */
+   public void addToken(Text alias, Token<? extends TokenIdentifier> t) {
+-    if (t != null) {
+-      tokenMap.put(alias, t);
+-    } else {
++    if (t == null) {
+       LOG.warn("Null token ignored for " + alias);
++    } else if (tokenMap.put(alias, t) != null) {
++      // Update private tokens
++      Map<Text, Token<? extends TokenIdentifier>> tokensToAdd =
++          new HashMap<>();
++      for (Map.Entry<Text, Token<? extends TokenIdentifier>> e :
++          tokenMap.entrySet()) {
++        Token<? extends TokenIdentifier> token = e.getValue();
++        if (token instanceof Token.PrivateToken &&
++            ((Token.PrivateToken) token).getPublicService().equals(alias)) {
++          Token<? extends TokenIdentifier> privateToken =
++              new Token.PrivateToken<>(t);
++          privateToken.setService(token.getService());
++          tokensToAdd.put(e.getKey(), privateToken);
++        }
++      }
++      tokenMap.putAll(tokensToAdd);
+     }
+   }
+   
+@@ -317,7 +331,7 @@ private void addAll(Credentials other, boolean overwrite) {
+     for(Map.Entry<Text, Token<?>> token: other.tokenMap.entrySet()){
+       Text key = token.getKey();
+       if (!tokenMap.containsKey(key) || overwrite) {
+-        tokenMap.put(key, token.getValue());
++        addToken(key, token.getValue());
+       }
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+index 251a9b9..489d0f0 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+@@ -94,10 +94,10 @@ public Token() {
+    * @param other the token to clone
+    */
+   public Token(Token<T> other) {
+-    this.identifier = other.identifier;
+-    this.password = other.password;
+-    this.kind = other.kind;
+-    this.service = other.service;
++    this.identifier = other.identifier.clone();
++    this.password = other.password.clone();
++    this.kind = new Text(other.kind);
++    this.service = new Text(other.service);
+   }
+ 
+   /**
+@@ -198,8 +198,37 @@ public void setService(Text newService) {
+   @InterfaceAudience.Private
+   @InterfaceStability.Unstable
+   public static class PrivateToken<T extends TokenIdentifier> extends Token<T> {
++    final private Text publicService;
++
+     public PrivateToken(Token<T> token) {
+       super(token);
++      publicService = new Text(token.getService());
++    }
++
++    public Text getPublicService() {
++      return publicService;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) {
++        return true;
++      }
++      if (o == null || getClass() != o.getClass()) {
++        return false;
++      }
++      if (!super.equals(o)) {
++        return false;
++      }
++      PrivateToken<?> that = (PrivateToken<?>) o;
++      return publicService.equals(that.publicService);
++    }
++
++    @Override
++    public int hashCode() {
++      int result = super.hashCode();
++      result = 31 * result + publicService.hashCode();
++      return result;
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDelegationTokensWithHA.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDelegationTokensWithHA.java
+index 33b5350..79ad574 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDelegationTokensWithHA.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDelegationTokensWithHA.java
+@@ -24,6 +24,7 @@
+ import org.apache.hadoop.fs.AbstractFileSystem;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
+ import org.apache.hadoop.hdfs.*;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+@@ -458,6 +459,37 @@ public Object run() {
+     });
+   }
+ 
++  @Test(timeout = 300000)
++  public void testCancelAndUpdateDelegationTokens() throws Exception {
++    // Create UGI with token1
++    String user = UserGroupInformation.getCurrentUser().getShortUserName();
++    UserGroupInformation ugi1 = UserGroupInformation.createRemoteUser(user);
++
++    ugi1.doAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        final Token<DelegationTokenIdentifier> token1 =
++            getDelegationToken(fs, "JobTracker");
++        UserGroupInformation.getCurrentUser()
++            .addToken(token1.getService(), token1);
++
++        FileSystem fs1 = HATestUtil.configureFailoverFs(cluster, conf);
++
++        // Cancel token1
++        doRenewOrCancel(token1, conf, TokenTestAction.CANCEL);
++
++        // Update UGI with token2
++        final Token<DelegationTokenIdentifier> token2 =
++            getDelegationToken(fs, "JobTracker");
++        UserGroupInformation.getCurrentUser()
++            .addToken(token2.getService(), token2);
++
++        // Check whether token2 works
++        fs1.listFiles(new Path("/"), false);
++        return null;
++      }
++    });
++  }
++
+   @SuppressWarnings("unchecked")
+   private Token<DelegationTokenIdentifier> getDelegationToken(FileSystem fs,
+       String renewer) throws IOException {
+-- 
+1.7.9.5
+

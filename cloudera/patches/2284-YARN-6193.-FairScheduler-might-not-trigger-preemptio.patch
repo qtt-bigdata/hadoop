@@ -1,0 +1,128 @@
+From 4ad78d5804531309b490b3244b9f035c00ebde4c Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Fri, 17 Feb 2017 14:07:31 -0800
+Subject: [PATCH 2284/2848] YARN-6193. FairScheduler might not trigger
+ preemption when using DRF. (kasha)
+
+(cherry picked from commit dbbfcf74ab44d7bfdc805b63affd0defc57182b8)
+(cherry picked from commit 5575328bb69dbf6844d05afed6a635f09af43f79)
+
+Change-Id: Ie93775a02d2cd4aad1f0448b500bc4d97242bd17
+---
+ .../scheduler/fair/FSAppAttempt.java               |    9 +++--
+ .../fair/TestFairSchedulerPreemption.java          |   36 ++++++++++++++------
+ 2 files changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+index ce55b5b..efc811b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+@@ -534,12 +534,11 @@ boolean canContainerBePreempted(RMContainer container) {
+ 
+     // Check if the app's allocation will be over its fairshare even
+     // after preempting this container
+-    Resource currentUsage = getResourceUsage();
+-    Resource fairshare = getFairShare();
+-    Resource overFairShareBy = Resources.subtract(currentUsage, fairshare);
++    Resource usageAfterPreemption = Resources.subtract(
++        getResourceUsage(), container.getAllocatedResource());
+ 
+-    return (Resources.fitsIn(container.getAllocatedResource(),
+-        overFairShareBy));
++    return !Resources.lessThan(fsQueue.getPolicy().getResourceCalculator(),
++        scheduler.getClusterResource(), usageAfterPreemption, getFairShare());
+   }
+ 
+   /**
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+index 5717b86..60df793 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+@@ -56,6 +56,7 @@
+   private static final int NODE_CAPACITY_MULTIPLE = 4;
+ 
+   private final boolean fairsharePreemption;
++  private final boolean drf;
+ 
+   // App that takes up the entire cluster
+   private FSAppAttempt greedyApp;
+@@ -66,13 +67,17 @@
+   @Parameterized.Parameters(name = "{0}")
+   public static Collection<Object[]> getParameters() {
+     return Arrays.asList(new Object[][] {
+-        {"FairSharePreemption", true},
+-        {"MinSharePreemption", false}});
++        {"MinSharePreemption", 0},
++        {"MinSharePreemptionWithDRF", 1},
++        {"FairSharePreemption", 2},
++        {"FairSharePreemptionWithDRF", 3}
++        });
+   }
+ 
+-  public TestFairSchedulerPreemption(String name, boolean fairshare)
++  public TestFairSchedulerPreemption(String name, int mode)
+       throws IOException {
+-    fairsharePreemption = fairshare;
++    fairsharePreemption = (mode > 1); // 2 and 3
++    drf = (mode % 2 == 1); // 1 and 3
+     writeAllocFile();
+   }
+ 
+@@ -145,6 +150,10 @@ private void writeAllocFile() throws IOException {
+ 
+     out.println("</queue>"); // end of nonpreemptable queue
+ 
++    if (drf) {
++      out.println("<defaultQueueSchedulingPolicy>drf" +
++          "</defaultQueueSchedulingPolicy>");
++    }
+     out.println("</allocations>");
+     out.close();
+ 
+@@ -176,9 +185,14 @@ private void setupCluster() throws IOException {
+     scheduler.setClock(clock);
+     resourceManager.start();
+ 
+-    // Create and add two nodes to the cluster
+-    addNode(NODE_CAPACITY_MULTIPLE * GB, NODE_CAPACITY_MULTIPLE);
+-    addNode(NODE_CAPACITY_MULTIPLE * GB, NODE_CAPACITY_MULTIPLE);
++    // Create and add two nodes to the cluster, with capacities
++    // disproportional to the container requests.
++    addNode(NODE_CAPACITY_MULTIPLE * GB, 3 * NODE_CAPACITY_MULTIPLE);
++    addNode(NODE_CAPACITY_MULTIPLE * GB, 3 * NODE_CAPACITY_MULTIPLE);
++
++    // Reinitialize the scheduler so DRF policy picks up cluster capacity
++    // TODO (YARN-6194): One shouldn't need to call this
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
+   }
+ 
+   private void sendEnoughNodeUpdatesToAssignFully() {
+@@ -244,7 +258,7 @@ private void submitApps(String queue1, String queue2)
+ 
+   private void verifyPreemption() throws InterruptedException {
+     // Sleep long enough for four containers to be preempted.
+-    for (int i = 0; i < 100; i++) {
++    for (int i = 0; i < 1000; i++) {
+       if (greedyApp.getLiveContainers().size() == 4) {
+         break;
+       }
+@@ -252,12 +266,14 @@ private void verifyPreemption() throws InterruptedException {
+     }
+ 
+     // Verify the right amount of containers are preempted from greedyApp
+-    assertEquals(4, greedyApp.getLiveContainers().size());
++    assertEquals("Incorrect number of containers on the greedy app",
++        4, greedyApp.getLiveContainers().size());
+ 
+     sendEnoughNodeUpdatesToAssignFully();
+ 
+     // Verify the preempted containers are assigned to starvingApp
+-    assertEquals(2, starvingApp.getLiveContainers().size());
++    assertEquals("Starved app is not assigned the right number of containers",
++        2, starvingApp.getLiveContainers().size());
+   }
+ 
+   private void verifyNoPreemption() throws InterruptedException {
+-- 
+1.7.9.5
+

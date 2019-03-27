@@ -1,0 +1,218 @@
+From 8e438fda9c503a706a5558d8c5fd01db8532cbe5 Mon Sep 17 00:00:00 2001
+From: Aaron Fabbri <fabbri@apache.org>
+Date: Thu, 30 Mar 2017 19:21:03 -0700
+Subject: [PATCH 2419/2848] HADOOP-14236 S3Guard: S3AFileSystem::rename()
+ should move non-listed sub-directory entries.
+ Contributed by Mingliang Liu.
+
+(cherry picked from commit 0c32daaae3d263506a42afa507507966f3343665)
+
+Change-Id: Ieffd81d4fb8017561333e108f5dd41e462832f10
+---
+ .../fs/contract/AbstractContractRenameTest.java    |   63 ++++++++++++++++++++
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   29 +++++----
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |   48 +++++++++++++++
+ 3 files changed, 129 insertions(+), 11 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRenameTest.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRenameTest.java
+index b0dcb93..b6d0a49 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRenameTest.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRenameTest.java
+@@ -222,4 +222,67 @@ public void testRenameWithNonEmptySubDir() throws Throwable {
+     assertPathDoesNotExist("not deleted",
+         new Path(srcDir, "source.txt"));
+   }
++
++  /**
++   * Test that after renaming, the nested subdirectory is moved along with all
++   * its ancestors.
++   */
++  @Test
++  public void testRenamePopulatesDirectoryAncestors() throws IOException {
++    final FileSystem fs = getFileSystem();
++    final Path src = path("testRenamePopulatesDirectoryAncestors/source");
++    fs.mkdirs(src);
++    final String nestedDir = "/dir1/dir2/dir3/dir4";
++    fs.mkdirs(path(src + nestedDir));
++
++    Path dst = path("testRenamePopulatesDirectoryAncestorsNew");
++
++    fs.rename(src, dst);
++    validateAncestorsMoved(src, dst, nestedDir);
++  }
++
++  /**
++   * Test that after renaming, the nested file is moved along with all its
++   * ancestors. It is similar to {@link #testRenamePopulatesDirectoryAncestors}.
++   */
++  @Test
++  public void testRenamePopulatesFileAncestors() throws IOException {
++    final FileSystem fs = getFileSystem();
++    final Path src = path("testRenamePopulatesFileAncestors/source");
++    fs.mkdirs(src);
++    final String nestedFile = "/dir1/dir2/dir3/file4";
++    byte[] srcDataset = dataset(256, 'a', 'z');
++    writeDataset(fs, path(src + nestedFile), srcDataset, srcDataset.length,
++        1024, false);
++
++    Path dst = path("testRenamePopulatesFileAncestorsNew");
++
++    fs.rename(src, dst);
++    validateAncestorsMoved(src, dst, nestedFile);
++  }
++
++  /**
++   * Validate that the nested path and its ancestors should have been moved.
++   *
++   * @param src the source root to move
++   * @param dst the destination root to move
++   * @param nestedPath the nested path to move
++   */
++  private void validateAncestorsMoved(Path src, Path dst, String nestedPath)
++      throws IOException {
++    assertIsDirectory(dst);
++    assertPathDoesNotExist("src path should not exist", path(src + nestedPath));
++    assertPathExists("dst path should exist", path(dst + nestedPath));
++
++    Path path = new Path(nestedPath).getParent();
++    while (path != null && !path.isRoot()) {
++      final Path parentSrc = path(src + path.toString());
++      assertPathDoesNotExist(parentSrc + " is not deleted", parentSrc);
++      final Path parentDst = path(dst + path.toString());
++      assertPathExists(parentDst + " should exist after rename", parentDst);
++      assertIsDirectory(parentDst);
++      path = path.getParent();
++    }
++  }
++
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 6f8d77b..0a71669 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -25,8 +25,10 @@
+ import java.io.InterruptedIOException;
+ import java.net.URI;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Date;
+ import java.util.EnumSet;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ExecutorService;
+@@ -826,10 +828,10 @@ private boolean innerRename(Path source, Path dest)
+     }
+ 
+     // If we have a MetadataStore, track deletions/creations.
+-    List<Path> srcPaths = null;
++    Collection<Path> srcPaths = null;
+     List<PathMetadata> dstMetas = null;
+     if (hasMetadataStore()) {
+-      srcPaths = new ArrayList<>();
++      srcPaths = new HashSet<>(); // srcPaths need fast look up before put
+       dstMetas = new ArrayList<>();
+     }
+     // HADOOP-13761 s3guard: retries when source paths are not visible yet
+@@ -898,15 +900,18 @@ private boolean innerRename(Path source, Path dest)
+           copyFile(summary.getKey(), newDstKey, length);
+ 
+           if (hasMetadataStore()) {
+-            Path srcPath = keyToQualifiedPath(summary.getKey());
+-            Path dstPath = keyToQualifiedPath(newDstKey);
++            Path childSrc = keyToQualifiedPath(summary.getKey());
++            Path childDst = keyToQualifiedPath(newDstKey);
+             if (objectRepresentsDirectory(summary.getKey(), length)) {
+-              S3Guard.addMoveDir(metadataStore, srcPaths, dstMetas, srcPath,
+-                  dstPath, username);
++              S3Guard.addMoveDir(metadataStore, srcPaths, dstMetas, childSrc,
++                  childDst, username);
+             } else {
+-              S3Guard.addMoveFile(metadataStore, srcPaths, dstMetas, srcPath,
+-                  dstPath, length, getDefaultBlockSize(dstPath), username);
++              S3Guard.addMoveFile(metadataStore, srcPaths, dstMetas, childSrc,
++                  childDst, length, getDefaultBlockSize(childDst), username);
+             }
++            // Ancestor directories may not be listed, so we explicitly add them
++            S3Guard.addMoveAncestors(metadataStore, srcPaths, dstMetas,
++                keyToQualifiedPath(srcKey), childSrc, childDst, username);
+           }
+ 
+           if (keysToDelete.size() == MAX_ENTRIES_TO_DELETE) {
+@@ -924,9 +929,11 @@ private boolean innerRename(Path source, Path dest)
+         }
+       }
+ 
+-      // We moved all the children, now move the top-level dir if it's non-empty
+-      // Empty directory has been added as the object summary of listObjects
+-      if (srcStatus.isEmptyDirectory() == Tristate.FALSE) {
++      // We moved all the children, now move the top-level dir
++      // Empty directory should have been added as the object summary
++      if (hasMetadataStore()
++          && srcPaths != null
++          && !srcPaths.contains(src)) {
+         LOG.debug("To move the non-empty top-level dir src={} and dst={}",
+             src, dst);
+         S3Guard.addMoveDir(metadataStore, srcPaths, dstMetas, src, dst,
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index cebc50e..360b561 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -324,6 +324,54 @@ public static void addMoveFile(MetadataStore ms, Collection<Path> srcPaths,
+     addMoveStatus(srcPaths, dstMetas, srcPath, dstStatus);
+   }
+ 
++  /**
++   * Helper method that records the move of all ancestors of a path.
++   *
++   * In S3A, an optimization is to delete unnecessary fake directory objects if
++   * the directory is non-empty. In that case, for a nested child to move, S3A
++   * is not listing and thus moving all its ancestors (up to source root). So we
++   * take care of those inferred directories of this path explicitly.
++   *
++   * As {@link #addMoveFile} and {@link #addMoveDir}, this method adds resulting
++   * metadata to the supplied lists. It does not store in MetadataStore.
++   *
++   * @param ms MetadataStore, no-op if it is NullMetadataStore
++   * @param srcPaths stores the source path here
++   * @param dstMetas stores destination metadata here
++   * @param srcRoot source root up to which (exclusive) should we add ancestors
++   * @param srcPath source path of the child to add ancestors
++   * @param dstPath destination path of the child to add ancestors
++   * @param owner Hadoop user name
++   */
++  public static void addMoveAncestors(MetadataStore ms,
++      Collection<Path> srcPaths, Collection<PathMetadata> dstMetas,
++      Path srcRoot, Path srcPath, Path dstPath, String owner) {
++    if (isNullMetadataStore(ms)) {
++      return;
++    }
++
++    assertQualified(srcRoot);
++    assertQualified(srcPath);
++    assertQualified(dstPath);
++
++    if (srcPath.equals(srcRoot)) {
++      LOG.debug("Skip moving ancestors of source root directory {}", srcRoot);
++      return;
++    }
++
++    Path parentSrc = srcPath.getParent();
++    Path parentDst = dstPath.getParent();
++    while (parentSrc != null
++        && !parentSrc.isRoot()
++        && !parentSrc.equals(srcRoot)
++        && !srcPaths.contains(parentSrc)) {
++      LOG.debug("Renaming non-listed parent {} to {}", parentSrc, parentDst);
++      S3Guard.addMoveDir(ms, srcPaths, dstMetas, parentSrc, parentDst, owner);
++      parentSrc = parentSrc.getParent();
++      parentDst = parentDst.getParent();
++    }
++  }
++
+   private static void addMoveStatus(Collection<Path> srcPaths,
+       Collection<PathMetadata> dstMetas, Path srcPath, FileStatus dstStatus)
+   {
+-- 
+1.7.9.5
+

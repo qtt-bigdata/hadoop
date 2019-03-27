@@ -1,0 +1,201 @@
+From baa0b00e0df2cde081638627b08bb0e2ab16bb9a Mon Sep 17 00:00:00 2001
+From: Junping Du <junping_du@apache.org>
+Date: Tue, 17 May 2016 14:41:47 -0700
+Subject: [PATCH 1575/2848] MAPREDUCE-6657. Job history server can fail on
+ startup when NameNode is in start phase.
+ Contributed by Haibo Chen. (cherry picked from
+ commit f6ef876fe158a5334cad7075f1966573a1c4dec9)
+
+Change-Id: I48d67447578818b8fc729648537fde78fe4d15f6
+---
+ .../hadoop/hdfs/server/namenode/NameNode.java      |    4 ++
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |    3 +-
+ .../hadoop-mapreduce-client-hs/pom.xml             |    4 ++
+ .../hadoop/mapreduce/v2/hs/HistoryFileManager.java |   20 ++++--
+ ...estHistoryFileManagerInitWithNonRunningDFS.java |   75 ++++++++++++++++++++
+ 5 files changed, 100 insertions(+), 6 deletions(-)
+ create mode 100644 hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestHistoryFileManagerInitWithNonRunningDFS.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index ed97d69..cbc7ead 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -487,6 +487,10 @@ public static InetSocketAddress getAddress(URI filesystemURI) {
+     return getAddress(authority);
+   }
+ 
++  public static String composeNotStartedMessage(NamenodeRole role) {
++    return role + " still not started";
++  }
++
+   /**
+    * Get the NN address from the URI. If the uri is logical, default address is
+    * returned. Otherwise return the DNS-resolved address of the URI.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index b1bc715..11274f5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -1669,7 +1669,8 @@ public void removeXAttr(String src, XAttr xAttr) throws IOException {
+ 
+   private void checkNNStartup() throws IOException {
+     if (!this.nn.isStarted()) {
+-      throw new RetriableException(this.nn.getRole() + " still not started");
++      String message = NameNode.composeNotStartedMessage(this.nn.getRole());
++      throw new RetriableException(message);
+     }
+   }
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/pom.xml b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/pom.xml
+index cfe524d..70a985f 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/pom.xml
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/pom.xml
+@@ -39,6 +39,10 @@
+     </dependency>
+     <dependency>
+       <groupId>org.apache.hadoop</groupId>
++      <artifactId>hadoop-hdfs</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.apache.hadoop</groupId>
+       <artifactId>hadoop-mapreduce-client-common</artifactId>
+     </dependency>
+     <dependency>
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/HistoryFileManager.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/HistoryFileManager.java
+index a38e5d4..5e0aeff 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/HistoryFileManager.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/HistoryFileManager.java
+@@ -55,6 +55,9 @@
+ import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
++import org.apache.hadoop.hdfs.server.namenode.NameNode;
++import org.apache.hadoop.ipc.RetriableException;
+ import org.apache.hadoop.mapred.JobACLsManager;
+ import org.apache.hadoop.mapreduce.jobhistory.JobSummary;
+ import org.apache.hadoop.mapreduce.v2.api.records.JobId;
+@@ -586,12 +589,19 @@ void createHistoryDirs(Clock clock, long intervalCheckMillis,
+   }
+ 
+   /**
++   * Check if the NameNode is still not started yet as indicated by the
++   * exception type and message.
+    * DistributedFileSystem returns a RemoteException with a message stating
+    * SafeModeException in it. So this is only way to check it is because of
+-   * being in safe mode.
++   * being in safe mode. In addition, Name Node may have not started yet, in
++   * which case, the message contains "NameNode still not started".
+    */
+-  private boolean isBecauseSafeMode(Throwable ex) {
+-    return ex.toString().contains("SafeModeException");
++  private boolean isNameNodeStillNotStarted(Exception ex) {
++    String nameNodeNotStartedMsg = NameNode.composeNotStartedMessage(
++        HdfsServerConstants.NamenodeRole.NAMENODE);
++    return ex.toString().contains("SafeModeException") ||
++        (ex instanceof RetriableException && ex.getMessage().contains(
++            nameNodeNotStartedMsg));
+   }
+ 
+   /**
+@@ -618,7 +628,7 @@ boolean tryCreatingHistoryDirs(boolean logWait) throws IOException {
+       }
+       succeeded = false;
+     } catch (IOException e) {
+-      if (isBecauseSafeMode(e)) {
++      if (isNameNodeStillNotStarted(e)) {
+         succeeded = false;
+         if (logWait) {
+           LOG.info("Waiting for FileSystem at " +
+@@ -648,7 +658,7 @@ boolean tryCreatingHistoryDirs(boolean logWait) throws IOException {
+               "to be available");
+         }
+       } catch (IOException e) {
+-        if (isBecauseSafeMode(e)) {
++        if (isNameNodeStillNotStarted(e)) {
+           succeeded = false;
+           if (logWait) {
+             LOG.info("Waiting for FileSystem at " +
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestHistoryFileManagerInitWithNonRunningDFS.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestHistoryFileManagerInitWithNonRunningDFS.java
+new file mode 100644
+index 0000000..d0fefef
+--- /dev/null
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestHistoryFileManagerInitWithNonRunningDFS.java
+@@ -0,0 +1,75 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.mapreduce.v2.hs;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.mapreduce.v2.jobhistory.JHAdminConfig;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++
++/**
++ * Test service initialization of HistoryFileManager when
++ * HDFS is not running normally (either in start phase or
++ * in safe mode).
++ */
++public class TestHistoryFileManagerInitWithNonRunningDFS {
++  private static final String CLUSTER_BASE_DIR =
++      MiniDFSCluster.getBaseDirectory();
++
++  /**
++   * Verify if JHS keeps retrying to connect to HDFS, if the name node is
++   * in safe mode, when it creates history directories during service
++   * initialization. The expected behavior of JHS is to keep retrying for
++   * a time limit as specified by
++   * JHAdminConfig.MR_HISTORY_MAX_START_WAIT_TIME, and give up by throwing
++   * a YarnRuntimeException with a time out message.
++   */
++  @Test
++  public void testKeepRetryingWhileNameNodeInSafeMode() throws Exception {
++    Configuration conf = new Configuration();
++    // set maximum wait time for JHS to wait for HDFS NameNode to start running
++    final long maxJhsWaitTime = 500;
++    conf.setLong(JHAdminConfig.MR_HISTORY_MAX_START_WAIT_TIME, maxJhsWaitTime);
++    conf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR, CLUSTER_BASE_DIR);
++
++    MiniDFSCluster dfsCluster = new MiniDFSCluster.Builder(conf).build();
++    try {
++      // set up a cluster with its name node in safe mode
++      dfsCluster.getFileSystem().setSafeMode(
++          HdfsConstants.SafeModeAction.SAFEMODE_ENTER);
++      Assert.assertTrue(dfsCluster.getFileSystem().isInSafeMode());
++
++      HistoryFileManager hfm = new HistoryFileManager();
++      hfm.serviceInit(conf);
++      Assert.fail("History File Manager did not retry to connect to name node");
++    } catch (YarnRuntimeException yex) {
++      String expectedExceptionMsg = "Timed out '" + maxJhsWaitTime +
++          "ms' waiting for FileSystem to become available";
++      Assert.assertEquals("Unexpected reconnect timeout exception message",
++          expectedExceptionMsg, yex.getMessage());
++    } finally {
++      dfsCluster.shutdown(true);
++    }
++  }
++}
+-- 
+1.7.9.5
+

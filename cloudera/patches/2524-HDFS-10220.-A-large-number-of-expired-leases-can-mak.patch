@@ -1,0 +1,310 @@
+From bfeeed1fc132191ae2ef4d201820e0b661d31c3a Mon Sep 17 00:00:00 2001
+From: Ravi Prakash <raviprak@altiscale.com>
+Date: Wed, 8 Jun 2016 13:44:22 -0700
+Subject: [PATCH 2524/2848] HDFS-10220. A large number of expired leases can
+ make namenode unresponsive and cause failover
+ (Nicolas Fraison via raviprak)
+
+(cherry picked from commit ae047655f4355288406cd5396fb4e3ea7c307b14)
+(cherry picked from commit 9c5f7f290eb05808fe89835a15bee0947b91d1a0)
+(cherry picked from commit 588ea6d431397771c13952c5f10a1cf55ecac733)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+
+Change-Id: I895cabc4279a22fba91015397d68182fa5a4bdf9
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |   10 +++++
+ .../hdfs/server/common/HdfsServerConstants.java    |    1 -
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   42 ++++++++++++++++----
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   22 ++++++++--
+ .../src/main/resources/hdfs-default.xml            |   18 +++++++++
+ .../hdfs/server/namenode/TestLeaseManager.java     |   15 +++----
+ 6 files changed, 89 insertions(+), 19 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 4acbae8..ea024eb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -419,6 +419,16 @@
+   public static final String  DFS_NAMENODE_MAX_XATTR_SIZE_KEY = "dfs.namenode.fs-limits.max-xattr-size";
+   public static final int     DFS_NAMENODE_MAX_XATTR_SIZE_DEFAULT = 16384;
+ 
++  public static final String  DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY =
++      "dfs.namenode.lease-recheck-interval-ms";
++  public static final long    DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT =
++      2000;
++  public static final String
++      DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_KEY =
++      "dfs.namenode.max-lock-hold-to-release-lease-ms";
++  public static final long
++      DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_DEFAULT = 25;
++
+   // Threshold for how long namenode locks must be held for the
+   // event to be logged
+   public static final String  DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+index 9c2c8a9..9c90c10 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+@@ -309,7 +309,6 @@ public void write(DataOutput out) throws IOException {
+   }
+   
+   public static final String NAMENODE_LEASE_HOLDER = "HDFS_NameNode";
+-  public static final long NAMENODE_LEASE_RECHECK_INTERVAL = 2000;
+ 
+   public static final String CRYPTO_XATTR_ENCRYPTION_ZONE =
+       "raw.hdfs.crypto.encryption.zone";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 2cdced0..377f44e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -81,6 +81,10 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SAFEMODE_THRESHOLD_PCT_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SAFEMODE_THRESHOLD_PCT_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERMISSIONS_ENABLED_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERMISSIONS_SUPERUSERGROUP_DEFAULT;
+@@ -411,7 +415,12 @@ private void logAuditEvent(boolean succeeded,
+   private final UserGroupInformation fsOwner;
+   private final String supergroup;
+   private final boolean standbyShouldCheckpoint;
+-  
++
++  /** Interval between each check of lease to release. */
++  private final long leaseRecheckIntervalMs;
++  /** Maximum time the lock is hold to release lease. */
++  private final long maxLockHoldToReleaseLeaseMs;
++
+   // Scan interval is not configurable.
+   private static final long DELEGATION_TOKEN_REMOVER_SCAN_INTERVAL =
+     TimeUnit.MILLISECONDS.convert(1, TimeUnit.HOURS);
+@@ -934,6 +943,13 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+           DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_KEY,
+           DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_DEFAULT);
+ 
++      this.leaseRecheckIntervalMs = conf.getLong(
++          DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY,
++          DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT);
++      this.maxLockHoldToReleaseLeaseMs = conf.getLong(
++          DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_KEY,
++          DFS_NAMENODE_MAX_LOCK_HOLD_TO_RELEASE_LEASE_MS_DEFAULT);
++
+       // For testing purposes, allow the DT secret manager to be started regardless
+       // of whether security is enabled.
+       alwaysUseDelegationTokensForTests = conf.getBoolean(
+@@ -988,6 +1004,16 @@ public RetryCache getRetryCache() {
+     return retryCache;
+   }
+ 
++  @VisibleForTesting
++  public long getLeaseRecheckIntervalMs() {
++    return leaseRecheckIntervalMs;
++  }
++
++  @VisibleForTesting
++  public long getMaxLockHoldToReleaseLeaseMs() {
++    return maxLockHoldToReleaseLeaseMs;
++  }
++
+   void lockRetryCache() {
+     if (retryCache != null) {
+       retryCache.lock();
+@@ -4665,9 +4691,9 @@ boolean internalReleaseLease(Lease lease, String src, INodesInPath iip,
+     if(nrCompleteBlocks == nrBlocks) {
+       finalizeINodeFileUnderConstruction(src, pendingFile,
+           iip.getLatestSnapshotId());
+-      NameNode.stateChangeLog.warn("BLOCK*"
+-        + " internalReleaseLease: All existing blocks are COMPLETE,"
+-        + " lease removed, file closed.");
++      NameNode.stateChangeLog.warn("BLOCK*" +
++          " internalReleaseLease: All existing blocks are COMPLETE," +
++          " lease removed, file " + src + " closed.");
+       return true;  // closed!
+     }
+ 
+@@ -4704,9 +4730,9 @@ boolean internalReleaseLease(Lease lease, String src, INodesInPath iip,
+           blockManager.checkMinReplication(lastBlock)) {
+         finalizeINodeFileUnderConstruction(src, pendingFile,
+             iip.getLatestSnapshotId());
+-        NameNode.stateChangeLog.warn("BLOCK*"
+-          + " internalReleaseLease: Committed blocks are minimally replicated,"
+-          + " lease removed, file closed.");
++        NameNode.stateChangeLog.warn("BLOCK*" +
++            " internalReleaseLease: Committed blocks are minimally" +
++            " replicated, lease removed, file" + src + " closed.");
+         return true;  // closed!
+       }
+       // Cannot close file right now, since some blocks 
+@@ -4736,7 +4762,7 @@ boolean internalReleaseLease(Lease lease, String src, INodesInPath iip,
+         finalizeINodeFileUnderConstruction(src, pendingFile,
+             iip.getLatestSnapshotId());
+         NameNode.stateChangeLog.warn("BLOCK* internalReleaseLease: "
+-            + "Removed empty last block and closed file.");
++            + "Removed empty last block and closed file " + src);
+         return true;
+       }
+       // start recovery of the last block for this file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 2d8c8b0..167bdf1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
++import static org.apache.hadoop.util.Time.monotonicNow;
+ import static org.apache.hadoop.util.Time.now;
+ 
+ import java.io.IOException;
+@@ -428,7 +429,7 @@ public void run() {
+             }
+           }
+   
+-          Thread.sleep(HdfsServerConstants.NAMENODE_LEASE_RECHECK_INTERVAL);
++          Thread.sleep(fsnamesystem.getLeaseRecheckIntervalMs());
+         } catch(InterruptedException ie) {
+           if (LOG.isDebugEnabled()) {
+             LOG.debug(name + " is interrupted", ie);
+@@ -448,8 +449,11 @@ synchronized boolean checkLeases() {
+     boolean needSync = false;
+     assert fsnamesystem.hasWriteLock();
+ 
+-    while(!sortedLeases.isEmpty() && sortedLeases.peek().expiredHardLimit()) {
+-      Lease leaseToCheck = sortedLeases.poll();
++    long start = monotonicNow();
++
++    while(!sortedLeases.isEmpty() && sortedLeases.peek().expiredHardLimit()
++      && !isMaxLockHoldToReleaseLease(start)) {
++      Lease leaseToCheck = sortedLeases.peek();
+       LOG.info(leaseToCheck + " has expired hard limit");
+ 
+       final List<Long> removing = new ArrayList<>();
+@@ -488,6 +492,11 @@ synchronized boolean checkLeases() {
+               + leaseToCheck, e);
+           removing.add(id);
+         }
++        if (isMaxLockHoldToReleaseLease(start)) {
++          LOG.debug("Breaking out of checkLeases after " +
++              fsnamesystem.getMaxLockHoldToReleaseLeaseMs() + "ms.");
++          break;
++        }
+       }
+ 
+       for(Long id : removing) {
+@@ -498,6 +507,13 @@ synchronized boolean checkLeases() {
+     return needSync;
+   }
+ 
++
++  /** @return true if max lock hold is reached */
++  private boolean isMaxLockHoldToReleaseLease(long start) {
++    return monotonicNow() - start >
++        fsnamesystem.getMaxLockHoldToReleaseLeaseMs();
++  }
++
+   @Override
+   public synchronized String toString() {
+     return getClass().getSimpleName() + "= {"
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 94dad36..f9b3635 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2317,6 +2317,24 @@
+ </property>
+ 
+ <property>
++  <name>dfs.namenode.lease-recheck-interval-ms</name>
++  <value>2000</value>
++  <description>During the release of lease a lock is hold that make any
++    operations on the namenode stuck. In order to not block them during
++    a too long duration we stop releasing lease after this max lock limit.
++  </description>
++</property>
++
++<property>
++  <name>dfs.namenode.max-lock-hold-to-release-lease-ms</name>
++  <value>25</value>
++  <description>During the release of lease a lock is hold that make any
++    operations on the namenode stuck. In order to not block them during
++    a too long duration we stop releasing lease after this max lock limit.
++  </description>
++</property>
++
++<property>
+   <name>dfs.namenode.startup.delay.block.deletion.sec</name>
+   <value>0</value>
+   <description>The delay in seconds at which we will pause the blocks deletion
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+index 9ffee3c..edaf17a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+@@ -50,6 +51,8 @@
+ public class TestLeaseManager {
+   private static final long GRANDFATHER_INODE_ID = 0;
+ 
++  public static long maxLockHoldToReleaseLeaseMs = 100;
++
+   @Test
+   public void testRemoveLeases() throws Exception {
+     FSNamesystem fsn = mock(FSNamesystem.class);
+@@ -68,16 +71,14 @@ public void testRemoveLeases() throws Exception {
+     assertEquals(0, lm.getINodeIdWithLeases().size());
+   }
+ 
+-  /** Check that even if LeaseManager.checkLease is not able to relinquish
+-   * leases, the Namenode does't enter an infinite loop while holding the FSN
+-   * write lock and thus become unresponsive
++  /** Check that LeaseManager.checkLease release some leases
+    */
+   @Test (timeout=30000)
+   public void testCheckLease() throws InterruptedException {
+     LeaseManager lm = new LeaseManager(makeMockFsNameSystem());
+-    final long numLease = 100;
+     final long expiryTime = 0;
+-    final long waitTime = expiryTime + 1;
++
++    long numLease = 100;
+ 
+     //Make sure the leases we are going to add exceed the hard limit
+     lm.setLeasePeriod(expiryTime, expiryTime);
+@@ -87,11 +88,10 @@ public void testCheckLease() throws InterruptedException {
+       lm.addLease("holder"+i, INodeId.ROOT_INODE_ID + i);
+     }
+     assertEquals(numLease, lm.countLease());
+-    Thread.sleep(waitTime);
+ 
+     //Initiate a call to checkLease. This should exit within the test timeout
+     lm.checkLeases();
+-    assertEquals(lm.countLease(), 0);
++    assertTrue(lm.countLease() < numLease);
+   }
+ 
+   /**
+@@ -398,6 +398,7 @@ private static FSNamesystem makeMockFsNameSystem() {
+     when(fsn.hasReadLock()).thenReturn(true);
+     when(fsn.hasWriteLock()).thenReturn(true);
+     when(fsn.getFSDirectory()).thenReturn(dir);
++    when(fsn.getMaxLockHoldToReleaseLeaseMs()).thenReturn(maxLockHoldToReleaseLeaseMs);
+     return fsn;
+   }
+ 
+-- 
+1.7.9.5
+

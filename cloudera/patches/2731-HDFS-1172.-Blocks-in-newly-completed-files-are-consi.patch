@@ -1,0 +1,567 @@
+From f87b493c29035b95eec1ad567364a630660ed04e Mon Sep 17 00:00:00 2001
+From: Zsolt Venczel <zvenczel@cloudera.com>
+Date: Wed, 3 Jan 2018 10:04:16 +0100
+Subject: [PATCH 2731/2848] HDFS-1172. Blocks in newly completed files are
+ considered under-replicated too quickly.
+ Contributed by Masatake Iwasaki.
+
+(cherry picked from commit d6fbd4124c24134bb657de84f3d84d24eee95199)
+(cherry picked from commit e906108fc98a011630d12a43e557b81d7ef7ea5d)
+(cherry picked from commit 1452ba139ea845ad9e82a5902d239b59a789bff3)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+
+Change-Id: I24268e8851af3acbcc192275d7da9aa40e5c9063
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |  133 +++++-------
+ .../org/apache/hadoop/hdfs/TestReplication.java    |  227 +++++++++++++++++---
+ 2 files changed, 258 insertions(+), 102 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index ce4b6c9..ef28b16 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -17,55 +17,15 @@
+  */
+ package org.apache.hadoop.hdfs.server.blockmanagement;
+ 
+-import static org.apache.hadoop.util.ExitUtil.terminate;
+-
+-import java.io.IOException;
+-import java.io.PrintWriter;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.EnumSet;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.LinkedHashSet;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Queue;
+-import java.util.Set;
+-import java.util.TreeSet;
+-import java.util.concurrent.ArrayBlockingQueue;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.Callable;
+-import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.FutureTask;
+-import java.util.concurrent.ThreadLocalRandom;
+-import java.util.concurrent.atomic.AtomicLong;
+-
+-import javax.management.ObjectName;
+-
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileEncryptionInfo;
+-import org.apache.hadoop.hdfs.AddBlockFlag;
+-import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+-import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.hdfs.HAUtil;
+-import org.apache.hadoop.hdfs.StorageType;
+-import org.apache.hadoop.hdfs.protocol.Block;
+-import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
++import org.apache.hadoop.hdfs.*;
++import org.apache.hadoop.hdfs.protocol.*;
+ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs.BlockReportReplica;
+-import org.apache.hadoop.hdfs.protocol.DatanodeID;
+-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+-import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+-import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+-import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+-import org.apache.hadoop.hdfs.protocol.UnregisteredNodeException;
+ import org.apache.hadoop.hdfs.security.token.block.BlockTokenSecretManager;
+ import org.apache.hadoop.hdfs.security.token.block.BlockTokenSecretManager.AccessMode;
+ import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
+@@ -82,35 +42,27 @@
+ import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
+ import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+ import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
+-import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
+-import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
+-import org.apache.hadoop.hdfs.server.protocol.BlocksWithLocations;
++import org.apache.hadoop.hdfs.server.protocol.*;
+ import org.apache.hadoop.hdfs.server.protocol.BlocksWithLocations.BlockWithLocations;
+-import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
+-import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+-import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage.State;
+-import org.apache.hadoop.hdfs.server.protocol.KeyUpdateCommand;
+-import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
+-import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
+ import org.apache.hadoop.hdfs.util.FoldedTreeSet;
+-import org.apache.hadoop.hdfs.util.LightWeightHashSet;
+ import org.apache.hadoop.hdfs.util.LightWeightLinkedSet;
+ import org.apache.hadoop.metrics2.util.MBeans;
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.security.UserGroupInformation;
+-import org.apache.hadoop.util.Daemon;
+-import org.apache.hadoop.util.ExitUtil;
+-import org.apache.hadoop.util.LightWeightGSet;
+-import org.apache.hadoop.util.Time;
+-import org.apache.hadoop.util.VersionInfo;
+-
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.base.Preconditions;
+-
++import org.apache.hadoop.util.*;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import javax.management.ObjectName;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicLong;
++
++import static org.apache.hadoop.util.ExitUtil.terminate;
++
+ /**
+  * Keeps information related to the blocks stored in the Hadoop cluster.
+  * For block state management, it tries to maintain the  safety
+@@ -753,12 +705,37 @@ public boolean commitOrCompleteLastBlock(BlockCollection bc,
+         numReplicas.liveEnteringMaintenanceReplicas();
+ 
+     if (numUsableReplicas >= minReplication) {
++      if (b) {
++        addExpectedReplicasToPending(lastBlock);
++      }
+       completeBlock(bc, bc.numBlocks() - 1, false);
+     }
+     return b;
+   }
+ 
+   /**
++   * If IBR is not sent from expected locations yet, add the datanodes to
++   * pendingReplications in order to keep ReplicationMonitor from scheduling
++   * the block.
++   */
++  private void addExpectedReplicasToPending(BlockInfo lastBlock) {
++    DatanodeStorageInfo[] expectedStorages =
++            ((BlockInfoUnderConstruction)lastBlock).getExpectedStorageLocations();
++    if (expectedStorages.length - lastBlock.numNodes() > 0) {
++      ArrayList<DatanodeDescriptor> pendingNodes =
++          new ArrayList<DatanodeDescriptor>();
++      for (DatanodeStorageInfo storage : expectedStorages) {
++        DatanodeDescriptor dnd = storage.getDatanodeDescriptor();
++        if (lastBlock.findStorageInfo(dnd) == null) {
++          pendingNodes.add(dnd);
++        }
++      }
++      pendingReplications.increment(lastBlock,
++          pendingNodes.toArray(new DatanodeDescriptor[pendingNodes.size()]));
++    }
++  }
++
++  /**
+    * Convert a specified block of the file to a complete block.
+    * @param bc file
+    * @param blkIndex  block index in the file
+@@ -783,7 +760,7 @@ private BlockInfo completeBlock(final BlockCollection bc,
+     BlockInfo completeBlock = ucBlock.convertToCompleteBlock();
+     // replace penultimate block in file
+     bc.setBlock(blkIndex, completeBlock);
+-    
++
+     // Since safe-mode only counts complete blocks, and we now have
+     // one more complete block, we need to adjust the total up, and
+     // also count it as safe, if we have at least the minimum replica
+@@ -793,7 +770,7 @@ private BlockInfo completeBlock(final BlockCollection bc,
+     namesystem.adjustSafeModeBlockTotals(0, 1);
+     namesystem.incrementSafeBlockCount(
+         Math.min(numNodes, minReplication));
+-    
++
+     // replace block in the blocksMap
+     return blocksMap.replaceBlock(completeBlock);
+   }
+@@ -807,7 +784,7 @@ private BlockInfo completeBlock(final BlockCollection bc,
+       }
+     return block;
+   }
+-  
++
+   /**
+    * Force the given block in the given file to be marked as complete,
+    * regardless of whether enough replicas are present. This is necessary
+@@ -820,7 +797,7 @@ public BlockInfo forceCompleteBlock(final BlockCollection bc,
+     return completeBlock(bc, block, true);
+   }
+ 
+-  
++
+   /**
+    * Convert the last block of the file to an under construction block.<p>
+    * The block is converted only if the file has blocks and the last one
+@@ -1530,7 +1507,7 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+               continue;
+             }
+ 
+-            // liveReplicaNodes can include READ_ONLY_SHARED replicas which are 
++            // liveReplicaNodes can include READ_ONLY_SHARED replicas which are
+             // not included in the numReplicas.liveReplicas() count
+             assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
+ 
+@@ -1677,6 +1654,8 @@ boolean hasEnoughEffectiveReplicas(BlockInfo block,
+         (pendingReplicaNum > 0 || isPlacementPolicySatisfied(block));
+   }
+ 
++
++
+   /** Choose target for WebHDFS redirection. */
+   public DatanodeStorageInfo[] chooseTarget4WebHDFS(String src,
+       DatanodeDescriptor clientnode, Set<Node> excludes, long blocksize) {
+@@ -1953,7 +1932,7 @@ public long requestBlockReportLeaseId(DatanodeRegistration nodeReg) {
+       this.reportedState = reportedState;
+     }
+   }
+-  
++
+   /**
+    * BlockToMarkCorrupt is used to build the "toCorrupt" list, which is a
+    * list of blocks that should be considered corrupt due to a block report.
+@@ -2799,7 +2778,7 @@ private void logAddStoredBlock(BlockInfo storedBlock, DatanodeDescriptor node) {
+     if (!blockLog.isInfoEnabled()) {
+       return;
+     }
+-    
++
+     StringBuilder sb = new StringBuilder(500);
+     sb.append("BLOCK* addStoredBlock: blockMap updated: ")
+       .append(node)
+@@ -3048,7 +3027,7 @@ public void setReplication(final short oldRepl, final short newRepl,
+         processOverReplicatedBlock(b, newRepl, null, null);
+       }
+     }
+-      
++
+     if (oldRepl > newRepl) {
+       // old replication > the new one; need to remove copies
+       LOG.info("Decreasing replication from " + oldRepl + " to " + newRepl
+@@ -3666,12 +3645,12 @@ private void updateNeededReplications(final BlockInfo block,
+    * process it as an over replicated block.
+    */
+   public void checkReplication(BlockCollection bc) {
+-    final short expected = bc.getBlockReplication();
+     for (BlockInfo block : bc.getBlocks()) {
++      final short expected = bc.getBlockReplication();
+       final NumberReplicas n = countNodes(block);
+       final int pending = pendingReplications.getNumReplicas(block);
+       if (!hasEnoughEffectiveReplicas(block, n, pending)) {
+-        neededReplications.add(block, n.liveReplicas(),
++        neededReplications.add(block, n.liveReplicas() + pending,
+             n.readOnlyReplicas(),
+             n.outOfServiceReplicas(), expected);
+       } else if (n.liveReplicas() > expected) {
+@@ -3836,11 +3815,11 @@ private void removeFromExcessReplicateMap(Block block) {
+   public int getCapacity() {
+     return blocksMap.getCapacity();
+   }
+-  
++
+   /**
+-   * Return a range of corrupt replica block ids. Up to numExpectedBlocks 
++   * Return a range of corrupt replica block ids. Up to numExpectedBlocks
+    * blocks starting at the next block after startingBlockId are returned
+-   * (fewer if numExpectedBlocks blocks are unavailable). If startingBlockId 
++   * (fewer if numExpectedBlocks blocks are unavailable). If startingBlockId
+    * is null, up to numExpectedBlocks blocks are returned from the beginning.
+    * If startingBlockId cannot be found, null is returned.
+    *
+@@ -4085,7 +4064,7 @@ public ReplicationWork(BlockInfo block,
+       this.priority = priority;
+       this.targets = null;
+     }
+-    
++
+     private void chooseTargets(BlockPlacementPolicy blockplacement,
+         BlockStoragePolicySuite storagePolicySuite,
+         Set<Node> excludedNodes) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+index d47d12d..1f3c66b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+@@ -17,38 +17,44 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-
+-import java.io.IOException;
+-import java.io.OutputStream;
+-import java.net.InetSocketAddress;
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import java.util.Random;
+-import java.util.List;
+-import java.util.concurrent.TimeoutException;
+-
++import com.google.common.base.Supplier;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.BlockLocation;
+-import org.apache.hadoop.fs.CommonConfigurationKeys;
+-import org.apache.hadoop.fs.FSDataOutputStream;
+-import org.apache.hadoop.fs.FileStatus;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+-import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.fs.*;
++import org.apache.hadoop.hdfs.protocol.*;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+-import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
++import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
++import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.datanode.FsDatasetTestUtils.MaterializedReplica;
++import org.apache.hadoop.hdfs.server.datanode.InternalDataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
++import org.apache.hadoop.hdfs.server.namenode.NameNode;
++import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
++import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.metrics2.MetricsRecordBuilder;
++import org.apache.hadoop.test.GenericTestUtils;
++import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
+ import org.apache.hadoop.util.Time;
+ import org.junit.Test;
++import org.mockito.Mockito;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.TimeoutException;
++
++import static org.apache.hadoop.test.MetricsAsserts.assertCounter;
++import static org.apache.hadoop.test.MetricsAsserts.getMetrics;
++import static org.junit.Assert.*;
+ 
+ /**
+  * This class tests the replication of a DFS file.
+@@ -280,7 +286,15 @@ private void waitForBlockReplication(String filename,
+                                        ClientProtocol namenode,
+                                        int expected, long maxWaitSec) 
+                                        throws IOException {
+-    long start = Time.now();
++    waitForBlockReplication(filename, namenode, expected, maxWaitSec, false, false);
++  }
++
++  private void waitForBlockReplication(String filename,
++    ClientProtocol namenode,
++    int expected, long maxWaitSec,
++    boolean isUnderConstruction, boolean noOverReplication)
++    throws IOException {
++    long start = Time.monotonicNow();
+     
+     //wait for all the blocks to be replicated;
+     LOG.info("Checking for block replication for " + filename);
+@@ -292,7 +306,13 @@ private void waitForBlockReplication(String filename,
+       for (Iterator<LocatedBlock> iter = blocks.getLocatedBlocks().iterator();
+            iter.hasNext();) {
+         LocatedBlock block = iter.next();
++        if (isUnderConstruction && !iter.hasNext()) {
++          break; // do not check the last block
++        }
+         int actual = block.getLocations().length;
++        if (noOverReplication) {
++          assertTrue(actual <= expected);
++        }
+         if ( actual < expected ) {
+           LOG.info("Not enough replicas for " + block.getBlock()
+               + " yet. Expecting " + expected + ", got " + actual + ".");
+@@ -306,7 +326,7 @@ private void waitForBlockReplication(String filename,
+       }
+       
+       if (maxWaitSec > 0 && 
+-          (Time.now() - start) > (maxWaitSec * 1000)) {
++          (Time.monotonicNow() - start) > (maxWaitSec * 1000)) {
+         throw new IOException("Timedout while waiting for all blocks to " +
+                               " be replicated for " + filename);
+       }
+@@ -516,4 +536,161 @@ public void testReplicationWhenBlockCorruption() throws Exception {
+       }
+     }
+   }
++
++
++  /**
++   * This test makes sure that, when a file is closed before all
++   * of the datanodes in the pipeline have reported their replicas,
++   * the NameNode doesn't consider the block under-replicated too
++   * aggressively. It is a regression test for HDFS-1172.
++   */
++  @Test(timeout=60000)
++  public void testNoExtraReplicationWhenBlockReceivedIsLate()
++      throws Exception {
++    LOG.info("Test block replication when blockReceived is late" );
++    final short numDataNodes = 3;
++    final short replication = 3;
++    final Configuration conf = new Configuration();
++        conf.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 1024);
++    final MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .numDataNodes(numDataNodes).build();
++    final String testFile = "/replication-test-file";
++    final Path testPath = new Path(testFile);
++    final BlockManager bm =
++        cluster.getNameNode().getNamesystem().getBlockManager();
++
++    try {
++      cluster.waitActive();
++
++      // Artificially delay IBR from 1 DataNode.
++      // this ensures that the client's completeFile() RPC will get to the
++      // NN before some of the replicas are reported.
++      NameNode nn = cluster.getNameNode();
++      DataNode dn = cluster.getDataNodes().get(0);
++      DatanodeProtocolClientSideTranslatorPB spy =
++          InternalDataNodeTestUtils.spyOnBposToNN(dn, nn);
++      DelayAnswer delayer = new GenericTestUtils.DelayAnswer(LOG);
++      Mockito.doAnswer(delayer).when(spy).blockReceivedAndDeleted(
++          Mockito.<DatanodeRegistration>anyObject(),
++          Mockito.anyString(),
++          Mockito.<StorageReceivedDeletedBlocks[]>anyObject());
++
++      FileSystem fs = cluster.getFileSystem();
++      // Create and close a small file with two blocks
++      DFSTestUtil.createFile(fs, testPath, 1500, replication, 0);
++
++      // schedule replication via BlockManager#computeReplicationWork
++      BlockManagerTestUtil.computeAllPendingWork(bm);
++
++      // Initially, should have some pending replication since the close()
++      // is earlier than at lease one of the reportReceivedDeletedBlocks calls
++      assertTrue(pendingReplicationCount(bm) > 0);
++
++      // release pending IBR.
++      delayer.waitForCall();
++      delayer.proceed();
++      delayer.waitForResult();
++
++      // make sure DataNodes do replication work if exists
++      for (DataNode d : cluster.getDataNodes()) {
++        DataNodeTestUtils.triggerHeartbeat(d);
++      }
++
++      // Wait until there is nothing pending
++      try {
++        GenericTestUtils.waitFor(new Supplier<Boolean>() {
++          @Override
++          public Boolean get() {
++            return pendingReplicationCount(bm) == 0;
++          }
++        }, 100, 3000);
++      } catch (TimeoutException e) {
++        fail("timed out while waiting for no pending replication.");
++      }
++
++      // Check that none of the datanodes have serviced a replication request.
++      // i.e. that the NameNode didn't schedule any spurious replication.
++      assertNoReplicationWasPerformed(cluster);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
++  /**
++   * This test makes sure that, if a file is under construction, blocks
++   * in the middle of that file are properly re-replicated if they
++   * become corrupt.
++   */
++  @Test(timeout=60000)
++  public void testReplicationWhileUnderConstruction()
++      throws Exception {
++    LOG.info("Test block replication in under construction" );
++    MiniDFSCluster cluster = null;
++    final short numDataNodes = 6;
++    final short replication = 3;
++    String testFile = "/replication-test-file";
++    Path testPath = new Path(testFile);
++    FSDataOutputStream stm = null;
++    try {
++      Configuration conf = new Configuration();
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build();
++      cluster.waitActive();
++
++      FileSystem fs = cluster.getFileSystem();
++
++      stm = AppendTestUtil.createFile(fs, testPath, replication);
++
++      // Write a full block
++      byte[] buffer = AppendTestUtil.initBuffer(AppendTestUtil.BLOCK_SIZE);
++      stm.write(buffer); // block 1
++      stm.write(buffer); // block 2
++      stm.write(buffer, 0, 1); // start block 3
++      stm.hflush(); // make sure blocks are persisted, etc
++
++      // Everything should be fully replicated
++      waitForBlockReplication(testFile, cluster.getNameNodeRpc(), replication, 30000, true, true);
++
++      // Check that none of the datanodes have serviced a replication request.
++      // i.e. that the NameNode didn't schedule any spurious replication.
++      assertNoReplicationWasPerformed(cluster);
++
++      // Mark one the blocks corrupt
++      List<LocatedBlock> blocks;
++      FSDataInputStream in = fs.open(testPath);
++      try {
++        blocks = DFSTestUtil.getAllBlocks(in);
++      } finally {
++        in.close();
++      }
++      LocatedBlock lb = blocks.get(0);
++      LocatedBlock lbOneReplica = new LocatedBlock(lb.getBlock(),
++          new DatanodeInfo[] { lb.getLocations()[0] });
++      cluster.getNameNodeRpc().reportBadBlocks(
++          new LocatedBlock[] { lbOneReplica });
++
++      // Everything should be fully replicated
++      waitForBlockReplication(testFile, cluster.getNameNodeRpc(), replication, 30000, true, true);
++    } finally {
++      if (stm != null) {
++        IOUtils.closeStream(stm);
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
++  private long pendingReplicationCount(BlockManager bm) {
++    BlockManagerTestUtil.updateState(bm);
++    return bm.getPendingReplicationBlocksCount();
++  }
++
++  private void assertNoReplicationWasPerformed(MiniDFSCluster cluster) {
++    for (DataNode dn : cluster.getDataNodes()) {
++      MetricsRecordBuilder rb = getMetrics(dn.getMetrics().name());
++      assertCounter("BlocksReplicated", 0L, rb);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

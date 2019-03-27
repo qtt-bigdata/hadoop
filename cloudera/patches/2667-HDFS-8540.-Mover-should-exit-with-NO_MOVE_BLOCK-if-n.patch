@@ -1,0 +1,343 @@
+From 8eb90517619c7ebbd681b8278a8823ec5f96a8bb Mon Sep 17 00:00:00 2001
+From: Tsz-Wo Nicholas Sze <szetszwo@hortonworks.com>
+Date: Mon, 15 Jun 2015 16:26:53 -0700
+Subject: [PATCH 2667/2848] HDFS-8540.  Mover should exit with NO_MOVE_BLOCK
+ if no block can be moved.  Contributed by
+ surendra singh lilhore
+
+(cherry picked from commit 9ba29f081b10f8f3f9e3afc9d88a83dbc363f3c7)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+
+Change-Id: I7fbbd217ef4b62025c7d032f451613a3faccd67a
+---
+ .../org/apache/hadoop/hdfs/server/mover/Mover.java |   94 ++++++++++++++------
+ .../apache/hadoop/hdfs/server/mover/TestMover.java |   29 ++++++
+ .../hadoop/hdfs/server/mover/TestStorageMover.java |   18 ++--
+ 3 files changed, 104 insertions(+), 37 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+index ee78c25..474d2fd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+@@ -160,8 +160,7 @@ private void initStoragePolicies() throws IOException {
+   private ExitStatus run() {
+     try {
+       init();
+-      boolean hasRemaining = new Processor().processNamespace();
+-      return hasRemaining ? ExitStatus.IN_PROGRESS : ExitStatus.SUCCESS;
++      return new Processor().processNamespace().getExitStatus();
+     } catch (IllegalArgumentException e) {
+       System.out.println(e + ".  Exiting ...");
+       return ExitStatus.ILLEGAL_ARGUMENTS;
+@@ -259,11 +258,11 @@ private boolean isSnapshotPathInCurrent(String path) throws IOException {
+      * @return whether there is still remaining migration work for the next
+      *         round
+      */
+-    private boolean processNamespace() throws IOException {
++    private Result processNamespace() throws IOException {
+       getSnapshottableDirs();
+-      boolean hasRemaining = false;
++      Result result = new Result();
+       for (Path target : targetPaths) {
+-        hasRemaining |= processPath(target.toUri().getPath());
++        processPath(target.toUri().getPath(), result);
+       }
+       // wait for pending move to finish and retry the failed migration
+       boolean hasFailed = Dispatcher.waitForMoveCompletion(storages.targets
+@@ -279,16 +278,15 @@ private boolean processNamespace() throws IOException {
+         // Reset retry count if no failure.
+         retryCount.set(0);
+       }
+-      hasRemaining |= hasFailed;
+-      return hasRemaining;
++      result.updateHasRemaining(hasFailed);
++      return result;
+     }
+ 
+     /**
+      * @return whether there is still remaing migration work for the next
+      *         round
+      */
+-    private boolean processPath(String fullPath) {
+-      boolean hasRemaining = false;
++    private void processPath(String fullPath, Result result) {
+       for (byte[] lastReturnedName = HdfsFileStatus.EMPTY_NAME;;) {
+         final DirectoryListing children;
+         try {
+@@ -296,73 +294,71 @@ private boolean processPath(String fullPath) {
+         } catch(IOException e) {
+           LOG.warn("Failed to list directory " + fullPath
+               + ". Ignore the directory and continue.", e);
+-          return hasRemaining;
++          return;
+         }
+         if (children == null) {
+-          return hasRemaining;
++          return;
+         }
+         for (HdfsFileStatus child : children.getPartialListing()) {
+-          hasRemaining |= processRecursively(fullPath, child);
++          processRecursively(fullPath, child, result);
+         }
+         if (children.hasMore()) {
+           lastReturnedName = children.getLastName();
+         } else {
+-          return hasRemaining;
++          return;
+         }
+       }
+     }
+ 
+     /** @return whether the migration requires next round */
+-    private boolean processRecursively(String parent, HdfsFileStatus status) {
++    private void processRecursively(String parent, HdfsFileStatus status,
++        Result result) {
+       String fullPath = status.getFullName(parent);
+-      boolean hasRemaining = false;
+       if (status.isDir()) {
+         if (!fullPath.endsWith(Path.SEPARATOR)) {
+           fullPath = fullPath + Path.SEPARATOR;
+         }
+ 
+-        hasRemaining = processPath(fullPath);
++        processPath(fullPath, result);
+         // process snapshots if this is a snapshottable directory
+         if (snapshottableDirs.contains(fullPath)) {
+           final String dirSnapshot = fullPath + HdfsConstants.DOT_SNAPSHOT_DIR;
+-          hasRemaining |= processPath(dirSnapshot);
++          processPath(dirSnapshot, result);
+         }
+       } else if (!status.isSymlink()) { // file
+         try {
+           if (!isSnapshotPathInCurrent(fullPath)) {
+             // the full path is a snapshot path but it is also included in the
+             // current directory tree, thus ignore it.
+-            hasRemaining = processFile(fullPath, (HdfsLocatedFileStatus)status);
++            processFile(fullPath, (HdfsLocatedFileStatus) status, result);
+           }
+         } catch (IOException e) {
+           LOG.warn("Failed to check the status of " + parent
+               + ". Ignore it and continue.", e);
+-          return false;
+         }
+       }
+-      return hasRemaining;
+     }
+ 
+     /** @return true if it is necessary to run another round of migration */
+-    private boolean processFile(String fullPath, HdfsLocatedFileStatus status) {
++    private void processFile(String fullPath, HdfsLocatedFileStatus status,
++        Result result) {
+       final byte policyId = status.getStoragePolicy();
+       // currently we ignore files with unspecified storage policy
+       if (policyId == BlockStoragePolicySuite.ID_UNSPECIFIED) {
+-        return false;
++        return;
+       }
+       final BlockStoragePolicy policy = blockStoragePolicies[policyId];
+       if (policy == null) {
+         LOG.warn("Failed to get the storage policy of file " + fullPath);
+-        return false;
++        return;
+       }
+       final List<StorageType> types = policy.chooseStorageTypes(
+           status.getReplication());
+ 
+       final LocatedBlocks locatedBlocks = status.getBlockLocations();
+-      boolean hasRemaining = false;
+       final boolean lastBlkComplete = locatedBlocks.isLastBlockComplete();
+       List<LocatedBlock> lbs = locatedBlocks.getLocatedBlocks();
+-      for(int i = 0; i < lbs.size(); i++) {
++      for (int i = 0; i < lbs.size(); i++) {
+         if (i == lbs.size() - 1 && !lastBlkComplete) {
+           // last block is incomplete, skip it
+           continue;
+@@ -372,12 +368,15 @@ private boolean processFile(String fullPath, HdfsLocatedFileStatus status) {
+             lb.getStorageTypes());
+         if (!diff.removeOverlap(true)) {
+           if (scheduleMoves4Block(diff, lb)) {
+-            hasRemaining |= (diff.existing.size() > 1 &&
+-                diff.expected.size() > 1);
++            result.updateHasRemaining(diff.existing.size() > 1
++                && diff.expected.size() > 1);
++            // One block scheduled successfully, set noBlockMoved to false
++            result.setNoBlockMoved(false);
++          } else {
++            result.updateHasRemaining(true);
+           }
+         }
+       }
+-      return hasRemaining;
+     }
+ 
+     boolean scheduleMoves4Block(StorageTypeDiff diff, LocatedBlock lb) {
+@@ -709,6 +708,45 @@ public int run(String[] args) throws Exception {
+     }
+   }
+ 
++  private static class Result {
++
++    private boolean hasRemaining;
++    private boolean noBlockMoved;
++
++    Result() {
++      hasRemaining = false;
++      noBlockMoved = true;
++    }
++
++    boolean isHasRemaining() {
++      return hasRemaining;
++    }
++
++    boolean isNoBlockMoved() {
++      return noBlockMoved;
++    }
++
++    void updateHasRemaining(boolean hasRemaining) {
++      this.hasRemaining |= hasRemaining;
++    }
++
++    void setNoBlockMoved(boolean noBlockMoved) {
++      this.noBlockMoved = noBlockMoved;
++    }
++
++    /**
++     * @return SUCCESS if all moves are success and there is no remaining move.
++     *         Return NO_MOVE_BLOCK if there moves available but all the moves
++     *         cannot be scheduled. Otherwise, return IN_PROGRESS since there
++     *         must be some remaining moves.
++     */
++    ExitStatus getExitStatus() {
++      return !isHasRemaining() ? ExitStatus.SUCCESS
++          : isNoBlockMoved() ? ExitStatus.NO_MOVE_BLOCK
++              : ExitStatus.IN_PROGRESS;
++    }
++
++  }
+   /**
+    * Run a Mover in command line.
+    *
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
+index 8418c45..67e2982 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
+@@ -328,6 +328,35 @@ public void testTwoReplicaSameStorageTypeShouldNotSelect() throws Exception {
+     }
+   }
+ 
++  @Test(timeout = 300000)
++  public void testMoveWhenStoragePolicyNotSatisfying() throws Exception {
++    // HDFS-8147
++    final Configuration conf = new HdfsConfiguration();
++    final MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .numDataNodes(3)
++        .storageTypes(
++            new StorageType[][] { { StorageType.DISK }, { StorageType.DISK },
++                { StorageType.DISK } }).build();
++    try {
++      cluster.waitActive();
++      final DistributedFileSystem dfs = cluster.getFileSystem();
++      final String file = "/testMoveWhenStoragePolicyNotSatisfying";
++      // write to DISK
++      final FSDataOutputStream out = dfs.create(new Path(file));
++      out.writeChars("testMoveWhenStoragePolicyNotSatisfying");
++      out.close();
++
++      // move to ARCHIVE
++      dfs.setStoragePolicy(new Path(file), "COLD");
++      int rc = ToolRunner.run(conf, new Mover.Cli(),
++          new String[] { "-p", file.toString() });
++      int exitcode = ExitStatus.NO_MOVE_BLOCK.getExitCode();
++      Assert.assertEquals("Exit code should be " + exitcode, exitcode, rc);
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
+   @Test
+   public void testMoverFailedRetry() throws Exception {
+     // HDFS-8147
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+index 5596b17..2f2a733 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+@@ -222,7 +222,7 @@ private void runBasicTest(boolean shutdown) throws Exception {
+         verify(true);
+ 
+         setStoragePolicy();
+-        migrate();
++        migrate(ExitStatus.SUCCESS);
+         verify(true);
+       } finally {
+         if (shutdown) {
+@@ -253,8 +253,8 @@ void setStoragePolicy() throws Exception {
+     /**
+      * Run the migration tool.
+      */
+-    void migrate() throws Exception {
+-      runMover();
++    void migrate(ExitStatus expectedExitCode) throws Exception {
++      runMover(expectedExitCode);
+       Thread.sleep(5000); // let the NN finish deletion
+     }
+ 
+@@ -270,14 +270,14 @@ void verify(boolean verifyAll) throws Exception {
+       }
+     }
+ 
+-    private void runMover() throws Exception {
++    private void runMover(ExitStatus expectedExitCode) throws Exception {
+       Collection<URI> namenodes = DFSUtil.getInternalNsRpcUris(conf);
+       Map<URI, List<Path>> nnMap = Maps.newHashMap();
+       for (URI nn : namenodes) {
+         nnMap.put(nn, null);
+       }
+       int result = Mover.run(nnMap, conf);
+-      Assert.assertEquals(ExitStatus.SUCCESS.getExitCode(), result);
++      Assert.assertEquals(expectedExitCode.getExitCode(), result);
+     }
+ 
+     private void verifyNamespace() throws Exception {
+@@ -583,7 +583,7 @@ public void testMigrateOpenFileToArchival() throws Exception {
+     try {
+       banner("start data migration");
+       test.setStoragePolicy(); // set /foo to COLD
+-      test.migrate();
++      test.migrate(ExitStatus.SUCCESS);
+ 
+       // make sure the under construction block has not been migrated
+       LocatedBlocks lbs = test.dfs.getClient().getLocatedBlocks(
+@@ -633,7 +633,7 @@ public void testHotWarmColdDirs() throws Exception {
+     try {
+       test.runBasicTest(false);
+       pathPolicyMap.moveAround(test.dfs);
+-      test.migrate();
++      test.migrate(ExitStatus.SUCCESS);
+ 
+       test.verify(true);
+     } finally {
+@@ -723,7 +723,7 @@ public void testNoSpaceDisk() throws Exception {
+       //test move a hot file to warm
+       final Path file1 = new Path(pathPolicyMap.hot, "file1");
+       test.dfs.rename(file1, pathPolicyMap.warm);
+-      test.migrate();
++      test.migrate(ExitStatus.NO_MOVE_BLOCK);
+       test.verifyFile(new Path(pathPolicyMap.warm, "file1"), WARM.getId());
+     } finally {
+       test.shutdownCluster();
+@@ -781,7 +781,7 @@ public void testNoSpaceArchive() throws Exception {
+       { //test move a cold file to warm
+         final Path file1 = new Path(pathPolicyMap.cold, "file1");
+         test.dfs.rename(file1, pathPolicyMap.warm);
+-        test.migrate();
++        test.migrate(ExitStatus.SUCCESS);
+         test.verify(true);
+       }
+     } finally {
+-- 
+1.7.9.5
+

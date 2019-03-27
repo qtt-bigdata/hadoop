@@ -1,0 +1,191 @@
+From 3cc231f6adbc7c7c2a6fc2a93cfa2d24ad5c31c0 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@cloudera.com>
+Date: Wed, 10 Feb 2016 16:17:07 -0800
+Subject: [PATCH 1216/2848] HDFS-7725. Incorrect 'nodes in service' metrics
+ caused all writes to fail. Contributed by Ming
+ Ma. (cherry picked from commit
+ 8104d522690fe9556177893770a388291cea0749)
+
+(cherry picked from commit 1d23e1ec073489bfc8a04a08350a2c46efbd466f)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+
+Change-Id: I1e37203fba060b3005ad182a72a79821ce3d99ab
+---
+ .../server/blockmanagement/DatanodeManager.java    |   35 ++++++++++++--------
+ .../server/blockmanagement/HeartbeatManager.java   |   29 +++++++++++-----
+ .../namenode/TestNamenodeCapacityReport.java       |    5 +++
+ 3 files changed, 46 insertions(+), 23 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index a0558db..a355b0c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -20,8 +20,6 @@
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+ import com.google.common.net.InetAddresses;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+@@ -45,6 +43,8 @@
+ import org.apache.hadoop.util.Daemon;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.Time;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
+ import java.io.PrintWriter;
+@@ -61,7 +61,8 @@
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+ public class DatanodeManager {
+-  static final Log LOG = LogFactory.getLog(DatanodeManager.class);
++  private static final Logger LOG = LoggerFactory.getLogger(
++      DatanodeManager.class);
+ 
+   private final Namesystem namesystem;
+   private final BlockManager blockManager;
+@@ -857,34 +858,40 @@ boolean checkDecommissionState(DatanodeDescriptor node) {
+   @InterfaceAudience.Private
+   @VisibleForTesting
+   public void startDecommission(DatanodeDescriptor node) {
+-    if (!node.isDecommissionInProgress()) {
+-      if (!node.isAlive) {
+-        LOG.info("Dead node " + node + " is decommissioned immediately.");
+-        node.setDecommissioned();
+-      } else if (!node.isDecommissioned()) {
++    if (!node.isDecommissionInProgress() && !node.isDecommissioned()) {
++      // Update DN stats maintained by HeartbeatManager
++      heartbeatManager.startDecommission(node);
++      // heartbeatManager.startDecommission will set dead node to decommissioned.
++      if (node.isDecommissionInProgress()) {
+         for (DatanodeStorageInfo storage : node.getStorageInfos()) {
+-          LOG.info("Start Decommissioning " + node + " " + storage
+-              + " with " + storage.numBlocks() + " blocks");
++          LOG.info("Starting decommission of {} {} with {} blocks",
++              node, storage, storage.numBlocks());
+         }
+-        heartbeatManager.startDecommission(node);
+         node.decommissioningStatus.setStartTime(now());
+ 
+         // all the blocks that reside on this node have to be replicated.
+         checkDecommissionState(node);
+       }
++    } else {
++      LOG.trace("startDecommission: Node {} in {}, nothing to do." +
++          node, node.getAdminState());
+     }
+   }
+ 
+   /** Stop decommissioning the specified datanodes. */
+-  void stopDecommission(DatanodeDescriptor node) {
++  @VisibleForTesting
++  public void stopDecommission(DatanodeDescriptor node) {
+     if (node.isDecommissionInProgress() || node.isDecommissioned()) {
+-      LOG.info("Stop Decommissioning " + node);
++      LOG.info("Stopping decommissioning of node {}", node);
+       heartbeatManager.stopDecommission(node);
+-      // Over-replicated blocks will be detected and processed when 
++      // Over-replicated blocks will be detected and processed when
+       // the dead node comes back and send in its full block report.
+       if (node.isAlive) {
+         blockManager.processOverReplicatedBlocksOnReCommission(node);
+       }
++    } else {
++      LOG.trace("stopDecommission: Node {} in {}, nothing to do." +
++          node, node.getAdminState());
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+index 6b528f9..c45237a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+@@ -26,8 +26,6 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -39,6 +37,8 @@
+ import org.apache.hadoop.util.Daemon;
+ import org.apache.hadoop.util.StopWatch;
+ import org.apache.hadoop.util.Time;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -48,7 +48,7 @@
+  * by the heartbeat manager lock.
+  */
+ class HeartbeatManager implements DatanodeStatistics {
+-  static final Log LOG = LogFactory.getLog(HeartbeatManager.class);
++  static final Logger LOG = LoggerFactory.getLogger(HeartbeatManager.class);
+ 
+   /**
+    * Stores a subset of the datanodeMap in DatanodeManager,
+@@ -242,15 +242,26 @@ synchronized void updateHeartbeat(final DatanodeDescriptor node,
+   }
+ 
+   synchronized void startDecommission(final DatanodeDescriptor node) {
+-    stats.subtract(node);
+-    node.startDecommission();
+-    stats.add(node);
++    if (!node.isAlive) {
++      LOG.info("Dead node {} is decommissioned immediately.", node);
++      node.setDecommissioned();
++    } else {
++      stats.subtract(node);
++      node.startDecommission();
++      stats.add(node);
++    }
+   }
+ 
+   synchronized void stopDecommission(final DatanodeDescriptor node) {
+-    stats.subtract(node);
+-    node.stopDecommission();
+-    stats.add(node);
++    LOG.info("Stopping decommissioning of {} node {}",
++        node.isAlive ? "live" : "dead", node);
++    if (!node.isAlive) {
++      node.stopDecommission();
++    } else {
++      stats.subtract(node);
++      node.stopDecommission();
++      stats.add(node);
++    }
+   }
+ 
+   @VisibleForTesting
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+index 2d29e5e..8d2181c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+@@ -205,9 +205,14 @@ public void testXceiverCount() throws Exception {
+         dn.shutdown();
+         dnd.setLastUpdate(0L);
+         BlockManagerTestUtil.checkHeartbeat(namesystem.getBlockManager());
++        //Verify decommission of dead node won't impact nodesInService metrics.
++        dnm.startDecommission(dnd);
+         expectedInServiceNodes--;
+         assertEquals(expectedInServiceNodes, namesystem.getNumLiveDataNodes());
+         assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
++        //Verify recommission of dead node won't impact nodesInService metrics.
++        dnm.stopDecommission(dnd);
++        assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
+       }
+ 
+       // restart the nodes to verify that counts are correct after
+-- 
+1.7.9.5
+

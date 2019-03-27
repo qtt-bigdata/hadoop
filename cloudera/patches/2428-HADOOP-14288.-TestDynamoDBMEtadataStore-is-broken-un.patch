@@ -1,0 +1,203 @@
+From 78921816ad7d77aea2afa2d7c895b8208e36b595 Mon Sep 17 00:00:00 2001
+From: Sean Mackrory <mackrorysd@apache.org>
+Date: Fri, 7 Apr 2017 17:48:42 -0600
+Subject: [PATCH 2428/2848] HADOOP-14288. TestDynamoDBMEtadataStore is broken
+ unless we can fail faster without a table version
+
+(cherry picked from commit 13fafee1be950cda8cef96d089e5ee4be223bba0)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+
+Change-Id: I7da0ce984bff8035d335dfd1b15e449cd74bddd5
+---
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |    9 ++++----
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |   11 +++++++++-
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |   23 ++++++++++++++++----
+ .../fs/s3a/s3guard/TestLocalMetadataStore.java     |   11 +++++++++-
+ .../fs/s3a/s3guard/TestNullMetadataStore.java      |    5 +++++
+ 5 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index e0a171d..2b28c58 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -191,7 +191,7 @@
+   private Configuration conf;
+   private String username;
+ 
+-  private RetryPolicy batchRetryPolicy;
++  private RetryPolicy dataAccessRetryPolicy;
+ 
+   /**
+    * A utility function to create DynamoDB instance.
+@@ -274,7 +274,7 @@ public void initialize(Configuration config) throws IOException {
+   private void setMaxRetries(Configuration config) {
+     int maxRetries = config.getInt(S3GUARD_DDB_MAX_RETRIES,
+         S3GUARD_DDB_MAX_RETRIES_DEFAULT);
+-    batchRetryPolicy = RetryPolicies
++    dataAccessRetryPolicy = RetryPolicies
+         .exponentialBackoffRetry(maxRetries, MIN_RETRY_SLEEP_MSEC,
+             TimeUnit.MILLISECONDS);
+   }
+@@ -517,7 +517,7 @@ private void processBatchWriteRequest(PrimaryKey[] keysToDelete,
+   private void retryBackoff(int retryCount) throws IOException {
+     try {
+       // Our RetryPolicy ignores everything but retryCount here.
+-      RetryPolicy.RetryAction action = batchRetryPolicy.shouldRetry(null,
++      RetryPolicy.RetryAction action = dataAccessRetryPolicy.shouldRetry(null,
+           retryCount, 0, true);
+       if (action.action == RetryPolicy.RetryAction.RetryDecision.FAIL) {
+         throw new IOException(
+@@ -764,7 +764,7 @@ private Item getVersionMarkerItem() throws IOException {
+     Item versionMarker = table.getItem(versionMarkerKey);
+     while (versionMarker == null) {
+       try {
+-        RetryPolicy.RetryAction action = batchRetryPolicy.shouldRetry(null,
++        RetryPolicy.RetryAction action = dataAccessRetryPolicy.shouldRetry(null,
+             retryCount, 0, true);
+         if (action.action == RetryPolicy.RetryAction.RetryDecision.FAIL) {
+           break;
+@@ -775,6 +775,7 @@ private Item getVersionMarkerItem() throws IOException {
+       } catch (Exception e) {
+         throw new IOException("initTable: Unexpected exception", e);
+       }
++      retryCount++;
+       versionMarker = table.getItem(versionMarkerKey);
+     }
+     return versionMarker;
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index 36a5cc5..88df45e 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.fs.s3a.s3guard;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -63,12 +64,20 @@
+   private final long modTime = accessTime - 5000;
+ 
+   /**
+-   * Each test should override this.
++   * Each test should override this.  Will use a new Configuration instance.
+    * @return Contract which specifies the MetadataStore under test plus config.
+    */
+   public abstract AbstractMSContract createContract() throws IOException;
+ 
+   /**
++   * Each test should override this.
++   * @param conf Base configuration instance to use.
++   * @return Contract which specifies the MetadataStore under test plus config.
++   */
++  public abstract AbstractMSContract createContract(Configuration conf)
++      throws IOException;
++
++  /**
+    * Tests assume that implementations will return recently set results.  If
+    * your implementation does not always hold onto metadata (e.g. LRU or
+    * time-based expiry) you can override this to return false.
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index 008837f..91cb12f 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -125,7 +125,10 @@ public static void tearDownAfterClass() throws Exception {
+     private final DynamoDBMetadataStore ms = new DynamoDBMetadataStore();
+ 
+     DynamoDBMSContract() throws IOException {
+-      final Configuration conf = new Configuration();
++        this(new Configuration());
++    }
++
++    DynamoDBMSContract(Configuration conf) throws IOException {
+       // using mocked S3 clients
+       conf.setClass(S3_CLIENT_FACTORY_IMPL, MockS3ClientFactory.class,
+           S3ClientFactory.class);
+@@ -159,6 +162,12 @@ public DynamoDBMSContract createContract() throws IOException {
+   }
+ 
+   @Override
++  public DynamoDBMSContract createContract(Configuration conf) throws
++      IOException {
++    return new DynamoDBMSContract(conf);
++  }
++
++  @Override
+   FileStatus basicFileStatus(Path path, int size, boolean isDir)
+       throws IOException {
+     String owner = UserGroupInformation.getCurrentUser().getShortUserName();
+@@ -347,9 +356,13 @@ public void testItemLacksVersion() throws Throwable {
+    */
+   @Test
+   public void testTableVersionRequired() throws Exception {
+-    final DynamoDBMetadataStore ddbms = createContract().getMetadataStore();
+-    String tableName = getFileSystem().getConf().get(Constants
+-        .S3GUARD_DDB_TABLE_NAME_KEY, BUCKET);
++    Configuration conf = getFileSystem().getConf();
++    int maxRetries = conf.getInt(Constants.S3GUARD_DDB_MAX_RETRIES, Constants
++        .S3GUARD_DDB_MAX_RETRIES_DEFAULT);
++    conf.setInt(Constants.S3GUARD_DDB_MAX_RETRIES, 3);
++
++    final DynamoDBMetadataStore ddbms = createContract(conf).getMetadataStore();
++    String tableName = conf.get(Constants.S3GUARD_DDB_TABLE_NAME_KEY, BUCKET);
+     Table table = verifyTableInitialized(tableName);
+     table.deleteItem(VERSION_MARKER_PRIMARY_KEY);
+ 
+@@ -364,6 +377,8 @@ public void testTableVersionRequired() throws Exception {
+           message.contains(E_NO_VERSION_MARKER));
+     }
+     assertTrue("Expected an exception but none was thrown", exceptionThrown);
++
++    conf.setInt(Constants.S3GUARD_DDB_MAX_RETRIES, maxRetries);
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+index c3eb0d3..4cffc6f 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+@@ -42,7 +42,10 @@
+     private FileSystem fs;
+ 
+     private LocalMSContract() throws IOException {
+-      Configuration config = new Configuration();
++      this(new Configuration());
++    }
++
++    private LocalMSContract(Configuration config) throws IOException {
+       config.set(LocalMetadataStore.CONF_MAX_RECORDS, MAX_ENTRIES_STR);
+       fs = FileSystem.getLocal(config);
+     }
+@@ -64,6 +67,12 @@ public AbstractMSContract createContract() throws IOException {
+     return new LocalMSContract();
+   }
+ 
++  @Override
++  public AbstractMSContract createContract(Configuration conf) throws
++      IOException {
++    return new LocalMSContract(conf);
++  }
++
+   @Test
+   public void testClearByAncestor() {
+     Map<Path, String> map = new HashMap<>();
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java
+index 5b18686..5b19efa 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java
+@@ -55,4 +55,9 @@ public boolean allowMissing() {
+   public AbstractMSContract createContract() {
+     return new NullMSContract();
+   }
++
++  @Override
++  public AbstractMSContract createContract(Configuration conf) {
++    return createContract();
++  }
+ }
+-- 
+1.7.9.5
+

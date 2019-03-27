@@ -1,0 +1,197 @@
+From c1aebc34dc63696316653270af79080ca2cfe3ff Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Mon, 5 Mar 2018 09:38:04 -0800
+Subject: [PATCH 2747/2848] HDFS-13040. Kerberized inotify client fails
+ despite kinit properly. Contributed by Istvan
+ Fajth, Wei-Chiu Chuang, Xiao Chen.
+
+(cherry picked from commit 0882725c889f6d77dd7feae986a84bf63cc5f053)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+
+Change-Id: I73472b3e19027375a088bc851c457b1e4a37616f
+---
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |   42 +++++++++++++++-----
+ .../hadoop/hdfs/qjournal/MiniQJMHACluster.java     |   19 +++++++--
+ 2 files changed, 46 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index 8fc654c..a13777b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -29,6 +29,7 @@
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.security.PrivilegedExceptionAction;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.EnumSet;
+@@ -161,6 +162,7 @@
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.Groups;
++import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AuthorizationException;
+ import org.apache.hadoop.security.authorize.ProxyUsers;
+@@ -210,7 +212,7 @@
+   protected final FSNamesystem namesystem;
+   protected final NameNode nn;
+   private final NameNodeMetrics metrics;
+-  
++
+   private final boolean serviceAuthEnabled;
+ 
+   /** The RPC server that listens to requests from DataNodes */
+@@ -470,7 +472,7 @@ void stop() {
+       serviceRpcServer.stop();
+     }
+   }
+-  
++
+   InetSocketAddress getServiceRpcAddress() {
+     return serviceRPCAddress;
+   }
+@@ -496,7 +498,7 @@ public BlocksWithLocations getBlocks(DatanodeInfo datanode, long size)
+     }
+     checkNNStartup();
+     namesystem.checkSuperuserPrivilege();
+-    return namesystem.getBlockManager().getBlocks(datanode, size); 
++    return namesystem.getBlockManager().getBlocks(datanode, size);
+   }
+ 
+   @Override // NamenodeProtocol
+@@ -615,7 +617,7 @@ public HdfsFileStatus create(String src, FsPermission masked,
+   }
+ 
+   @Override // ClientProtocol
+-  public LastBlockWithStatus append(String src, String clientName) 
++  public LastBlockWithStatus append(String src, String clientName)
+       throws IOException {
+     checkNNStartup();
+     String clientMachine = getClientMachine();
+@@ -1112,7 +1114,7 @@ public ContentSummary getContentSummary(String path) throws IOException {
+   }
+ 
+   @Override // ClientProtocol
+-  public void setQuota(String path, long namespaceQuota, long diskspaceQuota) 
++  public void setQuota(String path, long namespaceQuota, long diskspaceQuota)
+       throws IOException {
+     checkNNStartup();
+     namesystem.setQuota(path, namespaceQuota, diskspaceQuota);
+@@ -1754,15 +1756,15 @@ private static FSEditLogOp readOp(EditLogInputStream elis)
+   }
+ 
+   @Override // ClientProtocol
+-  public EventBatchList getEditsFromTxid(long txid) throws IOException {
++  public EventBatchList getEditsFromTxid(final long txid) throws IOException {
+     checkNNStartup();
+     namesystem.checkOperation(OperationCategory.READ); // only active
+     namesystem.checkSuperuserPrivilege();
+-    int maxEventsPerRPC = nn.conf.getInt(
++    final int maxEventsPerRPC = nn.conf.getInt(
+         DFSConfigKeys.DFS_NAMENODE_INOTIFY_MAX_EVENTS_PER_RPC_KEY,
+         DFSConfigKeys.DFS_NAMENODE_INOTIFY_MAX_EVENTS_PER_RPC_DEFAULT);
+-    FSEditLog log = namesystem.getFSImage().getEditLog();
+-    long syncTxid = log.getSyncTxId();
++    final FSEditLog log = namesystem.getFSImage().getEditLog();
++    final long syncTxid = log.getSyncTxId();
+     // If we haven't synced anything yet, we can only read finalized
+     // segments since we can't reliably determine which txns in in-progress
+     // segments have actually been committed (e.g. written to a quorum of JNs).
+@@ -1771,8 +1773,26 @@ public EventBatchList getEditsFromTxid(long txid) throws IOException {
+     // journals. (In-progress segments written by old writers are already
+     // discarded for us, so if we read any in-progress segments they are
+     // guaranteed to have been written by this NameNode.)
+-    boolean readInProgress = syncTxid > 0;
++    final boolean readInProgress = syncTxid > 0;
++
++    // doas the NN login user for the actual operations to get edits.
++    // Notably this is necessary when polling from the remote edits via https.
++    // We have validated the client is a superuser from the NN RPC, so this
++    // running as the login user here is safe.
++    EventBatchList ret = SecurityUtil.doAsLoginUser(
++        new PrivilegedExceptionAction<EventBatchList>() {
++          @Override
++          public EventBatchList run() throws IOException {
++            return getEventBatchList(syncTxid, txid, log, readInProgress,
++                maxEventsPerRPC);
++          }
++        });
++    return ret;
++  }
+ 
++  private EventBatchList getEventBatchList(long syncTxid, long txid,
++      FSEditLog log, boolean readInProgress, int maxEventsPerRPC)
++      throws IOException {
+     List<EventBatch> batches = Lists.newArrayList();
+     int totalEvents = 0;
+     long maxSeenTxid = -1;
+@@ -1791,7 +1811,7 @@ public EventBatchList getEditsFromTxid(long txid) throws IOException {
+       // and are using QJM -- the edit log will be closed and this exception
+       // will result
+       LOG.info("NN is transitioning from active to standby and FSEditLog " +
+-      "is closed -- could not read edits");
++          "is closed -- could not read edits");
+       return new EventBatchList(batches, firstSeenTxid, maxSeenTxid, syncTxid);
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+index 891e4ff..09117d2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+@@ -52,7 +52,8 @@
+     private final Configuration conf;
+     private StartupOption startOpt = null;
+     private final MiniDFSCluster.Builder dfsBuilder;
+-    
++    private boolean forceRemoteEditsOnly = false;
++
+     public Builder(Configuration conf) {
+       this.conf = conf;
+       // most QJMHACluster tests don't need DataNodes, so we'll make
+@@ -71,6 +72,11 @@ public MiniQJMHACluster build() throws IOException {
+     public void startupOption(StartupOption startOpt) {
+       this.startOpt = startOpt;
+     }
++
++    public Builder setForceRemoteEditsOnly(boolean val) {
++      this.forceRemoteEditsOnly = val;
++      return this;
++    }
+   }
+   
+   public static MiniDFSNNTopology createDefaultTopology(int basePort) {
+@@ -100,7 +106,7 @@ private MiniQJMHACluster(Builder builder) throws IOException {
+         // start cluster with 2 NameNodes
+         MiniDFSNNTopology topology = createDefaultTopology(basePort);
+ 
+-        initHAConf(journalURI, builder.conf, basePort);
++        initHAConf(journalURI, builder, basePort);
+ 
+         // First start up the NNs just to format the namespace. The MinIDFSCluster
+         // has no way to just format the NameNodes without also starting them.
+@@ -131,11 +137,16 @@ private MiniQJMHACluster(Builder builder) throws IOException {
+     }
+   }
+ 
+-  private Configuration initHAConf(URI journalURI, Configuration conf,
++  private Configuration initHAConf(URI journalURI, Builder builder,
+       int basePort) {
+     conf.set(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY,
+         journalURI.toString());
+-    
++    if (builder.forceRemoteEditsOnly) {
++      conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY, journalURI.toString());
++      conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY,
++          journalURI.toString());
++    }
++
+     String address1 = "127.0.0.1:" + basePort;
+     String address2 = "127.0.0.1:" + (basePort + 2);
+     conf.set(DFSUtil.addKeySuffixes(DFS_NAMENODE_RPC_ADDRESS_KEY,
+-- 
+1.7.9.5
+

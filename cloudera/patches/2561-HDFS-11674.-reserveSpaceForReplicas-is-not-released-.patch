@@ -1,0 +1,181 @@
+From ae6e5439fb13f79ebfbbff3aa2535829021b0e3e Mon Sep 17 00:00:00 2001
+From: Vinayakumar B <vinayakumarb@apache.org>
+Date: Fri, 12 May 2017 14:26:28 +0530
+Subject: [PATCH 2561/2848] HDFS-11674. reserveSpaceForReplicas is not
+ released if append request failed due to mirror
+ down and replica recovered (Contributed by
+ Vinayakumar B)
+
+(cherry picked from commit b0b6de38c97dd7e4241af3c450fc925bf3f7659d)
+
+Change-Id: If6536be6e72df8adcbaf2ffad98bef36064f35cd
+---
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   15 +++++
+ .../datanode/fsdataset/impl/FsDatasetImpl.java     |    4 ++
+ .../java/org/apache/hadoop/hdfs/DFSTestUtil.java   |    5 ++
+ .../fsdataset/impl/TestRbwSpaceReservation.java    |   67 +++++++++++++++++++-
+ 4 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index ee0785d..38a2e2d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -652,6 +652,21 @@ private DataStreamer(LocatedBlock lastBlock, HdfsFileStatus stat,
+       }
+     }
+ 
++    /**
++     * Set pipeline in construction
++     *
++     * @param lastBlock the last block of a file
++     * @throws IOException
++     */
++    void setPipelineInConstruction(LocatedBlock lastBlock) throws IOException{
++      // setup pipeline to append to the last block XXX retries??
++      setPipeline(lastBlock);
++      if (nodes.length < 1) {
++        throw new IOException("Unable to retrieve blocks locations " +
++            " for last block " + block + " of file " + src);
++      }
++    }
++
+     private void setPipeline(LocatedBlock lb) {
+       setPipeline(lb.getLocations(), lb.getStorageTypes(), lb.getStorageIDs());
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+index 4159c63..d1529c4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+@@ -2497,6 +2497,10 @@ static ReplicaRecoveryInfo initReplicaRecoveryImpl(String bpid, ReplicaMap map,
+       LOG.info("initReplicaRecovery: changing replica state for "
+           + block + " from " + replica.getState()
+           + " to " + rur.getState());
++      if (replica.getState() == ReplicaState.TEMPORARY || replica
++          .getState() == ReplicaState.RBW) {
++        ((ReplicaInPipeline) replica).releaseAllBytesReserved();
++      }
+     }
+     return rur.createInfo();
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+index 38f3d44..eb1e8e1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+@@ -1383,6 +1383,11 @@ public static void abortStream(DFSOutputStream out) throws IOException {
+     out.abort();
+   }
+ 
++  public static void setPipeline(DFSOutputStream out, LocatedBlock lastBlock)
++      throws IOException {
++    out.getStreamer().setPipelineInConstruction(lastBlock);
++  }
++
+   public static byte[] asArray(ByteBuffer buf) {
+     byte arr[] = new byte[buf.remaining()];
+     buf.duplicate().get(arr);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestRbwSpaceReservation.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestRbwSpaceReservation.java
+index ec5a2ee..984f63b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestRbwSpaceReservation.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestRbwSpaceReservation.java
+@@ -30,10 +30,13 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.HdfsBlockLocation;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.*;
+ import org.apache.hadoop.hdfs.protocol.Block;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
+ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeReference;
+@@ -44,6 +47,7 @@
+ import org.apache.hadoop.util.Daemon;
+ import org.apache.log4j.Level;
+ import org.junit.After;
++import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
+@@ -81,9 +85,12 @@
+   private DataNodeFaultInjector old = null;
+   private static Random rand = new Random();
+ 
+-  private void initConfig(int blockSize) {
++  @Before
++  public void before() {
+     conf = new HdfsConfiguration();
++  }
+ 
++  private void initConfig(int blockSize) {
+     // Refresh disk usage information frequently.
+     conf.setInt(FS_DU_INTERVAL_KEY, DU_REFRESH_INTERVAL_MSEC);
+     conf.setLong(DFS_BLOCK_SIZE_KEY, blockSize);
+@@ -554,4 +561,62 @@ public Boolean get() {
+       }
+     }
+   }
++
++  @Test(timeout = 60000)
++  public void testReservedSpaceForLeaseRecovery() throws Exception {
++    final short replication = 3;
++    conf.setInt(
++        CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY, 2);
++    conf.setInt(
++        CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_RETRY_INTERVAL_KEY,
++        1000);
++    startCluster(BLOCK_SIZE, replication, -1);
++
++    final String methodName = GenericTestUtils.getMethodName();
++    final Path file = new Path("/" + methodName + ".01.dat");
++    // Write to the file and kill the writer.
++    FSDataOutputStream os = fs.create(file, replication);
++    os.write(new byte[8192]);
++    os.hflush();
++    os.close();
++    /*
++     * Reset the pipeline for the append in such a way that, datanode which is
++     * down is one of the mirror, not the first datanode.
++     */
++    HdfsBlockLocation blockLocation = (HdfsBlockLocation) fs.getClient()
++        .getBlockLocations(file.toString(), 0, BLOCK_SIZE)[0];
++    LocatedBlock lastBlock = blockLocation.getLocatedBlock();
++    // stop 3rd node.
++    cluster.stopDataNode(lastBlock.getLocations()[2].getName());
++    try {
++      os = fs.append(file);
++      DFSTestUtil.setPipeline((DFSOutputStream) os.getWrappedStream(),
++          lastBlock);
++      os.writeBytes("hi");
++      os.hsync();
++    } catch (IOException e) {
++      // Append will fail due to not able to replace datanodes in 3 nodes
++      // cluster.
++      LOG.info("", e);
++    }
++    DFSTestUtil.abortStream((DFSOutputStream) os.getWrappedStream());
++    /*
++     * There is a chance that stopped DN could be chosen as primary for
++     * recovery. If so, then recovery will not happen in time. So mark stopped
++     * node as dead to exclude that node.
++     */
++    cluster.setDataNodeDead(lastBlock.getLocations()[2]);
++    fs.recoverLease(file);
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++      @Override
++      public Boolean get() {
++        try {
++          return fs.isFileClosed(file);
++        } catch (IOException e) {
++          return false;
++        }
++      }
++    }, 500, 30000);
++    checkReservedSpace(0);
++  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,170 @@
+From 84d2864ca92e365072f5570ee0668e92734c2cee Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Fri, 14 Jul 2017 16:17:44 -0500
+Subject: [PATCH 2562/2848] HDFS-12140. Remove BPOfferService lock contention
+ to get block pool id. Contributed by Daryn Sharp.
+
+(cherry picked from commit e7d187a1b6a826edd5bd0f708184d48f3674d489)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+
+(cherry picked from commit e28c74102d0be09c000327932d47981fdb7174e1)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+
+Change-Id: I3c85a4e8f1ac2f8ff068f1762343f21e32638e49
+---
+ .../hdfs/server/datanode/BPOfferService.java       |   49 ++++++++++++++------
+ .../hdfs/server/datanode/TestBPOfferService.java   |   29 ++++++++++++
+ 2 files changed, 64 insertions(+), 14 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+index b2c038b..1f75ee4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+@@ -67,7 +67,8 @@
+    * handshake.
+    */
+   volatile DatanodeRegistration bpRegistration;
+-  
++
++  private volatile String bpId;
+   private final DataNode dn;
+ 
+   /**
+@@ -163,6 +164,11 @@ boolean isAlive() {
+   }
+ 
+   String getBlockPoolId() {
++    // avoid lock contention unless the registration hasn't completed.
++    String id = bpId;
++    if (id != null) {
++      return id;
++    }
+     readLock();
+     try {
+       if (bpNSInfo != null) {
+@@ -178,7 +184,7 @@ String getBlockPoolId() {
+   }
+ 
+   boolean hasBlockPoolId() {
+-    return getNamespaceInfo() != null;
++    return getBlockPoolId() != null;
+   }
+ 
+   NamespaceInfo getNamespaceInfo() {
+@@ -190,6 +196,28 @@ NamespaceInfo getNamespaceInfo() {
+     }
+   }
+ 
++  @VisibleForTesting
++  NamespaceInfo setNamespaceInfo(NamespaceInfo nsInfo) throws IOException {
++    writeLock();
++    try {
++      NamespaceInfo old = bpNSInfo;
++      if (bpNSInfo != null && nsInfo != null) {
++        checkNSEquality(bpNSInfo.getBlockPoolID(), nsInfo.getBlockPoolID(),
++            "Blockpool ID");
++        checkNSEquality(bpNSInfo.getNamespaceID(), nsInfo.getNamespaceID(),
++            "Namespace ID");
++        checkNSEquality(bpNSInfo.getClusterID(), nsInfo.getClusterID(),
++            "Cluster ID");
++      }
++      bpNSInfo = nsInfo;
++      // cache the block pool id for lock-free access.
++      bpId = (nsInfo != null) ? nsInfo.getBlockPoolID() : null;
++      return old;
++    } finally {
++      writeUnlock();
++    }
++  }
++
+   @Override
+   public String toString() {
+     readLock();
+@@ -262,9 +290,10 @@ private void notifyNamenodeBlock(ExtendedBlock block, BlockStatus status,
+   private void checkBlock(ExtendedBlock block) {
+     Preconditions.checkArgument(block != null,
+         "block is null");
+-    Preconditions.checkArgument(block.getBlockPoolId().equals(getBlockPoolId()),
++    final String bpId = getBlockPoolId();
++    Preconditions.checkArgument(block.getBlockPoolId().equals(bpId),
+         "block belongs to BP %s instead of BP %s",
+-        block.getBlockPoolId(), getBlockPoolId());
++        block.getBlockPoolId(), bpId);
+   }
+ 
+   //This must be called only by blockPoolManager
+@@ -302,8 +331,7 @@ DataNode getDataNode() {
+   void verifyAndSetNamespaceInfo(NamespaceInfo nsInfo) throws IOException {
+     writeLock();
+     try {
+-      if (this.bpNSInfo == null) {
+-        this.bpNSInfo = nsInfo;
++      if (setNamespaceInfo(nsInfo) == null) {
+         boolean success = false;
+ 
+         // Now that we know the namespace ID, etc, we can pass this to the DN.
+@@ -317,16 +345,9 @@ void verifyAndSetNamespaceInfo(NamespaceInfo nsInfo) throws IOException {
+             // The datanode failed to initialize the BP. We need to reset
+             // the namespace info so that other BPService actors still have
+             // a chance to set it, and re-initialize the datanode.
+-            this.bpNSInfo = null;
++            setNamespaceInfo(null);
+           }
+         }
+-      } else {
+-        checkNSEquality(bpNSInfo.getBlockPoolID(), nsInfo.getBlockPoolID(),
+-            "Blockpool ID");
+-        checkNSEquality(bpNSInfo.getNamespaceID(), nsInfo.getNamespaceID(),
+-            "Namespace ID");
+-        checkNSEquality(bpNSInfo.getClusterID(), nsInfo.getClusterID(),
+-            "Cluster ID");
+       }
+     } finally {
+       writeUnlock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
+index b073272..90701e1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
+@@ -220,6 +220,35 @@ public void testBasicFunctionality() throws Exception {
+     }
+   }
+ 
++  @Test
++  public void testLocklessBlockPoolId() throws Exception {
++    BPOfferService bpos = Mockito.spy(setupBPOSForNNs(mockNN1));
++
++    // bpNSInfo is not set, should take lock to check nsInfo.
++    assertNull(bpos.getBlockPoolId());
++    Mockito.verify(bpos).readLock();
++
++    // setting the bpNSInfo should cache the bp id, thus no locking.
++    Mockito.reset(bpos);
++    NamespaceInfo nsInfo = new NamespaceInfo(1, FAKE_CLUSTERID, FAKE_BPID, 0);
++    assertNull(bpos.setNamespaceInfo(nsInfo));
++    assertEquals(FAKE_BPID, bpos.getBlockPoolId());
++    Mockito.verify(bpos, Mockito.never()).readLock();
++
++    // clearing the bpNSInfo should clear the cached bp id, thus requiring
++    // locking to check the bpNSInfo.
++    Mockito.reset(bpos);
++    assertEquals(nsInfo, bpos.setNamespaceInfo(null));
++    assertNull(bpos.getBlockPoolId());
++    Mockito.verify(bpos).readLock();
++
++    // test setting it again.
++    Mockito.reset(bpos);
++    assertNull(bpos.setNamespaceInfo(nsInfo));
++    assertEquals(FAKE_BPID, bpos.getBlockPoolId());
++    Mockito.verify(bpos, Mockito.never()).readLock();
++  }
++
+   /**
+    * Test that DNA_INVALIDATE commands from the standby are ignored.
+    */
+-- 
+1.7.9.5
+

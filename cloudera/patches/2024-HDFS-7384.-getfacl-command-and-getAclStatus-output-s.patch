@@ -1,0 +1,543 @@
+From e0fb7931faf51186953c41690cf92145b7666d7c Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@cloudera.com>
+Date: Tue, 8 Nov 2016 13:22:08 -0800
+Subject: [PATCH 2024/2848] HDFS-7384. getfacl command and getAclStatus output
+ should be in sync. Contributed by Vinayakumar B.
+
+(cherry picked from commit ffe942b82c1208bc7b22899da3a233944cb5ab52)
+(cherry picked from commit 143a5b67d87be0af62fedb46553a5d9835a90cb6)
+
+Conflicts:
+hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAclOp.java
+
+Change-Id: Ibffe07d3e143cca5b116cf5a5556ab5c9d909b46
+---
+ .../org/apache/hadoop/fs/permission/AclEntry.java  |    4 +-
+ .../org/apache/hadoop/fs/permission/AclStatus.java |   79 +++++++++++++++++++-
+ .../org/apache/hadoop/fs/shell/AclCommands.java    |   32 ++++----
+ .../apache/hadoop/hdfs/protocolPB/PBHelper.java    |   19 +++--
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    4 +-
+ .../tools/offlineImageViewer/FSImageLoader.java    |   31 +++-----
+ .../java/org/apache/hadoop/hdfs/web/JsonUtil.java  |   17 ++++-
+ .../hadoop-hdfs/src/main/proto/acl.proto           |    1 +
+ .../hadoop-hdfs/src/site/apt/WebHDFS.apt.vm        |    1 +
+ .../hadoop/hdfs/server/namenode/FSAclBaseTest.java |   46 ++++++++++++
+ .../hadoop-hdfs/src/test/resources/testAclCLI.xml  |   53 +++++++++++++
+ 11 files changed, 243 insertions(+), 44 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclEntry.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclEntry.java
+index b65b7a0..b9def64 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclEntry.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclEntry.java
+@@ -146,7 +146,9 @@ public Builder setType(AclEntryType type) {
+      * @return Builder this builder, for call chaining
+      */
+     public Builder setName(String name) {
+-      this.name = name;
++      if (name != null && !name.isEmpty()) {
++        this.name = name;
++      }
+       return this;
+     }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclStatus.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclStatus.java
+index 4a7258f..9d7500a 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclStatus.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/AclStatus.java
+@@ -23,6 +23,7 @@
+ import org.apache.hadoop.classification.InterfaceStability;
+ 
+ import com.google.common.base.Objects;
++import com.google.common.base.Preconditions;
+ import com.google.common.collect.Lists;
+ 
+ /**
+@@ -36,6 +37,7 @@
+   private final String group;
+   private final boolean stickyBit;
+   private final List<AclEntry> entries;
++  private final FsPermission permission;
+ 
+   /**
+    * Returns the file owner.
+@@ -73,6 +75,14 @@ public boolean isStickyBit() {
+     return entries;
+   }
+ 
++  /**
++   * Returns the permission set for the path
++   * @return {@link FsPermission} for the path
++   */
++  public FsPermission getPermission() {
++    return permission;
++  }
++
+   @Override
+   public boolean equals(Object o) {
+     if (o == null) {
+@@ -113,6 +123,7 @@ public String toString() {
+     private String group;
+     private boolean stickyBit;
+     private List<AclEntry> entries = Lists.newArrayList();
++    private FsPermission permission = null;
+ 
+     /**
+      * Sets the file owner.
+@@ -173,12 +184,21 @@ public Builder stickyBit(boolean stickyBit) {
+     }
+ 
+     /**
++     * Sets the permission for the file.
++     * @param permission
++     */
++    public Builder setPermission(FsPermission permission) {
++      this.permission = permission;
++      return this;
++    }
++
++    /**
+      * Builds a new AclStatus populated with the set properties.
+      *
+      * @return AclStatus new AclStatus
+      */
+     public AclStatus build() {
+-      return new AclStatus(owner, group, stickyBit, entries);
++      return new AclStatus(owner, group, stickyBit, entries, permission);
+     }
+   }
+ 
+@@ -190,12 +210,67 @@ public AclStatus build() {
+    * @param group String file group
+    * @param stickyBit the sticky bit
+    * @param entries the ACL entries
++   * @param permission permission of the path
+    */
+   private AclStatus(String owner, String group, boolean stickyBit,
+-      Iterable<AclEntry> entries) {
++      Iterable<AclEntry> entries, FsPermission permission) {
+     this.owner = owner;
+     this.group = group;
+     this.stickyBit = stickyBit;
+     this.entries = Lists.newArrayList(entries);
++    this.permission = permission;
++  }
++
++  /**
++   * Get the effective permission for the AclEntry
++   * @param entry AclEntry to get the effective action
++   */
++  public FsAction getEffectivePermission(AclEntry entry) {
++    return getEffectivePermission(entry, permission);
++  }
++
++  /**
++   * Get the effective permission for the AclEntry. <br>
++   * Recommended to use this API ONLY if client communicates with the old
++   * NameNode, needs to pass the Permission for the path to get effective
++   * permission, else use {@link AclStatus#getEffectivePermission(AclEntry)}.
++   * @param entry AclEntry to get the effective action
++   * @param permArg Permission for the path. However if the client is NOT
++   *          communicating with old namenode, then this argument will not have
++   *          any preference.
++   * @return Returns the effective permission for the entry.
++   * @throws IllegalArgumentException If the client communicating with old
++   *           namenode and permission is not passed as an argument.
++   */
++  public FsAction getEffectivePermission(AclEntry entry, FsPermission permArg)
++      throws IllegalArgumentException {
++    // At least one permission bits should be available.
++    Preconditions.checkArgument(this.permission != null || permArg != null,
++        "Permission bits are not available to calculate effective permission");
++    if (this.permission != null) {
++      // permission bits from server response will have the priority for
++      // accuracy.
++      permArg = this.permission;
++    }
++    if ((entry.getName() != null || entry.getType() == AclEntryType.GROUP)) {
++      if (entry.getScope() == AclEntryScope.ACCESS) {
++        FsAction entryPerm = entry.getPermission();
++        return entryPerm.and(permArg.getGroupAction());
++      } else {
++        Preconditions.checkArgument(this.entries.contains(entry)
++            && this.entries.size() >= 3,
++            "Passed default ACL entry not found in the list of ACLs");
++        // default mask entry for effective permission calculation will be the
++        // penultimate entry. This can be mask entry in case of extended ACLs.
++        // In case of minimal ACL, this is the owner group entry, and we end up
++        // intersecting group FsAction with itself, which is a no-op.
++        FsAction defaultMask = this.entries.get(this.entries.size() - 2)
++            .getPermission();
++        FsAction entryPerm = entry.getPermission();
++        return entryPerm.and(defaultMask);
++      }
++    } else {
++      return entry.getPermission();
++    }
+   }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/AclCommands.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/AclCommands.java
+index 206576c..d139eba 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/AclCommands.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/AclCommands.java
+@@ -86,22 +86,26 @@ protected void processPath(PathData item) throws IOException {
+           (perm.getOtherAction().implies(FsAction.EXECUTE) ? "t" : "T"));
+       }
+ 
+-      List<AclEntry> entries = perm.getAclBit() ?
+-        item.fs.getAclStatus(item.path).getEntries() :
+-        Collections.<AclEntry>emptyList();
++      AclStatus aclStatus = item.fs.getAclStatus(item.path);
++      List<AclEntry> entries = perm.getAclBit() ? aclStatus.getEntries()
++          : Collections.<AclEntry> emptyList();
+       ScopedAclEntries scopedEntries = new ScopedAclEntries(
+         AclUtil.getAclFromPermAndEntries(perm, entries));
+-      printAclEntriesForSingleScope(scopedEntries.getAccessEntries());
+-      printAclEntriesForSingleScope(scopedEntries.getDefaultEntries());
++      printAclEntriesForSingleScope(aclStatus, perm,
++          scopedEntries.getAccessEntries());
++      printAclEntriesForSingleScope(aclStatus, perm,
++          scopedEntries.getDefaultEntries());
+       out.println();
+     }
+ 
+     /**
+      * Prints all the ACL entries in a single scope.
+-     *
++     * @param aclStatus AclStatus for the path
++     * @param fsPerm FsPermission for the path
+      * @param entries List<AclEntry> containing ACL entries of file
+      */
+-    private void printAclEntriesForSingleScope(List<AclEntry> entries) {
++    private void printAclEntriesForSingleScope(AclStatus aclStatus,
++        FsPermission fsPerm, List<AclEntry> entries) {
+       if (entries.isEmpty()) {
+         return;
+       }
+@@ -110,10 +114,8 @@ private void printAclEntriesForSingleScope(List<AclEntry> entries) {
+           out.println(entry);
+         }
+       } else {
+-        // ACL sort order guarantees mask is the second-to-last entry.
+-        FsAction maskPerm = entries.get(entries.size() - 2).getPermission();
+         for (AclEntry entry: entries) {
+-          printExtendedAclEntry(entry, maskPerm);
++          printExtendedAclEntry(aclStatus, fsPerm, entry);
+         }
+       }
+     }
+@@ -123,14 +125,16 @@ private void printAclEntriesForSingleScope(List<AclEntry> entries) {
+      * permissions of the entry, then also prints the restricted version as the
+      * effective permissions.  The mask applies to all named entries and also
+      * the unnamed group entry.
+-     *
++     * @param aclStatus AclStatus for the path
++     * @param fsPerm FsPermission for the path
+      * @param entry AclEntry extended ACL entry to print
+-     * @param maskPerm FsAction permissions in the ACL's mask entry
+      */
+-    private void printExtendedAclEntry(AclEntry entry, FsAction maskPerm) {
++    private void printExtendedAclEntry(AclStatus aclStatus,
++        FsPermission fsPerm, AclEntry entry) {
+       if (entry.getName() != null || entry.getType() == AclEntryType.GROUP) {
+         FsAction entryPerm = entry.getPermission();
+-        FsAction effectivePerm = entryPerm.and(maskPerm);
++        FsAction effectivePerm = aclStatus
++            .getEffectivePermission(entry, fsPerm);
+         if (entryPerm != effectivePerm) {
+           out.println(String.format("%s\t#effective:%s", entry,
+             effectivePerm.SYMBOL));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+index 3920eed9..13ebf6b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+@@ -2342,15 +2342,24 @@ public static FsAction convert(FsActionProto v) {
+ 
+   public static AclStatus convert(GetAclStatusResponseProto e) {
+     AclStatusProto r = e.getResult();
+-    return new AclStatus.Builder().owner(r.getOwner()).group(r.getGroup())
+-        .stickyBit(r.getSticky())
+-        .addEntries(convertAclEntry(r.getEntriesList())).build();
++    AclStatus.Builder builder = new AclStatus.Builder();
++    builder.owner(r.getOwner()).group(r.getGroup()).stickyBit(r.getSticky())
++        .addEntries(convertAclEntry(r.getEntriesList()));
++    if (r.hasPermission()) {
++      builder.setPermission(convert(r.getPermission()));
++    }
++    return builder.build();
+   }
+ 
+   public static GetAclStatusResponseProto convert(AclStatus e) {
+-    AclStatusProto r = AclStatusProto.newBuilder().setOwner(e.getOwner())
++    AclStatusProto.Builder builder = AclStatusProto.newBuilder();
++    builder.setOwner(e.getOwner())
+         .setGroup(e.getGroup()).setSticky(e.isStickyBit())
+-        .addAllEntries(convertAclEntryProto(e.getEntries())).build();
++        .addAllEntries(convertAclEntryProto(e.getEntries()));
++    if (e.getPermission() != null) {
++      builder.setPermission(convert(e.getPermission()));
++    }
++    AclStatusProto r = builder.build();
+     return GetAclStatusResponseProto.newBuilder().setResult(r).build();
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 2bafa10..15870a1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -2872,9 +2872,11 @@ AclStatus getAclStatus(String src) throws IOException {
+       INode inode = resolveLastINode(src, iip);
+       int snapshotId = iip.getPathSnapshotId();
+       List<AclEntry> acl = AclStorage.readINodeAcl(inode, snapshotId);
++      FsPermission fsPermission = inode.getFsPermission(snapshotId);
+       return new AclStatus.Builder()
+           .owner(inode.getUserName()).group(inode.getGroupName())
+-          .stickyBit(inode.getFsPermission(snapshotId).getStickyBit())
++          .stickyBit(fsPermission.getStickyBit())
++          .setPermission(fsPermission)
+           .addEntries(acl).build();
+     } finally {
+       readUnlock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/FSImageLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/FSImageLoader.java
+index c3c6106..99c9be9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/FSImageLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/FSImageLoader.java
+@@ -34,10 +34,12 @@
+ import com.google.common.collect.ImmutableList;
+ import com.google.protobuf.CodedInputStream;
+ import com.google.protobuf.InvalidProtocolBufferException;
++
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.permission.AclEntry;
++import org.apache.hadoop.fs.permission.AclStatus;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+ import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos;
+@@ -46,6 +48,7 @@
+ import org.apache.hadoop.hdfs.server.namenode.FSImageUtil;
+ import org.apache.hadoop.hdfs.server.namenode.FsImageProto;
+ import org.apache.hadoop.hdfs.server.namenode.INodeId;
++import org.apache.hadoop.hdfs.web.JsonUtil;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.util.LimitInputStream;
+ import org.codehaus.jackson.map.ObjectMapper;
+@@ -316,27 +319,15 @@ String listStatus(String path) throws IOException {
+    * @throws IOException if failed to serialize fileStatus to JSON.
+    */
+   String getAclStatus(String path) throws IOException {
+-    StringBuilder sb = new StringBuilder();
+-    List<AclEntry> aclEntryList = getAclEntryList(path);
+     PermissionStatus p = getPermissionStatus(path);
+-    sb.append("{\"AclStatus\":{\"entries\":[");
+-    int i = 0;
+-    for (AclEntry aclEntry : aclEntryList) {
+-      if (i++ != 0) {
+-        sb.append(',');
+-      }
+-      sb.append('"');
+-      sb.append(aclEntry.toString());
+-      sb.append('"');
+-    }
+-    sb.append("],\"group\": \"");
+-    sb.append(p.getGroupName());
+-    sb.append("\",\"owner\": \"");
+-    sb.append(p.getUserName());
+-    sb.append("\",\"stickyBit\": ");
+-    sb.append(p.getPermission().getStickyBit());
+-    sb.append("}}\n");
+-    return sb.toString();
++    List<AclEntry> aclEntryList = getAclEntryList(path);
++    FsPermission permission = p.getPermission();
++    AclStatus.Builder builder = new AclStatus.Builder();
++    builder.owner(p.getUserName()).group(p.getGroupName())
++        .addEntries(aclEntryList).setPermission(permission)
++        .stickyBit(permission.getStickyBit());
++    AclStatus aclStatus = builder.build();
++    return JsonUtil.toJsonString(aclStatus);
+   }
+ 
+   private List<AclEntry> getAclEntryList(String path) throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/JsonUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/JsonUtil.java
+index c02fa49..b59941d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/JsonUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/JsonUtil.java
+@@ -658,6 +658,16 @@ public static String toJsonString(final AclStatus status) {
+     m.put("group", status.getGroup());
+     m.put("stickyBit", status.isStickyBit());
+     m.put("entries", status.getEntries());
++    FsPermission perm = status.getPermission();
++    if (perm != null) {
++      m.put("permission", toString(perm));
++      if (perm.getAclBit()) {
++        m.put("aclBit", true);
++      }
++      if (perm.getEncryptedBit()) {
++        m.put("encBit", true);
++      }
++    }
+     final Map<String, Map<String, Object>> finalMap =
+         new TreeMap<String, Map<String, Object>>();
+     finalMap.put(AclStatus.class.getSimpleName(), m);
+@@ -676,7 +686,12 @@ public static AclStatus toAclStatus(final Map<?, ?> json) {
+     aclStatusBuilder.owner((String) m.get("owner"));
+     aclStatusBuilder.group((String) m.get("group"));
+     aclStatusBuilder.stickyBit((Boolean) m.get("stickyBit"));
+-
++    String permString = (String) m.get("permission");
++    if (permString != null) {
++      final FsPermission permission = toFsPermission(permString,
++          (Boolean) m.get("aclBit"), (Boolean) m.get("encBit"));
++      aclStatusBuilder.setPermission(permission);
++    }
+     final Object[] entries = (Object[]) m.get("entries");
+ 
+     List<AclEntry> aclEntryList = new ArrayList<AclEntry>();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/acl.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/acl.proto
+index e940142..57cc855 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/acl.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/acl.proto
+@@ -58,6 +58,7 @@ message AclStatusProto {
+   required string group          = 2;
+   required bool sticky           = 3;
+   repeated AclEntryProto entries = 4;
++  optional FsPermissionProto permission = 5;
+ }
+ 
+ message AclEditLogProto {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
+index 54cd2ed..662f8b8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
+@@ -919,6 +919,7 @@ Transfer-Encoding: chunked
+         ], 
+         "group": "supergroup", 
+         "owner": "hadoop", 
++        "permission":"775",
+         "stickyBit": false
+     }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
+index fc3921a..a140fe2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
+@@ -1431,6 +1431,52 @@ public void testAccess() throws IOException, InterruptedException {
+     }
+   }
+ 
++  @Test
++  public void testEffectiveAccess() throws Exception {
++    Path p1 = new Path("/testEffectiveAccess");
++    fs.mkdirs(p1);
++    // give all access at first
++    fs.setPermission(p1, FsPermission.valueOf("-rwxrwxrwx"));
++    AclStatus aclStatus = fs.getAclStatus(p1);
++    assertEquals("Entries should be empty", 0, aclStatus.getEntries().size());
++    assertEquals("Permission should be carried by AclStatus",
++        fs.getFileStatus(p1).getPermission(), aclStatus.getPermission());
++
++    // Add a named entries with all access
++    fs.modifyAclEntries(p1, Lists.newArrayList(
++        aclEntry(ACCESS, USER, "bruce", ALL),
++        aclEntry(ACCESS, GROUP, "groupY", ALL)));
++    aclStatus = fs.getAclStatus(p1);
++    assertEquals("Entries should contain owner group entry also", 3, aclStatus
++        .getEntries().size());
++
++    // restrict the access
++    fs.setPermission(p1, FsPermission.valueOf("-rwxr-----"));
++    // latest permissions should be reflected as effective permission
++    aclStatus = fs.getAclStatus(p1);
++    List<AclEntry> entries = aclStatus.getEntries();
++    for (AclEntry aclEntry : entries) {
++      if (aclEntry.getName() != null || aclEntry.getType() == GROUP) {
++        assertEquals(FsAction.ALL, aclEntry.getPermission());
++        assertEquals(FsAction.READ, aclStatus.getEffectivePermission(aclEntry));
++      }
++    }
++    fsAsBruce.access(p1, READ);
++    try {
++      fsAsBruce.access(p1, WRITE);
++      fail("Access should not be given");
++    } catch (AccessControlException e) {
++      // expected
++    }
++    fsAsBob.access(p1, READ);
++    try {
++      fsAsBob.access(p1, WRITE);
++      fail("Access should not be given");
++    } catch (AccessControlException e) {
++      // expected
++    }
++  }
++
+   /**
+    * Creates a FileSystem for the super-user.
+    *
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testAclCLI.xml b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testAclCLI.xml
+index 21031ad..82a5809 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testAclCLI.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testAclCLI.xml
+@@ -318,6 +318,59 @@
+       </comparators>
+     </test>
+     <test>
++      <description>setfacl : Add minimal default ACL</description>
++      <test-commands>
++        <command>-fs NAMENODE -mkdir /dir1</command>
++        <command>-fs NAMENODE -setfacl -m default:user::rwx /dir1</command>
++        <command>-fs NAMENODE -getfacl /dir1</command>
++      </test-commands>
++      <cleanup-commands>
++        <command>-fs NAMENODE -rm -R /dir1</command>
++      </cleanup-commands>
++      <comparators>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output># file: /dir1</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output># owner: USERNAME</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output># group: supergroup</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>user::rwx</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>group::r-x</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>other::r-x</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>default:user::rwx</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>default:group::r-x</expected-output>
++        </comparator>
++        <comparator>
++          <type>SubstringComparator</type>
++          <expected-output>default:other::r-x</expected-output>
++        </comparator>
++        <comparator>
++          <type>RegexpAcrossOutputComparator</type>
++          <expected-output>.*(?!default\:mask)*</expected-output>
++        </comparator>
++      </comparators>
++    </test>
++    <test>
+       <description>setfacl : try adding default ACL to file</description>
+       <test-commands>
+         <command>-fs NAMENODE -touchz /file1</command>
+-- 
+1.7.9.5
+

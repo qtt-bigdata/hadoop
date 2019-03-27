@@ -1,0 +1,507 @@
+From adbb14f63e1603a78eec0c9dfad9718ce651439c Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@apache.org>
+Date: Tue, 11 Jul 2017 11:19:08 -0700
+Subject: [PATCH 2675/2848] HDFS-12052. Set SWEBHDFS delegation token kind
+ when ssl is enabled in HttpFS. Contributed by
+ Zoran Dimitrijevic.
+
+(cherry picked from commit 12c8fdceaf263425661169cba25402df89d444c1)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServerWebServer.java
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+
+(cherry picked from commit a42a19e139230d60063703d54ac17063a40285e8)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSAuthenticationFilter.java
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+
+Change-Id: Ifd2d5afd51d9ffc66a1e5785a23a3ec043fae698
+---
+ .../fs/http/server/HttpFSAuthenticationFilter.java |    7 +-
+ ...pFSKerberosAuthenticationHandlerForTesting.java |    1 -
+ .../hadoop/fs/http/server/TestHttpFSServer.java    |  272 +++++++++++---------
+ 3 files changed, 159 insertions(+), 121 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSAuthenticationFilter.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSAuthenticationFilter.java
+index 712a3a3..597e562 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSAuthenticationFilter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSAuthenticationFilter.java
+@@ -19,6 +19,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdfs.web.SWebHdfsFileSystem;
+ import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
+ import org.apache.hadoop.security.authentication.server.AuthenticationFilter;
+ import org.apache.hadoop.security.token.delegation.web.DelegationTokenAuthenticationFilter;
+@@ -91,8 +92,12 @@ protected Properties getConfiguration(String configPrefix,
+       throw new RuntimeException("Could not read HttpFS signature secret file: " + signatureSecretFile);
+     }
+     setAuthHandlerClass(props);
++    String dtkind = WebHdfsFileSystem.TOKEN_KIND.toString();
++    if (conf.getBoolean("httpfs.ssl.enabled", false)) {
++      dtkind = SWebHdfsFileSystem.TOKEN_KIND.toString();
++    }
+     props.setProperty(KerberosDelegationTokenAuthenticationHandler.TOKEN_KIND,
+-        WebHdfsFileSystem.TOKEN_KIND.toString());
++                      dtkind);
+     return props;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/HttpFSKerberosAuthenticationHandlerForTesting.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/HttpFSKerberosAuthenticationHandlerForTesting.java
+index 9a51bd3..8ac7da3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/HttpFSKerberosAuthenticationHandlerForTesting.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/HttpFSKerberosAuthenticationHandlerForTesting.java
+@@ -28,7 +28,6 @@
+   @Override
+   public void init(Properties config) throws ServletException {
+     //NOP overwrite to avoid Kerberos initialization
+-    config.setProperty(TOKEN_KIND, "t");
+     initTokenManager(config);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+index 615dda8..c219d77 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+@@ -19,8 +19,11 @@
+ 
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
++import org.apache.hadoop.hdfs.web.SWebHdfsFileSystem;
++import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
+ import org.apache.hadoop.security.authentication.util.SignerSecretProvider;
+ import org.apache.hadoop.security.authentication.util.StringSignerSecretProviderCreator;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier;
+ import org.apache.hadoop.security.token.delegation.web.DelegationTokenAuthenticator;
+ import org.apache.hadoop.security.token.delegation.web.KerberosDelegationTokenAuthenticationHandler;
+ import org.json.simple.JSONArray;
+@@ -53,6 +56,7 @@
+ import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
+ import org.apache.hadoop.security.authentication.server.AuthenticationToken;
+ import org.apache.hadoop.security.authentication.util.Signer;
++import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.test.HFSTestCase;
+ import org.apache.hadoop.test.HadoopUsersConfTestHelper;
+ import org.apache.hadoop.test.TestDir;
+@@ -122,8 +126,8 @@ public void serverStatusChange(org.apache.hadoop.lib.server.Server.Status oldSta
+ 
+   }
+ 
+-  private void createHttpFSServer(boolean addDelegationTokenAuthHandler)
+-    throws Exception {
++  private Configuration createHttpFSConf(boolean addDelegationTokenAuthHandler,
++                                         boolean sslEnabled) throws Exception {
+     File homeDir = TestDirHelper.getTestDir();
+     Assert.assertTrue(new File(homeDir, "conf").mkdir());
+     Assert.assertTrue(new File(homeDir, "log").mkdir());
+@@ -135,10 +139,11 @@ private void createHttpFSServer(boolean addDelegationTokenAuthHandler)
+     w.write("secret");
+     w.close();
+ 
+-    //HDFS configuration
++    // HDFS configuration
+     File hadoopConfDir = new File(new File(homeDir, "conf"), "hadoop-conf");
+     hadoopConfDir.mkdirs();
+     Configuration hdfsConf = TestHdfsHelper.getHdfsConf();
++
+     // Http Server's conf should be based on HDFS's conf
+     Configuration conf = new Configuration(hdfsConf);
+     conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY, true);
+@@ -148,26 +153,39 @@ private void createHttpFSServer(boolean addDelegationTokenAuthHandler)
+     conf.writeXml(os);
+     os.close();
+ 
+-    //HTTPFS configuration
++    // HTTPFS configuration
+     conf = new Configuration(false);
+     if (addDelegationTokenAuthHandler) {
+-     conf.set("httpfs.authentication.type",
+-              HttpFSKerberosAuthenticationHandlerForTesting.class.getName());
++      conf.set("httpfs.authentication.type",
++               HttpFSKerberosAuthenticationHandlerForTesting.class.getName());
+     }
+     conf.set("httpfs.services.ext", MockGroups.class.getName());
+     conf.set("httpfs.admin.group", HadoopUsersConfTestHelper.
+-      getHadoopUserGroups(HadoopUsersConfTestHelper.getHadoopUsers()[0])[0]);
+-    conf.set("httpfs.proxyuser." + HadoopUsersConfTestHelper.getHadoopProxyUser() + ".groups",
++        getHadoopUserGroups(HadoopUsersConfTestHelper.getHadoopUsers()[0])[0]);
++    conf.set("httpfs.proxyuser." +
++             HadoopUsersConfTestHelper.getHadoopProxyUser() + ".groups",
+              HadoopUsersConfTestHelper.getHadoopProxyUserGroups());
+-    conf.set("httpfs.proxyuser." + HadoopUsersConfTestHelper.getHadoopProxyUser() + ".hosts",
++    conf.set("httpfs.proxyuser." +
++             HadoopUsersConfTestHelper.getHadoopProxyUser() + ".hosts",
+              HadoopUsersConfTestHelper.getHadoopProxyUserHosts());
+-    conf.set("httpfs.authentication.signature.secret.file", secretFile.getAbsolutePath());
++    conf.set("httpfs.authentication.signature.secret.file",
++             secretFile.getAbsolutePath());
+     conf.set("httpfs.hadoop.config.dir", hadoopConfDir.toString());
++    if (sslEnabled) {
++      conf.set("httpfs.ssl.enabled", "true");
++    }
+     File httpfsSite = new File(new File(homeDir, "conf"), "httpfs-site.xml");
+     os = new FileOutputStream(httpfsSite);
+     conf.writeXml(os);
+     os.close();
++    return conf;
++  }
+ 
++  private void createHttpFSServer(boolean addDelegationTokenAuthHandler,
++                                  boolean sslEnabled)
++      throws Exception {
++    Configuration conf = createHttpFSConf(addDelegationTokenAuthHandler,
++                                          sslEnabled);
+     ClassLoader cl = Thread.currentThread().getContextClassLoader();
+     URL url = cl.getResource("webapp");
+     WebAppContext context = new WebAppContext(url.getPath(), "/webhdfs");
+@@ -179,12 +197,110 @@ private void createHttpFSServer(boolean addDelegationTokenAuthHandler)
+     }
+   }
+ 
++  private String getSignedTokenString()
++      throws Exception {
++    AuthenticationToken token = new AuthenticationToken("u", "p",
++        new KerberosDelegationTokenAuthenticationHandler().getType());
++    token.setExpires(System.currentTimeMillis() + 100000000);
++    SignerSecretProvider secretProvider =
++        StringSignerSecretProviderCreator.newStringSignerSecretProvider();
++    Properties secretProviderProps = new Properties();
++    secretProviderProps.setProperty(
++        AuthenticationFilter.SIGNATURE_SECRET, "secret");
++    secretProvider.init(secretProviderProps, null, -1);
++    Signer signer = new Signer(secretProvider);
++    return signer.sign(token.toString());
++  }
++
++  private void delegationTokenCommonTests(boolean sslEnabled) throws Exception {
++    URL url = new URL(TestJettyHelper.getJettyURL(),
++                      "/webhdfs/v1/?op=GETHOMEDIRECTORY");
++    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_UNAUTHORIZED,
++                        conn.getResponseCode());
++
++    String tokenSigned = getSignedTokenString();
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=GETDELEGATIONTOKEN");
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestProperty("Cookie",
++                            AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++                        conn.getResponseCode());
++
++    JSONObject json = (JSONObject)new JSONParser().parse(
++        new InputStreamReader(conn.getInputStream()));
++    json = (JSONObject)
++      json.get(DelegationTokenAuthenticator.DELEGATION_TOKEN_JSON);
++    String tokenStr = (String)json.get(
++        DelegationTokenAuthenticator.DELEGATION_TOKEN_URL_STRING_JSON);
++
++    Token<AbstractDelegationTokenIdentifier> dToken =
++        new Token<AbstractDelegationTokenIdentifier>();
++    dToken.decodeFromUrlString(tokenStr);
++    Assert.assertEquals(sslEnabled ?
++        SWebHdfsFileSystem.TOKEN_KIND :
++        WebHdfsFileSystem.TOKEN_KIND,
++        dToken.getKind());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=GETHOMEDIRECTORY&delegation=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++                        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=RENEWDELEGATIONTOKEN&token=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestMethod("PUT");
++    Assert.assertEquals(HttpURLConnection.HTTP_UNAUTHORIZED,
++                        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=RENEWDELEGATIONTOKEN&token=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestMethod("PUT");
++    conn.setRequestProperty("Cookie",
++                            AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++                        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestMethod("PUT");
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++                        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++                  "/webhdfs/v1/?op=GETHOMEDIRECTORY&delegation=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
++                        conn.getResponseCode());
++
++    // getTrash test with delegation
++    url = new URL(TestJettyHelper.getJettyURL(),
++        "/webhdfs/v1/?op=GETTRASHROOT&delegation=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
++        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++        "/webhdfs/v1/?op=GETTRASHROOT");
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestProperty("Cookie",
++        AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++        conn.getResponseCode());
++  }
++
+   @Test
+   @TestDir
+   @TestJetty
+   @TestHdfs
+   public void instrumentation() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     URL url = new URL(TestJettyHelper.getJettyURL(),
+                       MessageFormat.format("/webhdfs/v1?user.name={0}&op=instrumentation", "nobody"));
+@@ -213,7 +329,7 @@ public void instrumentation() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testHdfsAccess() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     String user = HadoopUsersConfTestHelper.getHadoopUsers()[0];
+     URL url = new URL(TestJettyHelper.getJettyURL(),
+@@ -230,7 +346,7 @@ public void testHdfsAccess() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testGlobFilter() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+     fs.mkdirs(new Path("/tmp"));
+@@ -436,7 +552,7 @@ private String getPath(String statusJson) throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testPerms() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+     fs.mkdirs(new Path("/perm"));
+@@ -472,9 +588,9 @@ public void testXAttrs() throws Exception {
+     final byte[] value2 = new byte[]{0x41, 0x42, 0x43};
+     final String dir = "/xattrTest";
+     final String path = dir + "/file";
+-    
+-    createHttpFSServer(false);
+-    
++
++    createHttpFSServer(false, false);
++
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+     fs.mkdirs(new Path(dir));
+     
+@@ -542,7 +658,7 @@ public void testFileAcls() throws Exception {
+     String statusJson;
+     List<String> aclEntries;
+ 
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+     fs.mkdirs(new Path(dir));
+@@ -625,7 +741,7 @@ public void testDirAcls() throws Exception {
+     String statusJson;
+     List<String> aclEntries;
+ 
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+     fs.mkdirs(new Path(dir));
+@@ -663,7 +779,7 @@ public void testDirAcls() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testOpenOffsetLength() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     byte[] array = new byte[]{0, 1, 2, 3};
+     FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
+@@ -688,7 +804,7 @@ public void testOpenOffsetLength() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testPutNoOperation() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+ 
+     String user = HadoopUsersConfTestHelper.getHadoopUsers()[0];
+     URL url = new URL(TestJettyHelper.getJettyURL(),
+@@ -706,7 +822,7 @@ public void testPutNoOperation() throws Exception {
+   @TestHdfs
+   public void testGetTrashRoot() throws Exception {
+     String user = HadoopUsersConfTestHelper.getHadoopUsers()[0];
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+     String trashJson = getStatus("/", "GETTRASHROOT");
+     String trashPath = getPath(trashJson);
+ 
+@@ -739,99 +855,8 @@ public void testGetTrashRoot() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testDelegationTokenOperations() throws Exception {
+-    createHttpFSServer(true);
+-
+-    URL url = new URL(TestJettyHelper.getJettyURL(),
+-                      "/webhdfs/v1/?op=GETHOMEDIRECTORY");
+-    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+-    Assert.assertEquals(HttpURLConnection.HTTP_UNAUTHORIZED,
+-                        conn.getResponseCode());
+-
+-
+-    AuthenticationToken token =
+-      new AuthenticationToken("u", "p",
+-          new KerberosDelegationTokenAuthenticationHandler().getType());
+-    token.setExpires(System.currentTimeMillis() + 100000000);
+-    SignerSecretProvider secretProvider =
+-        StringSignerSecretProviderCreator.newStringSignerSecretProvider();
+-    Properties secretProviderProps = new Properties();
+-    secretProviderProps.setProperty(AuthenticationFilter.SIGNATURE_SECRET, "secret");
+-    secretProvider.init(secretProviderProps, null, -1);
+-    Signer signer = new Signer(secretProvider);
+-    String tokenSigned = signer.sign(token.toString());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=GETHOMEDIRECTORY");
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestProperty("Cookie",
+-                            AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-                        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=GETDELEGATIONTOKEN");
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestProperty("Cookie",
+-                            AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-                        conn.getResponseCode());
+-
+-    JSONObject json = (JSONObject)
+-      new JSONParser().parse(new InputStreamReader(conn.getInputStream()));
+-    json = (JSONObject)
+-      json.get(DelegationTokenAuthenticator.DELEGATION_TOKEN_JSON);
+-    String tokenStr = (String)
+-        json.get(DelegationTokenAuthenticator.DELEGATION_TOKEN_URL_STRING_JSON);
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=GETHOMEDIRECTORY&delegation=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-                        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=RENEWDELEGATIONTOKEN&token=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestMethod("PUT");
+-    Assert.assertEquals(HttpURLConnection.HTTP_UNAUTHORIZED,
+-                        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=RENEWDELEGATIONTOKEN&token=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestMethod("PUT");
+-    conn.setRequestProperty("Cookie",
+-                            AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-                        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestMethod("PUT");
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-                        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-                  "/webhdfs/v1/?op=GETHOMEDIRECTORY&delegation=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
+-                        conn.getResponseCode());
+-
+-    // getTrash test with delegation
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-        "/webhdfs/v1/?op=GETTRASHROOT&delegation=" + tokenStr);
+-    conn = (HttpURLConnection) url.openConnection();
+-    Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
+-        conn.getResponseCode());
+-
+-    url = new URL(TestJettyHelper.getJettyURL(),
+-        "/webhdfs/v1/?op=GETTRASHROOT");
+-    conn = (HttpURLConnection) url.openConnection();
+-    conn.setRequestProperty("Cookie",
+-        AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
+-    Assert.assertEquals(HttpURLConnection.HTTP_OK,
+-        conn.getResponseCode());
++    createHttpFSServer(true, false);
++    delegationTokenCommonTests(false);
+   }
+ 
+   private HttpURLConnection snapshotTestPreconditions(String httpMethod,
+@@ -870,7 +895,7 @@ private HttpURLConnection snapshotTestPreconditions(String httpMethod,
+   @TestJetty
+   @TestHdfs
+   public void testCreateSnapshot() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+     final HttpURLConnection conn = snapshotTestPreconditions("PUT",
+         "CREATESNAPSHOT",
+         "snapshotname=snap-with-name");
+@@ -892,7 +917,7 @@ public void testCreateSnapshot() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testCreateSnapshotNoSnapshotName() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+     final HttpURLConnection conn = snapshotTestPreconditions("PUT",
+         "CREATESNAPSHOT",
+         "");
+@@ -918,7 +943,7 @@ public void testCreateSnapshotNoSnapshotName() throws Exception {
+   @TestJetty
+   @TestHdfs
+   public void testRenameSnapshot() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+     HttpURLConnection conn = snapshotTestPreconditions("PUT",
+         "CREATESNAPSHOT",
+         "snapshotname=snap-to-rename");
+@@ -940,8 +965,17 @@ public void testRenameSnapshot() throws Exception {
+   @TestDir
+   @TestJetty
+   @TestHdfs
++  public void testDelegationTokenOperationsSsl() throws Exception {
++    createHttpFSServer(true, true);
++    delegationTokenCommonTests(true);
++  }
++
++  @Test
++  @TestDir
++  @TestJetty
++  @TestHdfs
+   public void testDeleteSnapshot() throws Exception {
+-    createHttpFSServer(false);
++    createHttpFSServer(false, false);
+     HttpURLConnection conn = snapshotTestPreconditions("PUT",
+         "CREATESNAPSHOT",
+         "snapshotname=snap-to-delete");
+-- 
+1.7.9.5
+

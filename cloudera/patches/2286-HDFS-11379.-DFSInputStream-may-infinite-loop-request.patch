@@ -1,0 +1,198 @@
+From 12561d156761d7cd4e8a51c75f002bcee7299c82 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Fri, 17 Feb 2017 15:38:55 -0800
+Subject: [PATCH 2286/2848] HDFS-11379. DFSInputStream may infinite loop
+ requesting block locations. Contributed by Daryn
+ Sharp.
+
+(cherry picked from commit c2a4ce77175e55333e04ae2a91c93a8e418cf3f7)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+Change-Id: Idf01ab74c904ab7ed08fc3a5e681e6c6403c5c39
+---
+ .../org/apache/hadoop/hdfs/DFSInputStream.java     |   48 +++++++---------
+ .../java/org/apache/hadoop/hdfs/TestPread.java     |   58 +++++++++++++++++++-
+ 2 files changed, 76 insertions(+), 30 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+index 61e05d0..93384f0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+@@ -497,15 +497,7 @@ else if (offset >= locatedBlocks.getFileLength()) {
+       }
+       else {
+         // search cached blocks first
+-        int targetBlockIdx = locatedBlocks.findBlock(offset);
+-        if (targetBlockIdx < 0) { // block is not cached
+-          targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
+-          // fetch more blocks
+-          final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+-          assert (newBlocks != null) : "Could not find target position " + offset;
+-          locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+-        }
+-        blk = locatedBlocks.get(targetBlockIdx);
++        blk = fetchBlockAt(offset, 0, true);
+       }
+ 
+       // update current position
+@@ -523,18 +515,29 @@ else if (offset >= locatedBlocks.getFileLength()) {
+   }
+ 
+   /** Fetch a block from namenode and cache it */
+-  private void fetchBlockAt(long offset) throws IOException {
++  private LocatedBlock fetchBlockAt(long offset) throws IOException {
++    return fetchBlockAt(offset, 0, false); // don't use cache
++  }
++
++  /** Fetch a block from namenode and cache it */
++  private LocatedBlock fetchBlockAt(long offset, long length, boolean useCache)
++      throws IOException {
+     synchronized(infoLock) {
+       int targetBlockIdx = locatedBlocks.findBlock(offset);
+       if (targetBlockIdx < 0) { // block is not cached
+         targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
++        useCache = false;
+       }
+-      // fetch blocks
+-      final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+-      if (newBlocks == null) {
+-        throw new IOException("Could not find target position " + offset);
++      if (!useCache) { // fetch blocks
++        final LocatedBlocks newBlocks = (length == 0)
++            ? dfsClient.getLocatedBlocks(src, offset)
++            : dfsClient.getLocatedBlocks(src, offset, length);
++        if (newBlocks == null || newBlocks.locatedBlockCount() == 0) {
++          throw new EOFException("Could not find target position " + offset);
++        }
++        locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+       }
+-      locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
++      return locatedBlocks.get(targetBlockIdx);
+     }
+   }
+ 
+@@ -589,28 +592,15 @@ private void fetchBlockAt(long offset) throws IOException {
+       assert (locatedBlocks != null) : "locatedBlocks is null";
+       List<LocatedBlock> blockRange = new ArrayList<LocatedBlock>();
+       // search cached blocks first
+-      int blockIdx = locatedBlocks.findBlock(offset);
+-      if (blockIdx < 0) { // block is not cached
+-        blockIdx = LocatedBlocks.getInsertIndex(blockIdx);
+-      }
+       long remaining = length;
+       long curOff = offset;
+       while(remaining > 0) {
+-        LocatedBlock blk = null;
+-        if(blockIdx < locatedBlocks.locatedBlockCount())
+-          blk = locatedBlocks.get(blockIdx);
+-        if (blk == null || curOff < blk.getStartOffset()) {
+-          LocatedBlocks newBlocks;
+-          newBlocks = dfsClient.getLocatedBlocks(src, curOff, remaining);
+-          locatedBlocks.insertRange(blockIdx, newBlocks.getLocatedBlocks());
+-          continue;
+-        }
++        LocatedBlock blk = fetchBlockAt(curOff, remaining, true);
+         assert curOff >= blk.getStartOffset() : "Block not found";
+         blockRange.add(blk);
+         long bytesRead = blk.getStartOffset() + blk.getBlockSize() - curOff;
+         remaining -= bytesRead;
+         curOff += bytesRead;
+-        blockIdx++;
+       }
+       return blockRange;
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+index 2c5becd..7a22930 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+@@ -21,6 +21,7 @@
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.DataOutputStream;
++import java.io.EOFException;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Random;
+@@ -29,7 +30,7 @@
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-
++import java.util.concurrent.TimeUnit;
+ import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.ChecksumException;
+@@ -41,6 +42,7 @@
+ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.log4j.Level;
++import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.Mockito;
+@@ -483,6 +485,60 @@ public void testPreadLocalFS() throws IOException {
+     }
+   }
+ 
++  @Test
++  public void testTruncateWhileReading() throws Exception {
++    Path path = new Path("/testfile");
++    final int blockSize = 512;
++
++    // prevent initial pre-fetch of multiple block locations
++    Configuration conf = new Configuration();
++    conf.setLong(DFSConfigKeys.DFS_CLIENT_READ_PREFETCH_SIZE_KEY, blockSize);
++
++    MiniDFSCluster cluster =
++        new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
++    try {
++      DistributedFileSystem fs = cluster.getFileSystem();
++      // create multi-block file
++      FSDataOutputStream dos =
++          fs.create(path, true, blockSize, (short)1, blockSize);
++      dos.write(new byte[blockSize*3]);
++      dos.close();
++
++      // CLOUDERA-BUILD. upstream tests this with truncate. CDH doesn't
++      // truncate so renaming it to a smaller sized file.
++      Path pathTmp = new Path("/tmp");
++      FSDataOutputStream dosTmp =
++          fs.create(path, true, blockSize, (short)1, blockSize);
++      dosTmp.write(new byte[10]);
++      dosTmp.close();
++      fs.rename(pathTmp, path);
++
++      final FSDataInputStream dis = fs.open(path);
++      // verify that reading bytes outside the initial pre-fetch do
++      // not send the client into an infinite loop querying locations.
++      ExecutorService executor = Executors.newFixedThreadPool(1);
++      Future<?> future = executor.submit(new Callable<Void>() {
++        @Override
++        public Void call() throws IOException {
++          // read from 2nd block.
++          dis.readFully(blockSize, new byte[4]);
++          return null;
++        }
++      });
++      try {
++        future.get(4, TimeUnit.SECONDS);
++        Assert.fail();
++      } catch (ExecutionException ee) {
++        assertTrue(ee.toString(), ee.getCause() instanceof EOFException);
++      } finally {
++        future.cancel(true);
++        executor.shutdown();
++      }
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
+   public static void main(String[] args) throws Exception {
+     new TestPread().testPreadDFS();
+   }
+-- 
+1.7.9.5
+

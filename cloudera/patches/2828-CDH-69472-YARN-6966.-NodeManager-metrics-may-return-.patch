@@ -1,0 +1,514 @@
+From 9550013d7df8cdffb787f324d35d65c95ec05334 Mon Sep 17 00:00:00 2001
+From: Szilard Nemeth <snemeth@cloudera.com>
+Date: Mon, 6 Aug 2018 22:09:56 +0200
+Subject: [PATCH 2828/2848] CDH-69472: YARN-6966. NodeManager metrics may
+ return wrong negative values when NM restart.
+ (Szilard Nemeth via Haibo Chen)
+
+Please note that this is NOT A SIMPLE BACKPORT OF YARN-6966, more like a re-implementation of it,
+as the code in this branch and Hadoop branch-2 (upstream) have diverged heavily.
+
+==C5_APPROVED_BUGFIX==
+
+Change-Id: Ifc737d5209665415a1443b34a0e1a27f95c177b7
+---
+ .../containermanager/ContainerManagerImpl.java     |    6 +
+ .../recovery/NMLeveldbStateStoreService.java       |    8 +-
+ .../nodemanager/recovery/NMStateStoreService.java  |    6 +
+ .../containermanager/BaseContainerManagerTest.java |   46 ++++-
+ .../TestContainerManagerRecovery.java              |  179 ++++++++++++++++++--
+ .../metrics/TestNodeManagerMetrics.java            |    4 +-
+ .../recovery/NMMemoryStateStoreService.java        |   16 +-
+ .../recovery/TestNMLeveldbStateStoreService.java   |    4 +
+ 8 files changed, 247 insertions(+), 22 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+index 24458aa..0acab2f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+@@ -305,6 +305,12 @@ private void recoverContainer(RecoveredContainerState rcs)
+         + " with exit code " + rcs.getExitCode());
+ 
+     if (context.getApplications().containsKey(appId)) {
++      if (rcs.getStatus() != RecoveredContainerStatus.COMPLETED) {
++        metrics.launchedContainer();
++        if (rcs.getCapability() != null) {
++          metrics.allocateContainer(rcs.getCapability());
++        }
++      }
+       Credentials credentials = parseCredentials(launchContext);
+       Container container = new ContainerImpl(getConfig(), dispatcher,
+           req.getContainerLaunchContext(),
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
+index 201f51e..fa265bd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
+@@ -52,10 +52,12 @@
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.LocalizedResourceProto;
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.LogDeleterProto;
+ import org.apache.hadoop.yarn.proto.YarnServiceProtos.StartContainerRequestProto;
++import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
+ import org.apache.hadoop.yarn.server.api.records.MasterKey;
+ import org.apache.hadoop.yarn.server.api.records.impl.pb.MasterKeyPBImpl;
+ import org.apache.hadoop.yarn.server.records.Version;
+ import org.apache.hadoop.yarn.server.records.impl.pb.VersionPBImpl;
++import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+ import org.apache.hadoop.yarn.server.utils.LeveldbIterator;
+ import org.apache.hadoop.yarn.util.ConverterUtils;
+ import org.fusesource.leveldbjni.JniDBFactory;
+@@ -227,6 +229,9 @@ private RecoveredContainerState loadContainerState(ContainerId containerId,
+       if (suffix.equals(CONTAINER_REQUEST_KEY_SUFFIX)) {
+         rcs.startRequest = new StartContainerRequestPBImpl(
+             StartContainerRequestProto.parseFrom(entry.getValue()));
++        ContainerTokenIdentifier containerTokenIdentifier = BuilderUtils
++            .newContainerTokenIdentifier(rcs.startRequest.getContainerToken());
++        rcs.capability = containerTokenIdentifier.getResource();
+       } else if (suffix.equals(CONTAINER_DIAGS_KEY_SUFFIX)) {
+         rcs.diagnostics = asString(entry.getValue());
+       } else if (suffix.equals(CONTAINER_LAUNCHED_KEY_SUFFIX)) {
+@@ -252,7 +257,8 @@ public void storeContainer(ContainerId containerId,
+         + CONTAINER_REQUEST_KEY_SUFFIX;
+     try {
+       db.put(bytes(key),
+-        ((StartContainerRequestPBImpl) startRequest).getProto().toByteArray());
++          ((StartContainerRequestPBImpl) startRequest).getProto().toByteArray
++              ());
+     } catch (DBException e) {
+       throw new IOException(e);
+     }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMStateStoreService.java
+index fa66349..7e6a211 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMStateStoreService.java
+@@ -34,6 +34,7 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.proto.YarnProtos.LocalResourceProto;
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.ContainerManagerApplicationProto;
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.DeletionServiceDeleteTaskProto;
+@@ -74,6 +75,7 @@ public NMStateStoreService(String name) {
+     boolean killed = false;
+     String diagnostics = "";
+     StartContainerRequest startRequest;
++    Resource capability;
+ 
+     public RecoveredContainerStatus getStatus() {
+       return status;
+@@ -94,6 +96,10 @@ public String getDiagnostics() {
+     public StartContainerRequest getStartRequest() {
+       return startRequest;
+     }
++
++    public Resource getCapability() {
++      return capability;
++    }
+   }
+ 
+   public static class LocalResourceTrackerState {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+index 6474e5a..24aee7c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+@@ -37,7 +37,6 @@
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+-import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.ContainerManagementProtocol;
+ import org.apache.hadoop.yarn.api.protocolrecords.GetContainerStatusesRequest;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+@@ -255,6 +254,51 @@ public void tearDown() throws IOException, InterruptedException {
+         new Path(localDir.getAbsolutePath()), new Path[] {});
+   }
+ 
++  public static void waitForNMContainerState(ContainerManagerImpl
++      containerManager, ContainerId containerID,
++      org.apache.hadoop.yarn.server.nodemanager.containermanager
++          .container.ContainerState finalState)
++      throws InterruptedException {
++    waitForNMContainerState(containerManager, containerID, finalState, 20);
++  }
++
++  public static void waitForNMContainerState(ContainerManagerImpl
++      containerManager, ContainerId containerID,
++      org.apache.hadoop.yarn.server.nodemanager.containermanager
++          .container.ContainerState finalState, int timeOutMax)
++      throws InterruptedException {
++    waitForNMContainerState(containerManager, containerID,
++        Arrays.asList(finalState), timeOutMax);
++  }
++
++  public static void waitForNMContainerState(ContainerManagerImpl
++      containerManager, ContainerId containerID,
++      List<org.apache.hadoop.yarn.server.nodemanager.containermanager
++          .container.ContainerState> finalStates, int timeOutMax)
++      throws InterruptedException {
++    Container container;
++    org.apache.hadoop.yarn.server.nodemanager
++        .containermanager.container.ContainerState currentState = null;
++    int timeoutSecs = 0;
++    do {
++      Thread.sleep(1000);
++      container =
++          containerManager.getContext().getContainers().get(containerID);
++      if (container != null) {
++        currentState = container.getContainerState();
++      }
++      if (currentState != null) {
++        LOG.info("Waiting for NM container to get into one of the following " +
++            "states: " + finalStates + ". Current state is " + currentState);
++      }
++      timeoutSecs += 1;
++    } while (!finalStates.contains(currentState)
++        && timeoutSecs < timeOutMax);
++    LOG.info("Container state is " + currentState);
++    Assert.assertTrue("ContainerState is not correct (timedout)",
++        finalStates.contains(currentState));
++  }
++
+   public static void waitForContainerState(ContainerManagementProtocol containerManager,
+       ContainerId containerID, ContainerState finalState)
+       throws InterruptedException, YarnException, IOException {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManagerRecovery.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManagerRecovery.java
+index 78d102e..e6f2f1c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManagerRecovery.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManagerRecovery.java
+@@ -18,22 +18,14 @@
+ 
+ package org.apache.hadoop.yarn.server.nodemanager.containermanager;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertTrue;
+-import static org.mockito.Mockito.mock;
+-
+-import java.nio.ByteBuffer;
+-import java.security.PrivilegedExceptionAction;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
++import org.apache.commons.logging.LogFactory;
++import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.io.DataOutputBuffer;
++import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
++import org.apache.hadoop.net.ServerSocketUtil;
+ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.yarn.api.protocolrecords.StartContainerRequest;
+@@ -46,7 +38,10 @@
+ import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+ import org.apache.hadoop.yarn.api.records.LocalResource;
+ import org.apache.hadoop.yarn.api.records.LogAggregationContext;
++import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.event.AsyncDispatcher;
++import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.security.NMTokenIdentifier;
+ import org.apache.hadoop.yarn.server.api.records.MasterKey;
+ import org.apache.hadoop.yarn.server.api.records.impl.pb.MasterKeyPBImpl;
+@@ -54,30 +49,87 @@
+ import org.apache.hadoop.yarn.server.nodemanager.ContainerExecutor;
+ import org.apache.hadoop.yarn.server.nodemanager.Context;
+ import org.apache.hadoop.yarn.server.nodemanager.DeletionService;
++import org.apache.hadoop.yarn.server.nodemanager.LocalDirsHandlerService;
++import org.apache.hadoop.yarn.server.nodemanager.NodeHealthCheckerService;
++import org.apache.hadoop.yarn.server.nodemanager.NodeManager;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeManager.NMContext;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdater;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.Application;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationEventType;
+-import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationImpl;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationState;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainersLauncher;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainersLauncherEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.ResourceLocalizationService;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.LocalizationEvent;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.LogHandler;
+ import org.apache.hadoop.yarn.server.nodemanager.metrics.NodeManagerMetrics;
++import org.apache.hadoop.yarn.server.nodemanager.metrics.TestNodeManagerMetrics;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMMemoryStateStoreService;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
+ import org.apache.hadoop.yarn.server.nodemanager.security.NMContainerTokenSecretManager;
+ import org.apache.hadoop.yarn.server.nodemanager.security.NMTokenSecretManagerInNM;
+ import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
++import org.apache.log4j.Level;
++import org.junit.Before;
+ import org.junit.Test;
+ 
+-public class TestContainerManagerRecovery {
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.security.PrivilegedExceptionAction;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
++
++public class TestContainerManagerRecovery extends BaseContainerManagerTest {
++
++  public TestContainerManagerRecovery() throws UnsupportedFileSystemException {
++    super();
++  }
+ 
+   private NodeManagerMetrics metrics = NodeManagerMetrics.create();
+ 
++  @Override
++  @Before
++  public void setup() throws IOException {
++    localFS.delete(new Path(localDir.getAbsolutePath()), true);
++    localFS.delete(new Path(tmpDir.getAbsolutePath()), true);
++    localFS.delete(new Path(localLogDir.getAbsolutePath()), true);
++    localFS.delete(new Path(remoteLogDir.getAbsolutePath()), true);
++    localDir.mkdir();
++    tmpDir.mkdir();
++    localLogDir.mkdir();
++    remoteLogDir.mkdir();
++    LOG.info("Created localDir in " + localDir.getAbsolutePath());
++    LOG.info("Created tmpDir in " + tmpDir.getAbsolutePath());
++
++    String bindAddress = "0.0.0.0:" + ServerSocketUtil.getPort(49160, 10);
++    conf.set(YarnConfiguration.NM_ADDRESS, bindAddress);
++    conf.set(YarnConfiguration.NM_LOCAL_DIRS, localDir.getAbsolutePath());
++    conf.set(YarnConfiguration.NM_LOG_DIRS, localLogDir.getAbsolutePath());
++    conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogDir
++        .getAbsolutePath());
++    conf.setLong(YarnConfiguration.NM_LOG_RETAIN_SECONDS, 1);
++
++    delSrvc = createDeletionService();
++    delSrvc.init(conf);
++    exec = createContainerExecutor();
++    dirsHandler = new LocalDirsHandlerService();
++    nodeHealthChecker = new NodeHealthCheckerService(
++        NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
++    nodeHealthChecker.init(conf);
++  }
++
+   @Test
+   public void testApplicationRecovery() throws Exception {
+     YarnConfiguration conf = new YarnConfiguration();
+@@ -339,6 +391,84 @@ public void testNMRecoveryForAppFinishedWithLogAggregationFailure()
+     cm.stop();
+   }
+ 
++  @Test
++  public void testNodeManagerMetricsRecovery() throws Exception {
++    ((Log4JLogger) LogFactory.getLog(AsyncDispatcher.class))
++        .getLogger().setLevel(Level.DEBUG);
++
++    conf.setBoolean(YarnConfiguration.NM_RECOVERY_ENABLED, true);
++
++    NMStateStoreService stateStore = new NMMemoryStateStoreService();
++    stateStore.init(conf);
++    stateStore.start();
++    Context context = createContext(conf, stateStore);
++    ContainerManagerImpl cm = createContainerManager(context, delSrvc);
++    cm.init(conf);
++    cm.start();
++    cm.setBlockNewContainerRequests(false);
++    metrics.addResource(Resource.newInstance(10240, 8));
++
++    // add an application by starting a container
++    ApplicationId appId = ApplicationId.newInstance(0, 1);
++    ApplicationAttemptId attemptId = ApplicationAttemptId.newInstance(appId, 1);
++    ContainerId cid = ContainerId.newContainerId(attemptId, 1);
++    Map<String, String> containerEnv = Collections.emptyMap();
++    Map<String, ByteBuffer> serviceData = Collections.emptyMap();
++    Map<String, LocalResource> localResources = Collections.emptyMap();
++    List<String> commands = Arrays.asList("sleep 60s".split(" "));
++    ContainerLaunchContext clc = ContainerLaunchContext.newInstance(
++        localResources, containerEnv, commands, serviceData,
++        null, null);
++    StartContainersResponse startResponse = startContainer(context, cm, cid,
++        clc, null);
++    assertTrue(startResponse.getFailedRequests().isEmpty());
++    assertEquals(1, context.getApplications().size());
++    Application app = context.getApplications().get(appId);
++    assertNotNull(app);
++
++    // make sure the container reaches RUNNING state
++    waitForNMContainerState(cm, cid,
++        org.apache.hadoop.yarn.server.nodemanager
++            .containermanager.container.ContainerState.RUNNING);
++    TestNodeManagerMetrics.checkMetrics(1, 0, 0, 0, 0, 1, 1, 1, 9, 1, 7);
++
++    // restart and verify metrics could be recovered
++    cm.stop();
++    DefaultMetricsSystem.shutdown();
++    metrics = NodeManagerMetrics.create();
++    metrics.addResource(Resource.newInstance(10240, 8));
++    TestNodeManagerMetrics.checkMetrics(0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 8);
++    context = createContext(conf, stateStore);
++    cm = createContainerManager(context, delSrvc);
++    cm.init(conf);
++    System.out.println("###calling cm start");
++    cm.start();
++    assertEquals(1, context.getApplications().size());
++    app = context.getApplications().get(appId);
++    assertNotNull(app);
++    TestNodeManagerMetrics.checkMetrics(1, 0, 0, 0, 0, 1, 1, 1, 9, 1, 7);
++    cm.stop();
++  }
++
++  private NMContext createContext(Configuration conf,
++      NMStateStoreService stateStore) {
++    NMContext context = new NMContext(new NMContainerTokenSecretManager(
++        conf), new NMTokenSecretManagerInNM(), null,
++        new ApplicationACLsManager(conf), stateStore) {
++      public int getHttpPort() {
++        return HTTP_PORT;
++      }
++    };
++    // simulate registration with RM
++    MasterKey masterKey = new MasterKeyPBImpl();
++    masterKey.setKeyId(123);
++    masterKey.setBytes(ByteBuffer.wrap(new byte[]{new Integer(123)
++        .byteValue()}));
++    context.getContainerTokenSecretManager().setMasterKey(masterKey);
++    context.getNMTokenSecretManager().setMasterKey(masterKey);
++    return context;
++  }
++
+   private StartContainersResponse startContainer(Context context,
+       final ContainerManagerImpl cm, ContainerId cid,
+       ContainerLaunchContext clc, LogAggregationContext logAggregationContext)
+@@ -377,6 +507,23 @@ private void waitForAppState(Application app, ApplicationState state)
+     assertEquals(state, app.getApplicationState());
+   }
+ 
++  private ContainerManagerImpl createContainerManager(Context context,
++          DeletionService delSrvc) {
++    return new ContainerManagerImpl(context, exec, delSrvc,
++            mock(NodeStatusUpdater.class), metrics, mock
++            (ApplicationACLsManager.class), dirsHandler) {
++      @Override
++      protected void authorizeGetAndStopContainerRequest(
++              ContainerId containerId, Container container,
++              boolean stopRequest, NMTokenIdentifier identifier)
++              throws YarnException {
++        if (container == null || container.getUser().equals("Fail")) {
++          throw new YarnException("Reject this container");
++        }
++      }
++    };
++  }
++
+   private ContainerManagerImpl createContainerManager(Context context) {
+     final LogHandler logHandler = mock(LogHandler.class);
+     final ResourceLocalizationService rsrcSrv =
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/metrics/TestNodeManagerMetrics.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/metrics/TestNodeManagerMetrics.java
+index d2a0691..91ee560 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/metrics/TestNodeManagerMetrics.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/metrics/TestNodeManagerMetrics.java
+@@ -70,8 +70,8 @@
+     checkMetrics(10, 1, 1, 1, 1, 1, 4, 7, 4, 14, 2);
+   }
+ 
+-  private void checkMetrics(int launched, int completed, int failed, int killed,
+-      int initing, int running, int allocatedGB,
++  public static void checkMetrics(int launched, int completed, int failed,
++      int killed, int initing, int running, int allocatedGB,
+       int allocatedContainers, int availableGB, int allocatedVCores,
+       int availableVCores) {
+     MetricsRecordBuilder rb = getMetrics("NodeManagerMetrics");
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMMemoryStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMMemoryStateStoreService.java
+index e0487e7..6b1599b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMMemoryStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMMemoryStateStoreService.java
+@@ -38,8 +38,10 @@
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.DeletionServiceDeleteTaskProto;
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.LocalizedResourceProto;
+ import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.LogDeleterProto;
++import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
+ import org.apache.hadoop.yarn.server.api.records.MasterKey;
+ import org.apache.hadoop.yarn.server.api.records.impl.pb.MasterKeyPBImpl;
++import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+ 
+ public class NMMemoryStateStoreService extends NMStateStoreService {
+   private Map<ApplicationId, ContainerManagerApplicationProto> apps;
+@@ -122,16 +124,26 @@ public synchronized void removeApplication(ApplicationId appId)
+       rcsCopy.killed = rcs.killed;
+       rcsCopy.diagnostics = rcs.diagnostics;
+       rcsCopy.startRequest = rcs.startRequest;
++      rcsCopy.capability = rcs.capability;
+       result.add(rcsCopy);
+     }
+-    return new ArrayList<RecoveredContainerState>();
++    return result;
+   }
+ 
+   @Override
+   public synchronized void storeContainer(ContainerId containerId,
+-      StartContainerRequest startRequest) throws IOException {
++      StartContainerRequest startRequest) {
+     RecoveredContainerState rcs = new RecoveredContainerState();
+     rcs.startRequest = startRequest;
++
++    try {
++      ContainerTokenIdentifier containerTokenIdentifier = BuilderUtils
++          .newContainerTokenIdentifier(startRequest.getContainerToken());
++      rcs.capability = containerTokenIdentifier.getResource();
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++
+     containerStates.put(containerId, rcs);
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
+index ad3122a..4254d65 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
+@@ -280,6 +280,7 @@ public void testContainerStorage() throws IOException {
+     assertEquals(false, rcs.getKilled());
+     assertEquals(containerReq, rcs.getStartRequest());
+     assertTrue(rcs.getDiagnostics().isEmpty());
++    assertEquals(containerRsrc, rcs.getCapability());
+ 
+     // store a new container record without StartContainerRequest
+     ContainerId containerId1 = ContainerId.newInstance(appAttemptId, 6);
+@@ -302,6 +303,7 @@ public void testContainerStorage() throws IOException {
+     assertEquals(false, rcs.getKilled());
+     assertEquals(containerReq, rcs.getStartRequest());
+     assertEquals(diags.toString(), rcs.getDiagnostics());
++    assertEquals(containerRsrc, rcs.getCapability());
+ 
+     // mark the container killed, add some more diags, and verify recovered
+     diags.append("some more diags for container");
+@@ -316,6 +318,7 @@ public void testContainerStorage() throws IOException {
+     assertTrue(rcs.getKilled());
+     assertEquals(containerReq, rcs.getStartRequest());
+     assertEquals(diags.toString(), rcs.getDiagnostics());
++    assertEquals(containerRsrc, rcs.getCapability());
+ 
+     // add yet more diags, mark container completed, and verify recovered
+     diags.append("some final diags");
+@@ -330,6 +333,7 @@ public void testContainerStorage() throws IOException {
+     assertTrue(rcs.getKilled());
+     assertEquals(containerReq, rcs.getStartRequest());
+     assertEquals(diags.toString(), rcs.getDiagnostics());
++    assertEquals(containerRsrc, rcs.getCapability());
+ 
+     // remove the container and verify not recovered
+     stateStore.removeContainer(containerId);
+-- 
+1.7.9.5
+

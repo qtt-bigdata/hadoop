@@ -1,0 +1,153 @@
+From a3e3e7f94d7781c1739649dc10c2c073fd154d51 Mon Sep 17 00:00:00 2001
+From: Jing Zhao <jing9@apache.org>
+Date: Wed, 4 May 2016 10:23:04 -0700
+Subject: [PATCH 2487/2848] HADOOP-12469. distcp should not ignore the
+ ignoreFailures option. Contributed by Mingliang
+ Liu.
+
+(cherry picked from commit af942585a108d70e0946f6dd4c465a54d068eabf)
+(cherry picked from commit d43d8a1bcd904a3e8044a85136b857e633eeebb0)
+
+Change-Id: I7652365eb7b27bc05225a1be1afc85b06b4f6051
+---
+ .../org/apache/hadoop/tools/mapred/CopyMapper.java |    6 +-
+ .../apache/hadoop/tools/mapred/TestCopyMapper.java |   85 ++++++++++++++++++++
+ 2 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/CopyMapper.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/CopyMapper.java
+index 3e0638a..0f41978 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/CopyMapper.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/CopyMapper.java
+@@ -25,6 +25,7 @@
+ import java.util.Arrays;
+ import java.util.EnumSet;
+ 
++import org.apache.commons.lang.exception.ExceptionUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -40,6 +41,7 @@
+ import org.apache.hadoop.tools.DistCpOptionSwitch;
+ import org.apache.hadoop.tools.DistCpOptions;
+ import org.apache.hadoop.tools.DistCpOptions.FileAttribute;
++import org.apache.hadoop.tools.mapred.RetriableFileCopyCommand.CopyReadException;
+ import org.apache.hadoop.tools.util.DistCpUtils;
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -338,8 +340,8 @@ private void handleFailures(IOException exception,
+             : "") +
+         " to " + target, exception);
+ 
+-    if (ignoreFailures && exception.getCause() instanceof
+-            RetriableFileCopyCommand.CopyReadException) {
++    if (ignoreFailures &&
++        ExceptionUtils.indexOfType(exception, CopyReadException.class) != -1) {
+       incrementCounter(context, Counter.FAIL, 1);
+       incrementCounter(context, Counter.BYTESFAILED, sourceFileStatus.getLen());
+       context.write(null, new Text("FAIL: " + sourceFileStatus.getPath() + " - " +
+diff --git a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/mapred/TestCopyMapper.java b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/mapred/TestCopyMapper.java
+index c1ed914..3d333d9 100644
+--- a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/mapred/TestCopyMapper.java
++++ b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/mapred/TestCopyMapper.java
+@@ -392,6 +392,8 @@ public void testMakeDirFailure() {
+   public void testIgnoreFailures() {
+     doTestIgnoreFailures(true);
+     doTestIgnoreFailures(false);
++    doTestIgnoreFailuresDoubleWrapped(true);
++    doTestIgnoreFailuresDoubleWrapped(false);
+   }
+ 
+   @Test(timeout=40000)
+@@ -800,6 +802,89 @@ private void doTestIgnoreFailures(boolean ignoreFailures) {
+     }
+   }
+ 
++  /**
++   * This test covers the case where the CopyReadException is double-wrapped and
++   * the mapper should be able to ignore this nested read exception.
++   * @see #doTestIgnoreFailures
++   */
++  private void doTestIgnoreFailuresDoubleWrapped(final boolean ignoreFailures) {
++    try {
++      deleteState();
++      createSourceData();
++
++      final UserGroupInformation tmpUser = UserGroupInformation
++          .createRemoteUser("guest");
++
++      final CopyMapper copyMapper = new CopyMapper();
++
++      final Mapper<Text, CopyListingFileStatus, Text, Text>.Context context =
++          tmpUser.doAs(new PrivilegedAction<
++              Mapper<Text, CopyListingFileStatus, Text, Text>.Context>() {
++            @Override
++            public Mapper<Text, CopyListingFileStatus, Text, Text>.Context
++            run() {
++              try {
++                StubContext stubContext = new StubContext(
++                    getConfiguration(), null, 0);
++                return stubContext.getContext();
++              } catch (Exception e) {
++                LOG.error("Exception encountered when get stub context", e);
++                throw new RuntimeException(e);
++              }
++            }
++          });
++
++      touchFile(SOURCE_PATH + "/src/file");
++      mkdirs(TARGET_PATH);
++      cluster.getFileSystem().setPermission(new Path(SOURCE_PATH + "/src/file"),
++          new FsPermission(FsAction.NONE, FsAction.NONE, FsAction.NONE));
++      cluster.getFileSystem().setPermission(new Path(TARGET_PATH),
++          new FsPermission((short)511));
++
++      context.getConfiguration().setBoolean(
++          DistCpOptionSwitch.IGNORE_FAILURES.getConfigLabel(), ignoreFailures);
++
++      final FileSystem tmpFS = tmpUser.doAs(new PrivilegedAction<FileSystem>() {
++        @Override
++        public FileSystem run() {
++          try {
++            return FileSystem.get(configuration);
++          } catch (IOException e) {
++            LOG.error("Exception encountered when get FileSystem.", e);
++            throw new RuntimeException(e);
++          }
++        }
++      });
++
++      tmpUser.doAs(new PrivilegedAction<Integer>() {
++        @Override
++        public Integer run() {
++          try {
++            copyMapper.setup(context);
++            copyMapper.map(new Text("/src/file"),
++                new CopyListingFileStatus(tmpFS.getFileStatus(
++                    new Path(SOURCE_PATH + "/src/file"))),
++                context);
++            Assert.assertTrue("Should have thrown an IOException if not " +
++                "ignoring failures", ignoreFailures);
++          } catch (IOException e) {
++            LOG.error("Unexpected exception encountered. ", e);
++            Assert.assertFalse("Should not have thrown an IOException if " +
++                "ignoring failures", ignoreFailures);
++            // the IOException is not thrown again as it's expected
++          } catch (Exception e) {
++            LOG.error("Exception encountered when the mapper copies file.", e);
++            throw new RuntimeException(e);
++          }
++          return null;
++        }
++      });
++    } catch (Exception e) {
++      LOG.error("Unexpected exception encountered. ", e);
++      Assert.fail("Test failed: " + e.getMessage());
++    }
++  }
++
+   private static void deleteState() throws IOException {
+     pathList.clear();
+     nFiles = 0;
+-- 
+1.7.9.5
+

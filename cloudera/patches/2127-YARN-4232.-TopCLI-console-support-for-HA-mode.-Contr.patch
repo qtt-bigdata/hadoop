@@ -1,0 +1,368 @@
+From c2d695106f1456b0da9cd6670179a0364aa60b7f Mon Sep 17 00:00:00 2001
+From: Naganarasimha <naganarasimha_gr@apache.org>
+Date: Sat, 17 Sep 2016 09:52:39 +0530
+Subject: [PATCH 2127/2848] YARN-4232. TopCLI console support for HA mode.
+ Contributed by Bibin A Chundatt
+
+(cherry picked from commit ade7c2bc9ccf09d843ccb3dfa56c1453a9e87318)
+(cherry picked from commit 656b520dc6f7c51f7cb516866dd723a281a412be)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/util/WebAppUtils.java
+
+Change-Id: I936b6894e73320f1ae61ef723270670d2130952a
+---
+ .../org/apache/hadoop/yarn/client/cli/TopCLI.java  |  114 +++++++++++++++++---
+ .../apache/hadoop/yarn/client/cli/TestTopCLI.java  |  106 ++++++++++++++++++
+ .../hadoop/yarn/webapp/util/WebAppUtils.java       |   34 +++---
+ 3 files changed, 224 insertions(+), 30 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/cli/TestTopCLI.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/cli/TopCLI.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/cli/TopCLI.java
+index 8bcbcf3..072dcb3 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/cli/TopCLI.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/cli/TopCLI.java
+@@ -20,10 +20,13 @@
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.net.ConnectException;
++import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.net.URLConnection;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.EnumMap;
+@@ -37,6 +40,10 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.SSLSocketFactory;
++
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.cache.Cache;
+ import com.google.common.cache.CacheBuilder;
+ import org.apache.commons.cli.CommandLine;
+@@ -50,7 +57,12 @@
+ import org.apache.commons.lang.time.DurationFormatUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.http.HttpConfig.Policy;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
++import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
++import org.apache.hadoop.security.ssl.SSLFactory;
+ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.util.ToolRunner;
+ import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsRequest;
+@@ -59,12 +71,17 @@
+ import org.apache.hadoop.yarn.api.records.QueueStatistics;
+ import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+ import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
++import org.apache.hadoop.yarn.conf.HAUtil;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
++import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
++import org.codehaus.jettison.json.JSONException;
+ import org.codehaus.jettison.json.JSONObject;
+ 
+ public class TopCLI extends YarnCLI {
+ 
++  private static final String CLUSTER_INFO_URL = "/ws/v1/cluster/info";
++
+   private static final Log LOG = LogFactory.getLog(TopCLI.class);
+   private String CLEAR = "\u001b[2J";
+   private String CLEAR_LINE = "\u001b[2K";
+@@ -729,18 +746,12 @@ protected QueueMetrics getQueueMetrics() {
+ 
+   long getRMStartTime() {
+     try {
+-      URL url =
+-          new URL("http://"
+-              + client.getConfig().get(YarnConfiguration.RM_WEBAPP_ADDRESS)
+-              + "/ws/v1/cluster/info");
+-      URLConnection conn = url.openConnection();
+-      conn.connect();
+-      InputStream in = conn.getInputStream();
+-      String encoding = conn.getContentEncoding();
+-      encoding = encoding == null ? "UTF-8" : encoding;
+-      String body = IOUtils.toString(in, encoding);
+-      JSONObject obj = new JSONObject(body);
+-      JSONObject clusterInfo = obj.getJSONObject("clusterInfo");
++      // connect with url
++      URL url = getClusterUrl();
++      if (null == url) {
++        return -1;
++      }
++      JSONObject clusterInfo = getJSONObject(connect(url));
+       return clusterInfo.getLong("startedOn");
+     } catch (Exception e) {
+       LOG.error("Could not fetch RM start time", e);
+@@ -748,6 +759,80 @@ long getRMStartTime() {
+     return -1;
+   }
+ 
++  private JSONObject getJSONObject(URLConnection conn)
++      throws IOException, JSONException {
++    InputStream in = conn.getInputStream();
++    String encoding = conn.getContentEncoding();
++    encoding = encoding == null ? "UTF-8" : encoding;
++    String body = IOUtils.toString(in, encoding);
++    JSONObject obj = new JSONObject(body);
++    JSONObject clusterInfo = obj.getJSONObject("clusterInfo");
++    return clusterInfo;
++  }
++
++  private URL getClusterUrl() throws Exception {
++    URL url = null;
++    Configuration conf = getConf();
++    if (HAUtil.isHAEnabled(conf)) {
++      Collection<String> haids = HAUtil.getRMHAIds(conf);
++      for (String rmhid : haids) {
++        try {
++          url = getHAClusterUrl(conf, rmhid);
++          if (isActive(url)) {
++            break;
++          }
++        } catch (ConnectException e) {
++          // ignore and try second one when one of RM is down
++        }
++      }
++    } else {
++      url = new URL(
++          WebAppUtils.getRMWebAppURLWithScheme(conf) + CLUSTER_INFO_URL);
++    }
++    return url;
++  }
++
++  private boolean isActive(URL url) throws Exception {
++    URLConnection connect = connect(url);
++    JSONObject clusterInfo = getJSONObject(connect);
++    return clusterInfo.getString("haState").equals("ACTIVE");
++  }
++
++  @VisibleForTesting
++  public URL getHAClusterUrl(Configuration conf, String rmhid)
++      throws MalformedURLException {
++    return new URL(WebAppUtils.getHttpSchemePrefix(conf)
++        + WebAppUtils.getResolvedRemoteRMWebAppURLWithoutScheme(conf,
++            YarnConfiguration.useHttps(conf) ? Policy.HTTPS_ONLY
++                : Policy.HTTP_ONLY,
++            rmhid)
++        + CLUSTER_INFO_URL);
++  }
++
++  private URLConnection connect(URL url) throws Exception {
++    AuthenticatedURL.Token token = new AuthenticatedURL.Token();
++    AuthenticatedURL authUrl;
++    SSLFactory clientSslFactory;
++    URLConnection connection;
++    // If https is chosen, configures SSL client.
++    if (YarnConfiguration.useHttps(getConf())) {
++      clientSslFactory = new SSLFactory(SSLFactory.Mode.CLIENT, getConf());
++      clientSslFactory.init();
++      SSLSocketFactory sslSocktFact = clientSslFactory.createSSLSocketFactory();
++
++      authUrl =
++          new AuthenticatedURL(new KerberosAuthenticator(), clientSslFactory);
++      connection = authUrl.openConnection(url, token);
++      HttpsURLConnection httpsConn = (HttpsURLConnection) connection;
++      httpsConn.setSSLSocketFactory(sslSocktFact);
++    } else {
++      authUrl = new AuthenticatedURL(new KerberosAuthenticator());
++      connection = authUrl.openConnection(url, token);
++    }
++    connection.connect();
++    return connection;
++  }
++
+   String getHeader(QueueMetrics queueMetrics, NodesInformation nodes) {
+     StringBuilder ret = new StringBuilder();
+     String queue = "root";
+@@ -755,7 +840,10 @@ String getHeader(QueueMetrics queueMetrics, NodesInformation nodes) {
+       queue = StringUtils.join(queues, ",");
+     }
+     long now = Time.now();
+-    long uptime = now - rmStartTime;
++    long uptime = 0L;
++    if (rmStartTime != -1) {
++      uptime = now - rmStartTime;
++    }
+     long days = TimeUnit.MILLISECONDS.toDays(uptime);
+     long hours =
+         TimeUnit.MILLISECONDS.toHours(uptime)
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/cli/TestTopCLI.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/cli/TestTopCLI.java
+new file mode 100644
+index 0000000..706400f
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/cli/TestTopCLI.java
+@@ -0,0 +1,106 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.client.cli;
++
++import java.io.IOException;
++import java.net.URL;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.junit.AfterClass;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Test class for TopCli.
++ *
++ */
++public class TestTopCLI {
++
++  private static final String RM1_NODE_ID = "rm1";
++  private static final String RM2_NODE_ID = "rm2";
++
++  private static List<String> dummyHostNames =
++      Arrays.asList("host1", "host2", "host3");
++
++  private static Map<String, String> savedStaticResolution = new HashMap<>();
++
++  @BeforeClass
++  public static void initializeDummyHostnameResolution() throws Exception {
++    String previousIpAddress;
++    for (String hostName : dummyHostNames) {
++      previousIpAddress = NetUtils.getStaticResolution(hostName);
++      if (null != previousIpAddress) {
++        savedStaticResolution.put(hostName, previousIpAddress);
++      }
++      NetUtils.addStaticResolution(hostName, "10.20.30.40");
++    }
++  }
++
++  @AfterClass
++  public static void restoreDummyHostnameResolution() throws Exception {
++    for (Map.Entry<String, String> hostnameToIpEntry : savedStaticResolution
++        .entrySet()) {
++      NetUtils.addStaticResolution(hostnameToIpEntry.getKey(),
++          hostnameToIpEntry.getValue());
++    }
++  }
++
++  @Test
++  public void testHAClusterInfoURL() throws IOException, InterruptedException {
++    TopCLI topcli = new TopCLI();
++    // http
++    String rm1Address = "host2:8088";
++    String rm2Address = "host3:8088";
++    Configuration conf = topcli.getConf();
++    conf.set(YarnConfiguration.RM_WEBAPP_ADDRESS + "." + RM1_NODE_ID,
++        rm1Address);
++    topcli.getConf().set(
++        YarnConfiguration.RM_WEBAPP_ADDRESS + "." + RM2_NODE_ID, rm2Address);
++    topcli.getConf().setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
++    topcli.getConf().set(YarnConfiguration.RM_HA_IDS,
++        RM1_NODE_ID + "," + RM2_NODE_ID);
++    URL clusterUrl = topcli.getHAClusterUrl(conf, RM1_NODE_ID);
++    Assert.assertEquals("http", clusterUrl.getProtocol());
++    Assert.assertEquals(rm1Address, clusterUrl.getAuthority());
++    clusterUrl = topcli.getHAClusterUrl(conf, RM2_NODE_ID);
++    Assert.assertEquals("http", clusterUrl.getProtocol());
++    Assert.assertEquals(rm2Address, clusterUrl.getAuthority());
++    // https
++    rm1Address = "host2:9088";
++    rm2Address = "host3:9088";
++    conf = topcli.getConf();
++    conf.set(YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS + "." + RM1_NODE_ID,
++        rm1Address);
++    conf.set(YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS + "." + RM2_NODE_ID,
++        rm2Address);
++    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
++    conf.set(YarnConfiguration.RM_HA_IDS, RM1_NODE_ID + "," + RM2_NODE_ID);
++    conf.set(YarnConfiguration.YARN_HTTP_POLICY_KEY, "HTTPS_ONLY");
++    clusterUrl = topcli.getHAClusterUrl(conf, RM1_NODE_ID);
++    Assert.assertEquals("https", clusterUrl.getProtocol());
++    Assert.assertEquals(rm1Address, clusterUrl.getAuthority());
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/util/WebAppUtils.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/util/WebAppUtils.java
+index 9a21e6a..7d16a2d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/util/WebAppUtils.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/webapp/util/WebAppUtils.java
+@@ -177,32 +177,32 @@ public static String getResolvedRMWebAppURLWithoutScheme(Configuration conf,
+ 
+   public static String getResolvedRemoteRMWebAppURLWithoutScheme(Configuration conf,
+       Policy httpPolicy) {
+-    InetSocketAddress address = null;
+     String rmId = null;
+     if (HAUtil.isHAEnabled(conf)) {
+       // If HA enabled, pick one of the RM-IDs and rely on redirect to go to
+       // the Active RM
+       rmId = (String) HAUtil.getRMHAIds(conf).toArray()[0];
+     }
++    return getResolvedRemoteRMWebAppURLWithoutScheme(conf, httpPolicy, rmId);
++  }
++
++  public static String getResolvedRemoteRMWebAppURLWithoutScheme(
++      Configuration conf, Policy httpPolicy, String rmId) {
++    InetSocketAddress address = null;
+ 
+     if (httpPolicy == Policy.HTTPS_ONLY) {
+-      address =
+-          conf.getSocketAddr(
+-              rmId == null
+-                  ? YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS
+-                  : HAUtil.addSuffix(
+-                  YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS, rmId),
+-              YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_ADDRESS,
+-              YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_PORT);
++      address = conf.getSocketAddr(
++          rmId == null ? YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS
++              : HAUtil.addSuffix(YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS,
++                  rmId),
++          YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_ADDRESS,
++          YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_PORT);
+     } else {
+-      address =
+-          conf.getSocketAddr(
+-              rmId == null
+-                  ? YarnConfiguration.RM_WEBAPP_ADDRESS
+-                  : HAUtil.addSuffix(
+-                  YarnConfiguration.RM_WEBAPP_ADDRESS, rmId),
+-              YarnConfiguration.DEFAULT_RM_WEBAPP_ADDRESS,
+-              YarnConfiguration.DEFAULT_RM_WEBAPP_PORT);
++      address = conf.getSocketAddr(
++          rmId == null ? YarnConfiguration.RM_WEBAPP_ADDRESS
++              : HAUtil.addSuffix(YarnConfiguration.RM_WEBAPP_ADDRESS, rmId),
++          YarnConfiguration.DEFAULT_RM_WEBAPP_ADDRESS,
++          YarnConfiguration.DEFAULT_RM_WEBAPP_PORT);
+     }
+     return getResolvedAddress(address);
+   }
+-- 
+1.7.9.5
+

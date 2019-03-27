@@ -1,0 +1,1790 @@
+From ff85afaa2ded635357cbfb09bf2aa3ec9d61d121 Mon Sep 17 00:00:00 2001
+From: Andrew Wang <wang@apache.org>
+Date: Wed, 17 Jun 2015 08:05:44 -0700
+Subject: [PATCH 1721/2848] HDFS-8608. Merge HDFS-7912 to trunk and branch-2
+ (track BlockInfo instead of Block in
+ UnderReplicatedBlocks and
+ PendingReplicationBlocks). Contributed by Zhe
+ Zhang.
+
+(cherry picked from commit 6e3fcffe291faec40fa9214f4880a35a952836c4)
+
+Change-Id: I86f202ec3401b16d9d115f9f8bba31a6dbe3c5df
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |   82 ++++++++++----------
+ .../blockmanagement/PendingReplicationBlocks.java  |   51 ++++++------
+ .../blockmanagement/UnderReplicatedBlocks.java     |   66 ++++++++--------
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    4 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   23 +++---
+ .../apache/hadoop/hdfs/server/namenode/INode.java  |   67 ++++++++--------
+ .../hadoop/hdfs/server/namenode/INodeFile.java     |   10 +--
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |   60 +++++++-------
+ .../hadoop/hdfs/server/namenode/SafeMode.java      |    4 +-
+ .../blockmanagement/BlockManagerTestUtil.java      |    5 +-
+ .../server/blockmanagement/TestBlockManager.java   |    8 +-
+ .../hdfs/server/blockmanagement/TestNodeCount.java |    3 +-
+ .../blockmanagement/TestOverReplicatedBlocks.java  |    5 +-
+ .../blockmanagement/TestPendingReplication.java    |   26 ++++---
+ .../blockmanagement/TestRBWBlockInvalidation.java  |    4 +-
+ .../blockmanagement/TestReplicationPolicy.java     |   53 +++++++++----
+ .../TestUnderReplicatedBlockQueues.java            |   16 ++--
+ .../server/datanode/TestReadOnlySharedStorage.java |   11 ++-
+ .../server/namenode/TestProcessCorruptBlocks.java  |    5 +-
+ 19 files changed, 278 insertions(+), 225 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 3a5e767..862cf83 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -126,7 +126,7 @@
+   private final DatanodeManager datanodeManager;
+   private final HeartbeatManager heartbeatManager;
+   private final BlockTokenSecretManager blockTokenSecretManager;
+-  
++
+   private final PendingDataNodeMessages pendingDNMessages =
+     new PendingDataNodeMessages();
+ 
+@@ -292,7 +292,7 @@ public int getPendingDataNodeMessageCount() {
+ 
+   /** Check whether name system is running before terminating */
+   private boolean checkNSRunning = true;
+-  
++
+   public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+       final Configuration conf) throws IOException {
+     this.namesystem = namesystem;
+@@ -309,7 +309,7 @@ public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+     blocksMap = new BlocksMap(
+         LightWeightGSet.computeCapacity(2.0, "BlocksMap"));
+     blockplacement = BlockPlacementPolicy.getInstance(
+-        conf, stats, datanodeManager.getNetworkTopology(), 
++        conf, stats, datanodeManager.getNetworkTopology(),
+         datanodeManager.getHost2DatanodeMap());
+     storagePolicySuite = BlockStoragePolicySuite.createDefaultSuite();
+     pendingReplications = new PendingReplicationBlocks(conf.getInt(
+@@ -623,7 +623,7 @@ public int getMaxReplicationStreams() {
+   /**
+    * @return true if the block has minimum replicas
+    */
+-  public boolean checkMinReplication(Block block) {
++  public boolean checkMinReplication(BlockInfo block) {
+     return (countNodes(block).liveReplicas() >= minReplication);
+   }
+ 
+@@ -1360,7 +1360,7 @@ int computeInvalidateWork(int nodesToProcess) {
+    * @return number of blocks scheduled for replication during this iteration.
+    */
+   int computeReplicationWork(int blocksToProcess) {
+-    List<List<Block>> blocksToReplicate = null;
++    List<List<BlockInfo>> blocksToReplicate = null;
+     namesystem.writeLock();
+     try {
+       // Choose the blocks to be replicated
+@@ -1378,7 +1378,7 @@ int computeReplicationWork(int blocksToProcess) {
+    * @return the number of blocks scheduled for replication
+    */
+   @VisibleForTesting
+-  int computeReplicationWorkForBlocks(List<List<Block>> blocksToReplicate) {
++  int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+     int requiredReplication, numEffectiveReplicas;
+     List<DatanodeDescriptor> containingNodes;
+     DatanodeDescriptor srcNode;
+@@ -1392,7 +1392,7 @@ int computeReplicationWorkForBlocks(List<List<Block>> blocksToReplicate) {
+     try {
+       synchronized (neededReplications) {
+         for (int priority = 0; priority < blocksToReplicate.size(); priority++) {
+-          for (Block block : blocksToReplicate.get(priority)) {
++          for (BlockInfo block : blocksToReplicate.get(priority)) {
+             // block should belong to a file
+             bc = blocksMap.getBlockCollection(block);
+             // abandoned block or block reopened for append
+@@ -1476,7 +1476,7 @@ int computeReplicationWorkForBlocks(List<List<Block>> blocksToReplicate) {
+         }
+ 
+         synchronized (neededReplications) {
+-          Block block = rw.block;
++          BlockInfo block = rw.block;
+           int priority = rw.priority;
+           // Recheck since global lock was released
+           // block should belong to a file
+@@ -1738,7 +1738,7 @@ else if (excessBlocks != null && excessBlocks.contains(block)) {
+    * and put them back into the neededReplication queue
+    */
+   private void processPendingReplications() {
+-    Block[] timedOutItems = pendingReplications.getTimedOutBlocks();
++    BlockInfo[] timedOutItems = pendingReplications.getTimedOutBlocks();
+     if (timedOutItems != null) {
+       namesystem.writeLock();
+       try {
+@@ -1798,7 +1798,7 @@ public long requestBlockReportLeaseId(DatanodeRegistration nodeReg) {
+     final Block reportedBlock;
+     final ReplicaState reportedState;
+     
+-    StatefulBlockInfo(BlockInfoUnderConstruction storedBlock, 
++    StatefulBlockInfo(BlockInfoUnderConstruction storedBlock,
+         Block reportedBlock, ReplicaState reportedState) {
+       this.storedBlock = storedBlock;
+       this.reportedBlock = reportedBlock;
+@@ -2127,7 +2127,7 @@ void rescanPostponedMisreplicatedBlocks() {
+    * Mark block replicas as corrupt except those on the storages in 
+    * newStorages list.
+    */
+-  public void markBlockReplicasAsCorrupt(BlockInfo block, 
++  public void markBlockReplicasAsCorrupt(BlockInfo block,
+       long oldGenerationStamp, long oldNumBytes, 
+       DatanodeStorageInfo[] newStorages) throws IOException {
+     assert namesystem.hasWriteLock();
+@@ -2183,7 +2183,7 @@ private void processFirstBlockReport(
+ 
+     for (BlockReportReplica iblk : report) {
+       ReplicaState reportedState = iblk.getState();
+-      
++
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("Initial report of block " + iblk.getBlockName()
+             + " on " + storageInfo.getDatanodeDescriptor() + " size " +
+@@ -2442,7 +2442,7 @@ public void processAllPendingDNMessages() throws IOException {
+    */
+   private BlockToMarkCorrupt checkReplicaCorrupt(
+       Block reported, ReplicaState reportedState, 
+-      BlockInfo storedBlock, BlockUCState ucState, 
++      BlockInfo storedBlock, BlockUCState ucState,
+       DatanodeDescriptor dn) {
+     switch(reportedState) {
+     case FINALIZED:
+@@ -2515,7 +2515,7 @@ private BlockToMarkCorrupt checkReplicaCorrupt(
+     }
+   }
+ 
+-  private boolean isBlockUnderConstruction(BlockInfo storedBlock, 
++  private boolean isBlockUnderConstruction(BlockInfo storedBlock,
+       BlockUCState ucState, ReplicaState reportedState) {
+     switch(reportedState) {
+     case FINALIZED:
+@@ -2933,13 +2933,13 @@ private MisReplicationResult processMisReplicatedBlock(BlockInfo block) {
+   
+   /** Set replication for the blocks. */
+   public void setReplication(final short oldRepl, final short newRepl,
+-      final String src, final Block... blocks) {
++      final String src, final BlockInfo... blocks) {
+     if (newRepl == oldRepl) {
+       return;
+     }
+ 
+     // update needReplication priority queues
+-    for(Block b : blocks) {
++    for(BlockInfo b : blocks) {
+       updateNeededReplications(b, 0, newRepl-oldRepl);
+     }
+       
+@@ -2947,7 +2947,7 @@ public void setReplication(final short oldRepl, final short newRepl,
+       // old replication > the new one; need to remove copies
+       LOG.info("Decreasing replication from " + oldRepl + " to " + newRepl
+           + " for " + src);
+-      for(Block b : blocks) {
++      for(BlockInfo b : blocks) {
+         processOverReplicatedBlock(b, newRepl, null, null);
+       }
+     } else { // replication factor is increased
+@@ -3069,7 +3069,8 @@ public void removeStoredBlock(Block block, DatanodeDescriptor node) {
+     blockLog.debug("BLOCK* removeStoredBlock: {} from {}", block, node);
+     assert (namesystem.hasWriteLock());
+     {
+-      if (!blocksMap.removeNode(block, node)) {
++      BlockInfo storedBlock = getStoredBlock(block);
++      if (storedBlock == null || !blocksMap.removeNode(storedBlock, node)) {
+         blockLog.debug("BLOCK* removeStoredBlock: {} has already been" +
+             " removed from node {}", block, node);
+         return;
+@@ -3096,8 +3097,8 @@ public void removeStoredBlock(Block block, DatanodeDescriptor node) {
+       //
+       BlockCollection bc = blocksMap.getBlockCollection(block);
+       if (bc != null) {
+-        namesystem.decrementSafeBlockCount(block);
+-        updateNeededReplications(block, -1, 0);
++        namesystem.decrementSafeBlockCount(storedBlock);
++        updateNeededReplications(storedBlock, -1, 0);
+       }
+ 
+       //
+@@ -3171,7 +3172,10 @@ void addBlock(DatanodeStorageInfo storageInfo, Block block, String delHint)
+     //
+     // Modify the blocks->datanode map and node's map.
+     //
+-    pendingReplications.decrement(block, node);
++    BlockInfo storedBlock = getStoredBlock(block);
++    if (storedBlock != null) {
++      pendingReplications.decrement(storedBlock, node);
++    }
+     processAndHandleReportedBlock(storageInfo, block, ReplicaState.FINALIZED,
+         delHintNode);
+   }
+@@ -3330,7 +3334,7 @@ private void processIncrementalBlockReport(final DatanodeDescriptor node,
+    * Return the number of nodes hosting a given block, grouped
+    * by the state of those replicas.
+    */
+-  public NumberReplicas countNodes(Block b) {
++  public NumberReplicas countNodes(BlockInfo b) {
+     int decommissioned = 0;
+     int live = 0;
+     int corrupt = 0;
+@@ -3360,12 +3364,12 @@ public NumberReplicas countNodes(Block b) {
+   }
+ 
+   /** 
+-   * Simpler, faster form of {@link #countNodes(Block)} that only returns the number
++   * Simpler, faster form of {@link #countNodes} that only returns the number
+    * of live nodes.  If in startup safemode (or its 30-sec extension period),
+    * then it gains speed by ignoring issues of excess replicas or nodes
+    * that are decommissioned or in process of becoming decommissioned.
+-   * If not in startup, then it calls {@link #countNodes(Block)} instead.
+-   * 
++   * If not in startup, then it calls {@link #countNodes} instead.
++   *
+    * @param b - the block being tested
+    * @return count of live nodes for this block
+    */
+@@ -3405,7 +3409,7 @@ private void logBlockReplicationInfo(Block block, DatanodeDescriptor srcNode,
+         + srcNode + ", Is current datanode decommissioning: "
+         + srcNode.isDecommissionInProgress());
+   }
+-  
++
+   /**
+    * On stopping decommission, check if the node has excess replicas.
+    * If there are any excess replicas, call processOverReplicatedBlock().
+@@ -3416,10 +3420,10 @@ void processOverReplicatedBlocksOnReCommission(
+     if (!namesystem.isPopulatingReplQueues()) {
+       return;
+     }
+-    final Iterator<? extends Block> it = srcNode.getBlockIterator();
++    final Iterator<BlockInfo> it = srcNode.getBlockIterator();
+     int numOverReplicated = 0;
+     while(it.hasNext()) {
+-      final Block block = it.next();
++      final BlockInfo block = it.next();
+       BlockCollection bc = blocksMap.getBlockCollection(block);
+       short expectedReplication = bc.getBlockReplication();
+       NumberReplicas num = countNodes(block);
+@@ -3444,9 +3448,9 @@ boolean isReplicationInProgress(DatanodeDescriptor srcNode) {
+     int underReplicatedBlocks = 0;
+     int decommissionOnlyReplicas = 0;
+     int underReplicatedInOpenFiles = 0;
+-    final Iterator<? extends Block> it = srcNode.getBlockIterator();
++    final Iterator<BlockInfo> it = srcNode.getBlockIterator();
+     while(it.hasNext()) {
+-      final Block block = it.next();
++      final BlockInfo block = it.next();
+       BlockCollection bc = blocksMap.getBlockCollection(block);
+ 
+       if (bc != null) {
+@@ -3463,7 +3467,7 @@ boolean isReplicationInProgress(DatanodeDescriptor srcNode) {
+               }
+               underReplicatedInOpenFiles++;
+             }
+-            
++
+             // Log info about one block for this node which needs replication
+             if (!status) {
+               status = true;
+@@ -3516,7 +3520,7 @@ boolean isReplicationInProgress(DatanodeDescriptor srcNode) {
+     }
+ 
+     srcNode.decommissioningStatus.set(underReplicatedBlocks,
+-        decommissionOnlyReplicas, 
++        decommissionOnlyReplicas,
+         underReplicatedInOpenFiles);
+     return status;
+   }
+@@ -3538,7 +3542,7 @@ public int getTotalBlocks() {
+     return blocksMap.size();
+   }
+ 
+-  public void removeBlock(Block block) {
++  public void removeBlock(BlockInfo block) {
+     assert namesystem.hasWriteLock();
+     // No need to ACK blocks that are being removed entirely
+     // from the namespace, since the removal of the associated
+@@ -3559,7 +3563,7 @@ public BlockInfo getStoredBlock(Block block) {
+   }
+ 
+   /** updates a block in under replication queue */
+-  private void updateNeededReplications(final Block block,
++  private void updateNeededReplications(final BlockInfo block,
+       final int curReplicasDelta, int expectedReplicasDelta) {
+     namesystem.writeLock();
+     try {
+@@ -3591,7 +3595,7 @@ private void updateNeededReplications(final Block block,
+    */
+   public void checkReplication(BlockCollection bc) {
+     final short expected = bc.getBlockReplication();
+-    for (Block block : bc.getBlocks()) {
++    for (BlockInfo block : bc.getBlocks()) {
+       final NumberReplicas n = countNodes(block);
+       if (isNeededReplication(block, expected, n.liveReplicas())) { 
+         neededReplications.add(block, n.liveReplicas(),
+@@ -3764,7 +3768,7 @@ public int getCapacity() {
+   /**
+    * Return an iterator over the set of blocks for which there are no replicas.
+    */
+-  public Iterator<Block> getCorruptReplicaBlockIterator() {
++  public Iterator<BlockInfo> getCorruptReplicaBlockIterator() {
+     return neededReplications.iterator(
+         UnderReplicatedBlocks.QUEUE_WITH_CORRUPT_BLOCKS);
+   }
+@@ -3955,11 +3959,11 @@ public void clearQueues() {
+     postponedMisreplicatedBlocks.clear();
+     postponedMisreplicatedBlocksCount.set(0);
+   };
+-  
++
+ 
+   private static class ReplicationWork {
+ 
+-    private final Block block;
++    private final BlockInfo block;
+     private final BlockCollection bc;
+ 
+     private final DatanodeDescriptor srcNode;
+@@ -3970,7 +3974,7 @@ public void clearQueues() {
+     private DatanodeStorageInfo targets[];
+     private final int priority;
+ 
+-    public ReplicationWork(Block block,
++    public ReplicationWork(BlockInfo block,
+         BlockCollection bc,
+         DatanodeDescriptor srcNode,
+         List<DatanodeDescriptor> containingNodes,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/PendingReplicationBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/PendingReplicationBlocks.java
+index 57c2962..1eb7ef5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/PendingReplicationBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/PendingReplicationBlocks.java
+@@ -23,6 +23,7 @@
+ import java.sql.Time;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -46,8 +47,8 @@
+ class PendingReplicationBlocks {
+   private static final Logger LOG = BlockManager.LOG;
+ 
+-  private final Map<Block, PendingBlockInfo> pendingReplications;
+-  private final ArrayList<Block> timedOutItems;
++  private final Map<BlockInfo, PendingBlockInfo> pendingReplications;
++  private final ArrayList<BlockInfo> timedOutItems;
+   Daemon timerThread = null;
+   private volatile boolean fsRunning = true;
+ 
+@@ -62,8 +63,8 @@
+     if ( timeoutPeriod > 0 ) {
+       this.timeout = timeoutPeriod;
+     }
+-    pendingReplications = new HashMap<Block, PendingBlockInfo>();
+-    timedOutItems = new ArrayList<Block>();
++    pendingReplications = new HashMap<>();
++    timedOutItems = new ArrayList<>();
+   }
+ 
+   void start() {
+@@ -76,7 +77,7 @@ void start() {
+    * @param block The corresponding block
+    * @param targets The DataNodes where replicas of the block should be placed
+    */
+-  void increment(Block block, DatanodeDescriptor[] targets) {
++  void increment(BlockInfo block, DatanodeDescriptor[] targets) {
+     synchronized (pendingReplications) {
+       PendingBlockInfo found = pendingReplications.get(block);
+       if (found == null) {
+@@ -93,9 +94,9 @@ void increment(Block block, DatanodeDescriptor[] targets) {
+    * Decrement the number of pending replication requests
+    * for this block.
+    * 
+-   * @param The DataNode that finishes the replication
++   * @param dn The DataNode that finishes the replication
+    */
+-  void decrement(Block block, DatanodeDescriptor dn) {
++  void decrement(BlockInfo block, DatanodeDescriptor dn) {
+     synchronized (pendingReplications) {
+       PendingBlockInfo found = pendingReplications.get(block);
+       if (found != null) {
+@@ -115,7 +116,7 @@ void decrement(Block block, DatanodeDescriptor dn) {
+    * @param block The given block whose pending replication requests need to be
+    *              removed
+    */
+-  void remove(Block block) {
++  void remove(BlockInfo block) {
+     synchronized (pendingReplications) {
+       pendingReplications.remove(block);
+     }
+@@ -138,7 +139,7 @@ int size() {
+   /**
+    * How many copies of this block is pending replication?
+    */
+-  int getNumReplicas(Block block) {
++  int getNumReplicas(BlockInfo block) {
+     synchronized (pendingReplications) {
+       PendingBlockInfo found = pendingReplications.get(block);
+       if (found != null) {
+@@ -153,13 +154,13 @@ int getNumReplicas(Block block) {
+    * replication requests. Returns null if no blocks have
+    * timed out.
+    */
+-  Block[] getTimedOutBlocks() {
++  BlockInfo[] getTimedOutBlocks() {
+     synchronized (timedOutItems) {
+       if (timedOutItems.size() <= 0) {
+         return null;
+       }
+-      Block[] blockList = timedOutItems.toArray(
+-          new Block[timedOutItems.size()]);
++      BlockInfo[] blockList = timedOutItems.toArray(
++          new BlockInfo[timedOutItems.size()]);
+       timedOutItems.clear();
+       return blockList;
+     }
+@@ -179,7 +180,7 @@ int getNumReplicas(Block block) {
+     PendingBlockInfo(DatanodeDescriptor[] targets) {
+       this.timeStamp = now();
+       this.targets = targets == null ? new ArrayList<DatanodeDescriptor>()
+-          : new ArrayList<DatanodeDescriptor>(Arrays.asList(targets));
++          : new ArrayList<>(Arrays.asList(targets));
+     }
+ 
+     long getTimeStamp() {
+@@ -192,9 +193,7 @@ void setTimeStamp() {
+ 
+     void incrementReplicas(DatanodeDescriptor... newTargets) {
+       if (newTargets != null) {
+-        for (DatanodeDescriptor dn : newTargets) {
+-          targets.add(dn);
+-        }
++        Collections.addAll(targets, newTargets);
+       }
+     }
+ 
+@@ -232,17 +231,17 @@ public void run() {
+      */
+     void pendingReplicationCheck() {
+       synchronized (pendingReplications) {
+-        Iterator<Map.Entry<Block, PendingBlockInfo>> iter =
++        Iterator<Map.Entry<BlockInfo, PendingBlockInfo>> iter =
+                                     pendingReplications.entrySet().iterator();
+         long now = now();
+         if(LOG.isDebugEnabled()) {
+           LOG.debug("PendingReplicationMonitor checking Q");
+         }
+         while (iter.hasNext()) {
+-          Map.Entry<Block, PendingBlockInfo> entry = iter.next();
++          Map.Entry<BlockInfo, PendingBlockInfo> entry = iter.next();
+           PendingBlockInfo pendingBlock = entry.getValue();
+           if (now > pendingBlock.getTimeStamp() + timeout) {
+-            Block block = entry.getKey();
++            BlockInfo block = entry.getKey();
+             synchronized (timedOutItems) {
+               timedOutItems.add(block);
+             }
+@@ -275,16 +274,14 @@ void metaSave(PrintWriter out) {
+     synchronized (pendingReplications) {
+       out.println("Metasave: Blocks being replicated: " +
+                   pendingReplications.size());
+-      Iterator<Map.Entry<Block, PendingBlockInfo>> iter =
+-                                  pendingReplications.entrySet().iterator();
+-      while (iter.hasNext()) {
+-        Map.Entry<Block, PendingBlockInfo> entry = iter.next();
++      for (Map.Entry<BlockInfo, PendingBlockInfo> entry :
++          pendingReplications.entrySet()) {
+         PendingBlockInfo pendingBlock = entry.getValue();
+         Block block = entry.getKey();
+-        out.println(block + 
+-                    " StartTime: " + new Time(pendingBlock.timeStamp) +
+-                    " NumReplicaInProgress: " + 
+-                    pendingBlock.getNumReplicas());
++        out.println(block +
++            " StartTime: " + new Time(pendingBlock.timeStamp) +
++            " NumReplicaInProgress: " +
++            pendingBlock.getNumReplicas());
+       }
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/UnderReplicatedBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/UnderReplicatedBlocks.java
+index 1cc42da..85909c2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/UnderReplicatedBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/UnderReplicatedBlocks.java
+@@ -39,7 +39,7 @@
+  *
+  * <p/>
+  * The policy for choosing which priority to give added blocks
+- * is implemented in {@link #getPriority(Block, int, int, int)}.
++ * is implemented in {@link #getPriority(int, int, int)}.
+  * </p>
+  * <p>The queue order is as follows:</p>
+  * <ol>
+@@ -66,7 +66,7 @@
+  *   blocks that are not corrupt higher priority.</li>
+  * </ol>
+  */
+-class UnderReplicatedBlocks implements Iterable<Block> {
++class UnderReplicatedBlocks implements Iterable<BlockInfo> {
+   /** The total number of queues : {@value} */
+   static final int LEVEL = 5;
+   /** The queue with the highest priority: {@value} */
+@@ -82,8 +82,8 @@
+   /** The queue for corrupt blocks: {@value} */
+   static final int QUEUE_WITH_CORRUPT_BLOCKS = 4;
+   /** the queues themselves */
+-  private final List<LightWeightLinkedSet<Block>> priorityQueues
+-      = new ArrayList<LightWeightLinkedSet<Block>>();
++  private final List<LightWeightLinkedSet<BlockInfo>> priorityQueues
++      = new ArrayList<LightWeightLinkedSet<BlockInfo>>(LEVEL);
+ 
+   /** Stores the replication index for each priority */
+   private Map<Integer, Integer> priorityToReplIdx = new HashMap<Integer, Integer>(LEVEL);
+@@ -93,7 +93,7 @@
+   /** Create an object. */
+   UnderReplicatedBlocks() {
+     for (int i = 0; i < LEVEL; i++) {
+-      priorityQueues.add(new LightWeightLinkedSet<Block>());
++      priorityQueues.add(new LightWeightLinkedSet<BlockInfo>());
+       priorityToReplIdx.put(i, 0);
+     }
+   }
+@@ -139,8 +139,8 @@ synchronized int getCorruptReplOneBlockSize() {
+   }
+ 
+   /** Check if a block is in the neededReplication queue */
+-  synchronized boolean contains(Block block) {
+-    for(LightWeightLinkedSet<Block> set : priorityQueues) {
++  synchronized boolean contains(BlockInfo block) {
++    for(LightWeightLinkedSet<BlockInfo> set : priorityQueues) {
+       if (set.contains(block)) {
+         return true;
+       }
+@@ -149,13 +149,11 @@ synchronized boolean contains(Block block) {
+   }
+ 
+   /** Return the priority of a block
+-   * @param block a under replicated block
+    * @param curReplicas current number of replicas of the block
+    * @param expectedReplicas expected number of replicas of the block
+    * @return the priority for the blocks, between 0 and ({@link #LEVEL}-1)
+    */
+-  private int getPriority(Block block,
+-                          int curReplicas, 
++  private int getPriority(int curReplicas,
+                           int decommissionedReplicas,
+                           int expectedReplicas) {
+     assert curReplicas >= 0 : "Negative replicas!";
+@@ -191,12 +189,12 @@ private int getPriority(Block block,
+    * @param expectedReplicas expected number of replicas of the block
+    * @return true if the block was added to a queue.
+    */
+-  synchronized boolean add(Block block,
+-                           int curReplicas, 
++  synchronized boolean add(BlockInfo block,
++                           int curReplicas,
+                            int decomissionedReplicas,
+                            int expectedReplicas) {
+     assert curReplicas >= 0 : "Negative replicas!";
+-    int priLevel = getPriority(block, curReplicas, decomissionedReplicas,
++    int priLevel = getPriority(curReplicas, decomissionedReplicas,
+                                expectedReplicas);
+     if(priorityQueues.get(priLevel).add(block)) {
+       if (priLevel == QUEUE_WITH_CORRUPT_BLOCKS &&
+@@ -215,11 +213,11 @@ synchronized boolean add(Block block,
+   }
+ 
+   /** remove a block from a under replication queue */
+-  synchronized boolean remove(Block block, 
+-                              int oldReplicas, 
++  synchronized boolean remove(BlockInfo block,
++                              int oldReplicas,
+                               int decommissionedReplicas,
+                               int oldExpectedReplicas) {
+-    int priLevel = getPriority(block, oldReplicas, 
++    int priLevel = getPriority(oldReplicas,
+                                decommissionedReplicas,
+                                oldExpectedReplicas);
+     boolean removedBlock = remove(block, priLevel);
+@@ -249,8 +247,8 @@ synchronized boolean remove(Block block,
+    * @param priLevel expected privilege level
+    * @return true if the block was found and removed from one of the priority queues
+    */
+-  boolean remove(Block block, int priLevel) {
+-    if(priLevel >= 0 && priLevel < LEVEL 
++  boolean remove(BlockInfo block, int priLevel) {
++    if(priLevel >= 0 && priLevel < LEVEL
+         && priorityQueues.get(priLevel).remove(block)) {
+       NameNode.blockStateChangeLog.debug(
+         "BLOCK* NameSystem.UnderReplicationBlock.remove: Removing block {}" +
+@@ -287,14 +285,16 @@ boolean remove(Block block, int priLevel) {
+    * @param curReplicasDelta the change in the replicate count from before
+    * @param expectedReplicasDelta the change in the expected replica count from before
+    */
+-  synchronized void update(Block block, int curReplicas,
++  synchronized void update(BlockInfo block, int curReplicas,
+                            int decommissionedReplicas,
+                            int curExpectedReplicas,
+                            int curReplicasDelta, int expectedReplicasDelta) {
+     int oldReplicas = curReplicas-curReplicasDelta;
+     int oldExpectedReplicas = curExpectedReplicas-expectedReplicasDelta;
+-    int curPri = getPriority(block, curReplicas, decommissionedReplicas, curExpectedReplicas);
+-    int oldPri = getPriority(block, oldReplicas, decommissionedReplicas, oldExpectedReplicas);
++    int curPri = getPriority(curReplicas, decommissionedReplicas,
++        curExpectedReplicas);
++    int oldPri = getPriority(oldReplicas, decommissionedReplicas,
++        oldExpectedReplicas);
+     if(NameNode.stateChangeLog.isDebugEnabled()) {
+       NameNode.stateChangeLog.debug("UnderReplicationBlocks.update " + 
+         block +
+@@ -337,17 +337,17 @@ synchronized void update(Block block, int curReplicas,
+    * all priority lists and find the elements after replication index. Once the
+    * last priority lists reaches to end, all replication indexes will be set to
+    * 0 and start from 1st priority list to fulfill the blockToProces count.
+-   * 
++   *
+    * @param blocksToProcess - number of blocks to fetch from underReplicated blocks.
+    * @return Return a list of block lists to be replicated. The block list index
+    *         represents its replication priority.
+    */
+-  public synchronized List<List<Block>> chooseUnderReplicatedBlocks(
++  public synchronized List<List<BlockInfo>> chooseUnderReplicatedBlocks(
+       int blocksToProcess) {
+     // initialize data structure for the return value
+-    List<List<Block>> blocksToReplicate = new ArrayList<List<Block>>(LEVEL);
++    List<List<BlockInfo>> blocksToReplicate = new ArrayList<>(LEVEL);
+     for (int i = 0; i < LEVEL; i++) {
+-      blocksToReplicate.add(new ArrayList<Block>());
++      blocksToReplicate.add(new ArrayList<BlockInfo>());
+     }
+ 
+     if (size() == 0) { // There are no blocks to collect.
+@@ -359,7 +359,7 @@ synchronized void update(Block block, int curReplicas,
+       // Go through all blocks that need replications with current priority.
+       BlockIterator neededReplicationsIterator = iterator(priority);
+       Integer replIndex = priorityToReplIdx.get(priority);
+-      
++
+       // skip to the first unprocessed block, which is at replIndex
+       for (int i = 0; i < replIndex && neededReplicationsIterator.hasNext(); i++) {
+         neededReplicationsIterator.next();
+@@ -374,7 +374,7 @@ synchronized void update(Block block, int curReplicas,
+       // Loop through all remaining blocks in the list.
+       while (blockCount < blocksToProcess
+           && neededReplicationsIterator.hasNext()) {
+-        Block block = neededReplicationsIterator.next();
++        BlockInfo block = neededReplicationsIterator.next();
+         blocksToReplicate.get(priority).add(block);
+         replIndex++;
+         blockCount++;
+@@ -389,7 +389,7 @@ synchronized void update(Block block, int curReplicas,
+         }
+         break;
+       }
+-      priorityToReplIdx.put(priority, replIndex); 
++      priorityToReplIdx.put(priority, replIndex);
+     }
+     return blocksToReplicate;
+   }
+@@ -408,10 +408,10 @@ public synchronized BlockIterator iterator() {
+   /**
+    * An iterator over blocks.
+    */
+-  class BlockIterator implements Iterator<Block> {
++  class BlockIterator implements Iterator<BlockInfo> {
+     private int level;
+     private boolean isIteratorForLevel = false;
+-    private final List<Iterator<Block>> iterators = new ArrayList<Iterator<Block>>();
++    private final List<Iterator<BlockInfo>> iterators = new ArrayList<>();
+ 
+     /**
+      * Construct an iterator over all queues.
+@@ -443,7 +443,7 @@ private void update() {
+     }
+ 
+     @Override
+-    public Block next() {
++    public BlockInfo next() {
+       if (isIteratorForLevel) {
+         return iterators.get(0).next();
+       }
+@@ -476,11 +476,11 @@ int getPriority() {
+ 
+   /**
+    * This method is to decrement the replication index for the given priority
+-   * 
++   *
+    * @param priority  - int priority level
+    */
+   public void decrementReplicationIndex(int priority) {
+     Integer replIdx = priorityToReplIdx.get(priority);
+-    priorityToReplIdx.put(priority, --replIdx); 
++    priorityToReplIdx.put(priority, --replIdx);
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 69745b4..b01ab81 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -991,7 +991,7 @@ void updateQuotasInSourceTree() throws QuotaExceededException {
+    * @throws QuotaExceededException
+    * @throws SnapshotAccessControlException 
+    */
+-  Block[] setReplication(String src, short replication, short[] blockRepls)
++  BlockInfo[] setReplication(String src, short replication, short[] blockRepls)
+       throws QuotaExceededException, UnresolvedLinkException,
+       SnapshotAccessControlException {
+     writeLock();
+@@ -1002,7 +1002,7 @@ void updateQuotasInSourceTree() throws QuotaExceededException {
+     }
+   }
+ 
+-  Block[] unprotectedSetReplication(String src, short replication,
++  BlockInfo[] unprotectedSetReplication(String src, short replication,
+       short[] blockRepls) throws QuotaExceededException,
+       UnresolvedLinkException, SnapshotAccessControlException {
+     assert hasWriteLock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 88eea8f..aaed0cf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -2373,7 +2373,7 @@ private boolean setReplicationInt(final String srcArg,
+       }
+ 
+       final short[] blockRepls = new short[2]; // 0: old, 1: new
+-      final Block[] blocks = dir.setReplication(src, replication, blockRepls);
++      final BlockInfo[] blocks = dir.setReplication(src, replication, blockRepls);
+       isFile = blocks != null;
+       if (isFile) {
+         getEditLog().logSetReplication(src, replication);
+@@ -4124,8 +4124,8 @@ private boolean deleteInternal(String src, boolean recursive,
+    *          of blocks that need to be removed from blocksMap
+    */
+   void removeBlocks(BlocksMapUpdateInfo blocks) {
+-    List<Block> toDeleteList = blocks.getToDeleteList();
+-    Iterator<Block> iter = toDeleteList.iterator();
++    List<BlockInfo> toDeleteList = blocks.getToDeleteList();
++    Iterator<BlockInfo> iter = toDeleteList.iterator();
+     while (iter.hasNext()) {
+       writeLock();
+       try {
+@@ -4186,12 +4186,11 @@ void removeBlocksAndUpdateSafemodeTotal(BlocksMapUpdateInfo blocks) {
+     boolean trackBlockCounts = isSafeModeTrackingBlocks();
+     int numRemovedComplete = 0, numRemovedSafe = 0;
+ 
+-    for (Block b : blocks.getToDeleteList()) {
++    for (BlockInfo b : blocks.getToDeleteList()) {
+       if (trackBlockCounts) {
+-        BlockInfo bi = getStoredBlock(b);
+-        if (bi.isComplete()) {
++        if (b.isComplete()) {
+           numRemovedComplete++;
+-          if (bi.numNodes() >= blockManager.minReplication) {
++          if (blockManager.checkMinReplication(b)) {
+             numRemovedSafe++;
+           }
+         }
+@@ -5363,7 +5362,8 @@ private void clearCorruptLazyPersistFiles()
+       writeLock();
+ 
+       try {
+-        final Iterator<Block> it = blockManager.getCorruptReplicaBlockIterator();
++        final Iterator<BlockInfo> it =
++            blockManager.getCorruptReplicaBlockIterator();
+ 
+         while (it.hasNext()) {
+           Block b = it.next();
+@@ -6315,7 +6315,7 @@ public void incrementSafeBlockCount(int replication) {
+   }
+ 
+   @Override
+-  public void decrementSafeBlockCount(Block b) {
++  public void decrementSafeBlockCount(BlockInfo b) {
+     // safeMode is volatile, and may be set to null at any time
+     SafeModeInfo safeMode = this.safeMode;
+     if (safeMode == null) // mostly true
+@@ -7404,7 +7404,8 @@ public String toString() {
+       }
+       // print a limited # of corrupt files per call
+ 
+-      final Iterator<Block> blkIterator = blockManager.getCorruptReplicaBlockIterator();
++      final Iterator<BlockInfo> blkIterator =
++          blockManager.getCorruptReplicaBlockIterator();
+ 
+       int skip = getIntCookie(cookieTab[0]);
+       for (int i = 0; i < skip && blkIterator.hasNext(); i++) {
+@@ -7412,7 +7413,7 @@ public String toString() {
+       }
+ 
+       while (blkIterator.hasNext()) {
+-        Block blk = blkIterator.next();
++        BlockInfo blk = blkIterator.next();
+         final INode inode = (INode)blockManager.getBlockCollection(blk);
+         skip++;
+         if (inode != null && blockManager.countNodes(blk).liveReplicas() == 0) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+index 0d93f65..512fefc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+@@ -17,11 +17,8 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+-import java.io.PrintStream;
+-import java.io.PrintWriter;
+-import java.io.StringWriter;
+-import java.util.List;
+-
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+@@ -29,10 +26,10 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
+ import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
+ import org.apache.hadoop.hdfs.server.namenode.INodeReference.DstReference;
+ import org.apache.hadoop.hdfs.server.namenode.INodeReference.WithName;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
+@@ -40,8 +37,10 @@
+ import org.apache.hadoop.util.ChunkedArrayList;
+ import org.apache.hadoop.util.StringUtils;
+ 
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.base.Preconditions;
++import java.io.PrintStream;
++import java.io.PrintWriter;
++import java.io.StringWriter;
++import java.util.List;
+ 
+ /**
+  * We keep an in-memory representation of the file/block hierarchy.
+@@ -49,7 +48,7 @@
+  * directory inodes.
+  */
+ @InterfaceAudience.Private
+-public abstract class INode implements INodeAttributes, Diff.Element<byte[]>, 
++public abstract class INode implements INodeAttributes, Diff.Element<byte[]>,
+     AuthorizationProvider.INodeAuthorizationInfo {
+   public static final Log LOG = LogFactory.getLog(INode.class);
+ 
+@@ -455,9 +454,9 @@ public INodeSymlink asSymlink() {
+    * 2.4 To clean {@link INodeDirectory} with snapshot: delete the corresponding 
+    * snapshot in its diff list. Recursively clean its children.
+    * </pre>
+-   * 
++   *
+    * @param snapshotId
+-   *          The id of the snapshot to delete. 
++   *          The id of the snapshot to delete.
+    *          {@link Snapshot#CURRENT_STATE_ID} means to delete the current
+    *          file/directory.
+    * @param priorSnapshotId
+@@ -468,21 +467,21 @@ public INodeSymlink asSymlink() {
+    *          blocks collected from the descents for further block
+    *          deletion/update will be added to the given map.
+    * @param removedINodes
+-   *          INodes collected from the descents for further cleaning up of 
++   *          INodes collected from the descents for further cleaning up of
+    *          inodeMap
+    * @return quota usage delta when deleting a snapshot
+    */
+   public abstract Quota.Counts cleanSubtree(final int snapshotId,
+       int priorSnapshotId, BlocksMapUpdateInfo collectedBlocks,
+       List<INode> removedINodes);
+-  
++
+   /**
+    * Destroy self and clear everything! If the INode is a file, this method
+    * collects its blocks for further block deletion. If the INode is a
+    * directory, the method goes down the subtree and collects blocks from the
+    * descents, and clears its parent/children references as well. The method
+    * also clears the diff list if the INode contains snapshot diff list.
+-   * 
++   *
+    * @param collectedBlocks
+    *          blocks collected from the descents for further block
+    *          deletion/update will be added to this map.
+@@ -521,12 +520,12 @@ public final ContentSummary computeAndConvertContentSummary(
+   public abstract ContentSummaryComputationContext computeContentSummary(
+       ContentSummaryComputationContext summary);
+ 
+-  
++
+   /**
+    * Check and add namespace/diskspace consumed to itself and the ancestors.
+    * @throws QuotaExceededException if quote is violated.
+    */
+-  public void addSpaceConsumed(long nsDelta, long dsDelta, boolean verify) 
++  public void addSpaceConsumed(long nsDelta, long dsDelta, boolean verify)
+       throws QuotaExceededException {
+     addSpaceConsumed2Parent(nsDelta, dsDelta, verify);
+   }
+@@ -535,7 +534,7 @@ public void addSpaceConsumed(long nsDelta, long dsDelta, boolean verify)
+    * Check and add namespace/diskspace consumed to itself and the ancestors.
+    * @throws QuotaExceededException if quote is violated.
+    */
+-  void addSpaceConsumed2Parent(long nsDelta, long dsDelta, boolean verify) 
++  void addSpaceConsumed2Parent(long nsDelta, long dsDelta, boolean verify)
+       throws QuotaExceededException {
+     if (parent != null) {
+       parent.addSpaceConsumed(nsDelta, dsDelta, verify);
+@@ -549,12 +548,12 @@ void addSpaceConsumed2Parent(long nsDelta, long dsDelta, boolean verify)
+   public Quota.Counts getQuotaCounts() {
+     return Quota.Counts.newInstance(-1, -1);
+   }
+-  
++
+   public final boolean isQuotaSet() {
+     final Quota.Counts q = getQuotaCounts();
+     return q.get(Quota.NAMESPACE) >= 0 || q.get(Quota.DISKSPACE) >= 0;
+   }
+-  
++
+   /**
+    * Count subtree {@link Quota#NAMESPACE} and {@link Quota#DISKSPACE} usages.
+    */
+@@ -582,7 +581,7 @@ public final boolean isQuotaSet() {
+    * creation time of the snapshot associated with the {@link WithName} node.
+    * We do not count in the size of the diff list.  
+    * <pre>
+-   * 
++   *
+    * @param counts The subtree counts for returning.
+    * @param useCache Whether to use cached quota usage. Note that 
+    *                 {@link WithName} node never uses cache for its subtree.
+@@ -599,7 +598,7 @@ public final boolean isQuotaSet() {
+       boolean useCache) {
+     return computeQuotaUsage(counts, useCache, Snapshot.CURRENT_STATE_ID);
+   }
+-  
++
+   /**
+    * @return null if the local name is null; otherwise, return the local name.
+    */
+@@ -842,7 +841,7 @@ public void dumpTreeRecursively(PrintWriter out, StringBuilder prefix,
+     out.print(getParentString());
+     out.print(", " + getPermissionStatus(snapshotId));
+   }
+-  
++
+   /**
+    * Information used for updating the blocksMap when deleting files.
+    */
+@@ -850,16 +849,16 @@ public void dumpTreeRecursively(PrintWriter out, StringBuilder prefix,
+     /**
+      * The list of blocks that need to be removed from blocksMap
+      */
+-    private final List<Block> toDeleteList;
+-    
++    private final List<BlockInfo> toDeleteList;
++
+     public BlocksMapUpdateInfo() {
+-      toDeleteList = new ChunkedArrayList<Block>();
++      toDeleteList = new ChunkedArrayList<BlockInfo>();
+     }
+     
+     /**
+      * @return The list of blocks that need to be removed from blocksMap
+      */
+-    public List<Block> getToDeleteList() {
++    public List<BlockInfo> getToDeleteList() {
+       return toDeleteList;
+     }
+     
+@@ -868,12 +867,16 @@ public BlocksMapUpdateInfo() {
+      * {@link BlocksMapUpdateInfo#toDeleteList}
+      * @param toDelete the to-be-deleted block
+      */
+-    public void addDeleteBlock(Block toDelete) {
+-      if (toDelete != null) {
+-        toDeleteList.add(toDelete);
+-      }
++    public void addDeleteBlock(BlockInfo toDelete) {
++      assert toDelete != null : "toDelete is null";
++      toDeleteList.add(toDelete);
+     }
+-    
++
++    public void removeDeleteBlock(BlockInfo block) {
++      assert block != null : "block is null";
++      toDeleteList.remove(block);
++    }
++
+     /**
+      * Clear {@link BlocksMapUpdateInfo#toDeleteList}
+      */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+index 003f159..c37101b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+@@ -322,7 +322,7 @@ public void recordModification(final int latestSnapshotId, boolean withBlocks) {
+       sf.getDiffs().saveSelf2Snapshot(latestSnapshotId, this, null);
+     }
+   }
+-  
++
+   public FileDiffList getDiffs() {
+     FileWithSnapshotFeature sf = this.getFileWithSnapshotFeature();
+     if (sf != null) {
+@@ -512,13 +512,13 @@ public void destroyAndCollectBlocks(BlocksMapUpdateInfo collectedBlocks,
+     setBlocks(BlockInfo.EMPTY_ARRAY);
+     clear();
+     removedINodes.add(this);
+-    
++
+     FileWithSnapshotFeature sf = getFileWithSnapshotFeature();
+     if (sf != null) {
+       sf.clearDiffs();
+     }
+   }
+-  
++
+   @Override
+   public String getName() {
+     // Get the full path name of this inode.
+@@ -540,7 +540,7 @@ public String getName() {
+         dsDelta = diskspaceConsumed();
+       } else if (last < lastSnapshotId) {
+         dsDelta = computeFileSize(true, false) * getFileReplication();
+-      } else {      
++      } else {
+         int sid = fileDiffList.getSnapshotById(lastSnapshotId);
+         dsDelta = diskspaceConsumed(sid);
+       }
+@@ -665,7 +665,7 @@ public final long diskspaceConsumed(int lastSnapshotId) {
+       return diskspaceConsumed();
+     }
+   }
+-  
++
+   /**
+    * Return the penultimate allocated block for this file.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 3b9f353..3c9cd74 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -107,7 +107,7 @@
+ @InterfaceAudience.Private
+ public class NamenodeFsck implements DataEncryptionKeyFactory {
+   public static final Log LOG = LogFactory.getLog(NameNode.class.getName());
+-  
++
+   // return string marking fsck status
+   public static final String CORRUPT_STATUS = "is CORRUPT";
+   public static final String HEALTHY_STATUS = "is HEALTHY";
+@@ -115,7 +115,7 @@
+   public static final String DECOMMISSIONED_STATUS = "is DECOMMISSIONED";
+   public static final String NONEXISTENT_STATUS = "does not exist";
+   public static final String FAILURE_STATUS = "FAILED";
+-  
++
+   private final NameNode namenode;
+   private final NetworkTopology networktopology;
+   private final int totalDatanodes;
+@@ -138,14 +138,14 @@
+    */
+   private boolean internalError = false;
+ 
+-  /** 
++  /**
+    * True if the user specified the -move option.
+    *
+    * Whe this option is in effect, we will copy salvaged blocks into the lost
+    * and found. */
+   private boolean doMove = false;
+ 
+-  /** 
++  /**
+    * True if the user specified the -delete option.
+    *
+    * Whe this option is in effect, we will delete corrupted files.
+@@ -180,7 +180,7 @@
+    * @param remoteAddress source address of the fsck request
+    */
+   NamenodeFsck(Configuration conf, NameNode namenode,
+-      NetworkTopology networktopology, 
++      NetworkTopology networktopology,
+       Map<String,String[]> pmap, PrintWriter out,
+       int totalDatanodes, short minReplication, InetAddress remoteAddress) {
+     this.conf = conf;
+@@ -244,7 +244,7 @@ public void blockIdCK(String blockId) {
+       }
+       BlockCollection bc = bm.getBlockCollection(blockInfo);
+       INode iNode = (INode) bc;
+-      NumberReplicas numberReplicas= bm.countNodes(block);
++      NumberReplicas numberReplicas= bm.countNodes(blockInfo);
+       out.println("Block Id: " + blockId);
+       out.println("Block belongs to: "+iNode.getFullPathName());
+       out.println("No. of Expected Replica: " + bc.getBlockReplication());
+@@ -339,7 +339,7 @@ public void fsck() {
+           listCorruptFileBlocks();
+           return;
+         }
+-        
++
+         Result res = new Result(conf);
+ 
+         check(path, file, res);
+@@ -360,7 +360,7 @@ public void fsck() {
+ 
+         // DFSck client scans for the string HEALTHY/CORRUPT to check the status
+         // of file system and return appropriate code. Changing the output
+-        // string might break testcases. Also note this must be the last line 
++        // string might break testcases. Also note this must be the last line
+         // of the report.
+         if (res.isHealthy()) {
+           out.print("\n\nThe filesystem under path '" + path + "' " + HEALTHY_STATUS);
+@@ -404,7 +404,7 @@ private void listCorruptFileBlocks() throws IOException {
+         + " CORRUPT files");
+     out.println();
+   }
+-  
++
+   @VisibleForTesting
+   void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+     String path = file.getFullName(parent);
+@@ -448,7 +448,7 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+       return;
+     }
+     long fileLen = file.getLen();
+-    // Get block locations without updating the file access time 
++    // Get block locations without updating the file access time
+     // and without block access tokens
+     LocatedBlocks blocks;
+     try {
+@@ -493,7 +493,9 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+       boolean isCorrupt = lBlk.isCorrupt();
+       String blkName = block.toString();
+       DatanodeInfo[] locs = lBlk.getLocations();
+-      NumberReplicas numberReplicas = namenode.getNamesystem().getBlockManager().countNodes(block.getLocalBlock());
++      NumberReplicas numberReplicas = namenode.getNamesystem()
++              .getBlockManager().countNodes(namenode.getNamesystem()
++                      .getBlockManager().getStoredBlock(block.getLocalBlock()));
+       int liveReplicas = numberReplicas.liveReplicas();
+       res.totalReplicas += liveReplicas;
+       short targetFileReplication = file.getReplication();
+@@ -506,7 +508,7 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+       if (isCorrupt) {
+         corrupt++;
+         res.corruptBlocks++;
+-        out.print("\n" + path + ": CORRUPT blockpool " + block.getBlockPoolId() + 
++        out.print("\n" + path + ": CORRUPT blockpool " + block.getBlockPoolId() +
+             " block " + block.getBlockName()+"\n");
+       }
+       if (liveReplicas >= minReplication)
+@@ -534,7 +536,7 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+             out.println();
+           out.print(path + ": ");
+         }
+-        out.println(" Replica placement policy is violated for " + 
++        out.println(" Replica placement policy is violated for " +
+                     block + ". " + blockPlacementStatus.getErrorDescription());
+       }
+       report.append(i + ". " + blkName + " len=" + block.getNumBytes());
+@@ -605,7 +607,7 @@ boolean hdfsPathExists(String path)
+       return false;
+     }
+   }
+-  
++
+   private void copyBlocksToLostFound(String parent, HdfsFileStatus file,
+         LocatedBlocks blocks) throws IOException {
+     final DFSClient dfs = new DFSClient(NameNode.getAddress(conf), conf);
+@@ -650,7 +652,7 @@ private void copyBlocksToLostFound(String parent, HdfsFileStatus file,
+           }
+           chain++;
+         }
+-        
++
+         // copy the block. It's a pity it's not abstracted from DFSInputStream ...
+         try {
+           copyBlock(dfs, lblock, fos);
+@@ -668,7 +670,7 @@ private void copyBlocksToLostFound(String parent, HdfsFileStatus file,
+         LOG.warn("Fsck: there were errors copying the remains of the " +
+           "corrupted file " + fullName + " to /lost+found");
+       } else {
+-        LOG.info("Fsck: copied the remains of the corrupted file " + 
++        LOG.info("Fsck: copied the remains of the corrupted file " +
+           fullName + " to /lost+found");
+       }
+     } catch (Exception e) {
+@@ -679,7 +681,7 @@ private void copyBlocksToLostFound(String parent, HdfsFileStatus file,
+       dfs.close();
+     }
+   }
+-      
++
+   /*
+    * XXX (ab) Bulk of this method is copied verbatim from {@link DFSClient}, which is
+    * bad. Both places should be refactored to provide a method to copy blocks
+@@ -690,12 +692,12 @@ private void copyBlock(final DFSClient dfs, LocatedBlock lblock,
+     int failures = 0;
+     InetSocketAddress targetAddr = null;
+     TreeSet<DatanodeInfo> deadNodes = new TreeSet<DatanodeInfo>();
+-    BlockReader blockReader = null; 
+-    ExtendedBlock block = lblock.getBlock(); 
++    BlockReader blockReader = null;
++    ExtendedBlock block = lblock.getBlock();
+ 
+     while (blockReader == null) {
+       DatanodeInfo chosenNode;
+-      
++
+       try {
+         chosenNode = bestNode(dfs, lblock.getLocations(), deadNodes);
+         targetAddr = NetUtils.createSocketAddr(chosenNode.getXferAddr());
+@@ -767,7 +769,7 @@ public Peer newConnectedPeer(InetSocketAddress addr,
+         bytesRead += cnt;
+       }
+       if ( bytesRead != block.getNumBytes() ) {
+-        throw new IOException("Recorded block size is " + block.getNumBytes() + 
++        throw new IOException("Recorded block size is " + block.getNumBytes() +
+                               ", but datanode returned " +bytesRead+" bytes");
+       }
+     } catch (Exception e) {
+@@ -804,12 +806,12 @@ private DatanodeInfo bestNode(DFSClient dfs, DatanodeInfo[] nodes,
+     } while (deadNodes.contains(chosenNode));
+     return chosenNode;
+   }
+-  
++
+   private void lostFoundInit(DFSClient dfs) {
+     lfInited = true;
+     try {
+       String lfName = "/lost+found";
+-      
++
+       final HdfsFileStatus lfStatus = dfs.getFileInfo(lfName);
+       if (lfStatus == null) { // not exists
+         lfInitedOk = dfs.mkdirs(lfName, null, true);
+@@ -859,32 +861,32 @@ private void lostFoundInit(DFSClient dfs) {
+     long totalReplicas = 0L;
+ 
+     final short replication;
+-    
++
+     Result(Configuration conf) {
+-      this.replication = (short)conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY, 
++      this.replication = (short)conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY,
+                                             DFSConfigKeys.DFS_REPLICATION_DEFAULT);
+     }
+-    
++
+     /**
+      * DFS is considered healthy if there are no missing blocks.
+      */
+     boolean isHealthy() {
+       return ((missingIds.size() == 0) && (corruptBlocks == 0));
+     }
+-    
++
+     /** Add a missing block name, plus its size. */
+     void addMissing(String id, long size) {
+       missingIds.add(id);
+       missingSize += size;
+     }
+-    
++
+     /** Return the actual replication factor. */
+     float getReplicationFactor() {
+       if (totalBlocks == 0)
+         return 0.0f;
+       return (float) (totalReplicas) / (float) totalBlocks;
+     }
+-    
++
+     @Override
+     public String toString() {
+       StringBuilder res = new StringBuilder();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SafeMode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SafeMode.java
+index 95fc06b..1428482 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SafeMode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SafeMode.java
+@@ -18,7 +18,7 @@
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+-import org.apache.hadoop.hdfs.protocol.Block;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ 
+ /** SafeMode related operations. */
+ @InterfaceAudience.Private
+@@ -49,5 +49,5 @@
+   public void incrementSafeBlockCount(int replication);
+ 
+   /** Decrement number of blocks that reached minimal replication. */
+-  public void decrementSafeBlockCount(Block b);
++  public void decrementSafeBlockCount(BlockInfo b);
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
+index fccd308..1be25ce 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManagerTestUtil.java
+@@ -68,9 +68,10 @@ public static void updateState(final BlockManager blockManager) {
+     final BlockManager bm = namesystem.getBlockManager();
+     namesystem.readLock();
+     try {
++      final BlockInfo storedBlock = bm.getStoredBlock(b);
+       return new int[]{getNumberOfRacks(bm, b),
+-          bm.countNodes(b).liveReplicas(),
+-          bm.neededReplications.contains(b) ? 1 : 0};
++          bm.countNodes(storedBlock).liveReplicas(),
++          bm.neededReplications.contains(storedBlock) ? 1 : 0};
+     } finally {
+       namesystem.readUnlock();
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+index dbd6df1..1d8ce60 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+@@ -523,14 +523,14 @@ private BlockInfo addBlockOnNodes(long blockId, List<DatanodeDescriptor> nodes)
+     return blockInfo;
+   }
+ 
+-  private DatanodeStorageInfo[] scheduleSingleReplication(Block block) {
++  private DatanodeStorageInfo[] scheduleSingleReplication(BlockInfo block) {
+     // list for priority 1
+-    List<Block> list_p1 = new ArrayList<Block>();
++    List<BlockInfo> list_p1 = new ArrayList<>();
+     list_p1.add(block);
+ 
+     // list of lists for each priority
+-    List<List<Block>> list_all = new ArrayList<List<Block>>();
+-    list_all.add(new ArrayList<Block>()); // for priority 0
++    List<List<BlockInfo>> list_all = new ArrayList<>();
++    list_all.add(new ArrayList<BlockInfo>()); // for priority 0
+     list_all.add(list_p1); // for priority 1
+ 
+     assertEquals("Block not initially pending replication", 0,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNodeCount.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNodeCount.java
+index b4226b3..f70ccff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNodeCount.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNodeCount.java
+@@ -172,10 +172,11 @@ void checkTimeout(String testLabel, long cycleTime) throws TimeoutException {
+ 
+   /* threadsafe read of the replication counts for this block */
+   NumberReplicas countNodes(Block block, FSNamesystem namesystem) {
++    BlockManager blockManager = namesystem.getBlockManager();
+     namesystem.readLock();
+     try {
+       lastBlock = block;
+-      lastNum = namesystem.getBlockManager().countNodes(block);
++      lastNum = blockManager.countNodes(blockManager.getStoredBlock(block));
+       return lastNum;
+     }
+     finally {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestOverReplicatedBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestOverReplicatedBlocks.java
+index 89f9987..a0141c5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestOverReplicatedBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestOverReplicatedBlocks.java
+@@ -116,7 +116,8 @@ public void testProcesOverReplicateBlock() throws Exception {
+ 
+           // corrupt one won't be chosen to be excess one
+           // without 4910 the number of live replicas would be 0: block gets lost
+-          assertEquals(1, bm.countNodes(block.getLocalBlock()).liveReplicas());
++          assertEquals(1, bm.countNodes(
++              bm.getStoredBlock(block.getLocalBlock())).liveReplicas());
+         }
+       } finally {
+         namesystem.writeUnlock();
+@@ -218,7 +219,7 @@ public void testInvalidateOverReplicatedBlock() throws Exception {
+       out.close();
+       ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, p);
+       assertEquals("Expected only one live replica for the block", 1, bm
+-          .countNodes(block.getLocalBlock()).liveReplicas());
++          .countNodes(bm.getStoredBlock(block.getLocalBlock())).liveReplicas());
+     } finally {
+       cluster.shutdown();
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestPendingReplication.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestPendingReplication.java
+index efe1976..204a71c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestPendingReplication.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestPendingReplication.java
+@@ -53,6 +53,11 @@
+   private static final int DFS_REPLICATION_INTERVAL = 1;
+   // Number of datanodes in the cluster
+   private static final int DATANODE_COUNT = 5;
++
++  private BlockInfo genBlockInfo(long id, long length, long gs) {
++    return new BlockInfo(new Block(id, length, gs), (short) DATANODE_COUNT);
++  }
++
+   @Test
+   public void testPendingReplication() {
+     PendingReplicationBlocks pendingReplications;
+@@ -63,7 +68,7 @@ public void testPendingReplication() {
+     //
+     DatanodeStorageInfo[] storages = DFSTestUtil.createDatanodeStorageInfos(10);
+     for (int i = 0; i < storages.length; i++) {
+-      Block block = new Block(i, i, 0);
++      BlockInfo block = genBlockInfo(i, i, 0);
+       DatanodeStorageInfo[] targets = new DatanodeStorageInfo[i];
+       System.arraycopy(storages, 0, targets, 0, i);
+       pendingReplications.increment(block,
+@@ -76,7 +81,7 @@ public void testPendingReplication() {
+     //
+     // remove one item and reinsert it
+     //
+-    Block blk = new Block(8, 8, 0);
++    BlockInfo blk = genBlockInfo(8, 8, 0);
+     pendingReplications.decrement(blk, storages[7].getDatanodeDescriptor()); // removes one replica
+     assertEquals("pendingReplications.getNumReplicas ",
+                  7, pendingReplications.getNumReplicas(blk));
+@@ -96,7 +101,7 @@ public void testPendingReplication() {
+     // are sane.
+     //
+     for (int i = 0; i < 10; i++) {
+-      Block block = new Block(i, i, 0);
++      BlockInfo block = genBlockInfo(i, i, 0);
+       int numReplicas = pendingReplications.getNumReplicas(block);
+       assertTrue(numReplicas == i);
+     }
+@@ -115,7 +120,7 @@ public void testPendingReplication() {
+     }
+ 
+     for (int i = 10; i < 15; i++) {
+-      Block block = new Block(i, i, 0);
++      BlockInfo block = genBlockInfo(i, i, 0);
+       pendingReplications.increment(block,
+           DatanodeStorageInfo.toDatanodeDescriptors(
+               DFSTestUtil.createDatanodeStorageInfos(i)));
+@@ -180,7 +185,7 @@ public void testProcessPendingReplications() throws Exception {
+       block = new Block(1, 1, 0);
+       blockInfo = new BlockInfo(block, (short) 3);
+ 
+-      pendingReplications.increment(block,
++      pendingReplications.increment(blockInfo,
+           DatanodeStorageInfo.toDatanodeDescriptors(
+               DFSTestUtil.createDatanodeStorageInfos(1)));
+       BlockCollection bc = Mockito.mock(BlockCollection.class);
+@@ -195,7 +200,8 @@ public void testProcessPendingReplications() throws Exception {
+       // Add a second block to pendingReplications that has no
+       // corresponding entry in blocksmap
+       block = new Block(2, 2, 0);
+-      pendingReplications.increment(block,
++      blockInfo = new BlockInfo(block, (short) 3);
++      pendingReplications.increment(blockInfo,
+           DatanodeStorageInfo.toDatanodeDescriptors(
+               DFSTestUtil.createDatanodeStorageInfos(1)));
+ 
+@@ -275,7 +281,7 @@ public void testBlockReceived() throws Exception {
+ 
+       assertEquals(1, blkManager.pendingReplications.size());
+       INodeFile fileNode = fsn.getFSDirectory().getINode4Write(file).asFile();
+-      Block[] blocks = fileNode.getBlocks();
++      BlockInfo[] blocks = fileNode.getBlocks();
+       assertEquals(DATANODE_COUNT - 1,
+           blkManager.pendingReplications.getNumReplicas(blocks[0]));
+ 
+@@ -383,9 +389,9 @@ public void testPendingAndInvalidate() throws Exception {
+       BlockManagerTestUtil.computeAllPendingWork(bm);
+       BlockManagerTestUtil.updateState(bm);
+       assertEquals(bm.getPendingReplicationBlocksCount(), 1L);
+-      assertEquals(bm.pendingReplications.getNumReplicas(block.getBlock()
+-          .getLocalBlock()), 2);
+-      
++      BlockInfo storedBlock = bm.getStoredBlock(block.getBlock().getLocalBlock());
++      assertEquals(bm.pendingReplications.getNumReplicas(storedBlock), 2);
++
+       // 4. delete the file
+       fs.delete(filePath, true);
+       // retry at most 10 times, each time sleep for 1s. Note that 10s is much
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+index 600c6c8..744e9fa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+@@ -55,7 +55,9 @@
+   
+   private static NumberReplicas countReplicas(final FSNamesystem namesystem,
+       ExtendedBlock block) {
+-    return namesystem.getBlockManager().countNodes(block.getLocalBlock());
++    final BlockManager blockManager = namesystem.getBlockManager();
++    return blockManager.countNodes(blockManager.getStoredBlock(
++        block.getLocalBlock()));
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 4aaa60f..82eb8c2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -43,6 +43,7 @@
+ 
+ import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.hdfs.AddBlockFlag;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -62,6 +63,7 @@
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.ReplicaState;
+ import org.apache.hadoop.hdfs.server.namenode.FSClusterStats;
++import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
+@@ -76,6 +78,7 @@
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
++import org.mockito.Mockito;
+ 
+ public class TestReplicationPolicy {
+   {
+@@ -244,7 +247,7 @@ public void testChooseNodeWithMultipleStorages2() throws Exception {
+   @Test
+   public void testChooseTarget1() throws Exception {
+     updateHeartbeatWithUsage(dataNodes[0],
+-        2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L, 
++        2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
+         HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
+         0L, 0L, 4, 0); // overloaded
+ 
+@@ -782,7 +785,7 @@ public void testChooseTargetWithMoreThanHalfStaleNodes() throws Exception {
+       assertEquals(targets.length, 3);
+       assertTrue(isOnSameRack(targets[0], staleNodeInfo));
+       
+-      // Step 3. Set 2 stale datanodes back to healthy nodes, 
++      // Step 3. Set 2 stale datanodes back to healthy nodes,
+       // still have 2 stale nodes
+       for (int i = 2; i < 4; i++) {
+         DataNode dn = miniCluster.getDataNodes().get(i);
+@@ -901,7 +904,11 @@ public void testRereplicate3() throws Exception {
+     assertEquals(targets.length, 2);
+     assertTrue(isOnSameRack(targets[0], dataNodes[2]));
+   }
+-  
++
++  private BlockInfo genBlockInfo(long id) {
++    return new BlockInfo(new Block(id), (short) 3);
++  }
++
+   /**
+    * Test for the high priority blocks are processed before the low priority
+    * blocks.
+@@ -920,15 +927,18 @@ public void testReplicationWithPriority() throws Exception {
+           .getNamesystem().getBlockManager().neededReplications;
+       for (int i = 0; i < 100; i++) {
+         // Adding the blocks directly to normal priority
+-        neededReplications.add(new Block(random.nextLong()), 2, 0, 3);
++
++        neededReplications.add(genBlockInfo(ThreadLocalRandom.current().
++            nextLong()), 2, 0, 3);
+       }
+       // Lets wait for the replication interval, to start process normal
+       // priority blocks
+       Thread.sleep(DFS_NAMENODE_REPLICATION_INTERVAL);
+       
+       // Adding the block directly to high priority list
+-      neededReplications.add(new Block(random.nextLong()), 1, 0, 3);
+-      
++      neededReplications.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 1, 0, 3);
++
+       // Lets wait for the replication interval
+       Thread.sleep(DFS_NAMENODE_REPLICATION_INTERVAL);
+ 
+@@ -950,25 +960,31 @@ public void testChooseUnderReplicatedBlocks() throws Exception {
+ 
+     for (int i = 0; i < 5; i++) {
+       // Adding QUEUE_HIGHEST_PRIORITY block
+-      underReplicatedBlocks.add(new Block(random.nextLong()), 1, 0, 3);
++      underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 1, 0, 3);
+ 
+       // Adding QUEUE_VERY_UNDER_REPLICATED block
+-      underReplicatedBlocks.add(new Block(random.nextLong()), 2, 0, 7);
++      underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 2, 0, 7);
+ 
+       // Adding QUEUE_REPLICAS_BADLY_DISTRIBUTED block
+-      underReplicatedBlocks.add(new Block(random.nextLong()), 6, 0, 6);
++      underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 6, 0, 6);
+ 
+       // Adding QUEUE_UNDER_REPLICATED block
+-      underReplicatedBlocks.add(new Block(random.nextLong()), 5, 0, 6);
++      underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 5, 0, 6);
+ 
+       // Adding QUEUE_WITH_CORRUPT_BLOCKS block
+-      underReplicatedBlocks.add(new Block(random.nextLong()), 0, 0, 3);
++      underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++          nextLong()), 0, 0, 3);
+     }
+ 
+     // Choose 6 blocks from UnderReplicatedBlocks. Then it should pick 5 blocks
+     // from
+     // QUEUE_HIGHEST_PRIORITY and 1 block from QUEUE_VERY_UNDER_REPLICATED.
+-    List<List<Block>> chosenBlocks = underReplicatedBlocks.chooseUnderReplicatedBlocks(6);
++    List<List<BlockInfo>> chosenBlocks =
++        underReplicatedBlocks.chooseUnderReplicatedBlocks(6);
+     assertTheChosenBlocks(chosenBlocks, 5, 1, 0, 0, 0);
+ 
+     // Choose 10 blocks from UnderReplicatedBlocks. Then it should pick 4 blocks from
+@@ -978,7 +994,8 @@ public void testChooseUnderReplicatedBlocks() throws Exception {
+     assertTheChosenBlocks(chosenBlocks, 0, 4, 5, 1, 0);
+ 
+     // Adding QUEUE_HIGHEST_PRIORITY
+-    underReplicatedBlocks.add(new Block(random.nextLong()), 1, 0, 3);
++    underReplicatedBlocks.add(genBlockInfo(ThreadLocalRandom.current().
++        nextLong()), 1, 0, 3);
+ 
+     // Choose 10 blocks from UnderReplicatedBlocks. Then it should pick 1 block from
+     // QUEUE_HIGHEST_PRIORITY, 4 blocks from QUEUE_REPLICAS_BADLY_DISTRIBUTED
+@@ -996,9 +1013,17 @@ public void testChooseUnderReplicatedBlocks() throws Exception {
+   
+   /** asserts the chosen blocks with expected priority blocks */
+   private void assertTheChosenBlocks(
+-      List<List<Block>> chosenBlocks, int firstPrioritySize,
++      List<List<BlockInfo>> chosenBlocks, int firstPrioritySize,
+       int secondPrioritySize, int thirdPrioritySize, int fourthPrioritySize,
+       int fifthPrioritySize) {
++    int level = 0;
++    for (List<BlockInfo> blocks : chosenBlocks) {
++      System.out.print("Level: " + level + ", blocks: ");
++      for (BlockInfo block : blocks) {
++        System.out.print(block + " ");
++      }
++      System.out.println(" ");
++    }
+     assertEquals(
+         "Not returned the expected number of QUEUE_HIGHEST_PRIORITY blocks",
+         firstPrioritySize, chosenBlocks.get(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestUnderReplicatedBlockQueues.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestUnderReplicatedBlockQueues.java
+index e87a043..03be967 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestUnderReplicatedBlockQueues.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestUnderReplicatedBlockQueues.java
+@@ -28,6 +28,10 @@
+ 
+ public class TestUnderReplicatedBlockQueues {
+ 
++  private BlockInfo genBlockInfo(long id) {
++    return new BlockInfo(new Block(id), (short) 3);
++  }
++
+   /**
+    * Test that adding blocks with different replication counts puts them
+    * into different queues
+@@ -36,11 +40,11 @@
+   @Test
+   public void testBlockPriorities() throws Throwable {
+     UnderReplicatedBlocks queues = new UnderReplicatedBlocks();
+-    Block block1 = new Block(1);
+-    Block block2 = new Block(2);
+-    Block block_very_under_replicated = new Block(3);
+-    Block block_corrupt = new Block(4);
+-    Block block_corrupt_repl_one = new Block(5);
++    BlockInfo block1 = genBlockInfo(1);
++    BlockInfo block2 = genBlockInfo(2);
++    BlockInfo block_very_under_replicated = genBlockInfo(3);
++    BlockInfo block_corrupt = genBlockInfo(4);
++    BlockInfo block_corrupt_repl_one = genBlockInfo(5);
+ 
+     //add a block with a single entry
+     assertAdded(queues, block1, 1, 0, 3);
+@@ -82,7 +86,7 @@ public void testBlockPriorities() throws Throwable {
+   }
+ 
+   private void assertAdded(UnderReplicatedBlocks queues,
+-                           Block block,
++                           BlockInfo block,
+                            int curReplicas,
+                            int decomissionedReplicas,
+                            int expectedReplicas) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+index e6bf067..dbc9bc4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
+ import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
+@@ -81,6 +82,7 @@
+   private DatanodeInfo readOnlyDataNode;
+   
+   private Block block;
++  private BlockInfo storedBlock;
+ 
+   private ExtendedBlock extendedBlock;
+ 
+@@ -132,7 +134,8 @@ public void setup() throws IOException, InterruptedException {
+     LocatedBlock locatedBlock = getLocatedBlock();
+     extendedBlock = locatedBlock.getBlock();
+     block = extendedBlock.getLocalBlock();
+-    
++    storedBlock = blockManager.getStoredBlock(block);
++
+     assertThat(locatedBlock.getLocations().length, is(1));
+     normalDataNode = locatedBlock.getLocations()[0];
+     readOnlyDataNode = datanodeManager.getDatanode(cluster.getDataNodes().get(RO_NODE_INDEX).getDatanodeId());
+@@ -188,7 +191,7 @@ private void validateStorageState(StorageReport[] storageReports, DatanodeStorag
+   }
+   
+   private void validateNumberReplicas(int expectedReplicas) throws IOException {
+-    NumberReplicas numberReplicas = blockManager.countNodes(block);
++    NumberReplicas numberReplicas = blockManager.countNodes(storedBlock);
+     assertThat(numberReplicas.liveReplicas(), is(expectedReplicas));
+     assertThat(numberReplicas.excessReplicas(), is(0));
+     assertThat(numberReplicas.corruptReplicas(), is(0));
+@@ -230,7 +233,7 @@ public void testNormalReplicaOffline() throws Exception {
+         cluster.getNameNode(), normalDataNode.getXferAddr());
+     
+     // The live replica count should now be zero (since the NORMAL replica is offline)
+-    NumberReplicas numberReplicas = blockManager.countNodes(block);
++    NumberReplicas numberReplicas = blockManager.countNodes(storedBlock);
+     assertThat(numberReplicas.liveReplicas(), is(0));
+     
+     // The block should be reported as under-replicated
+@@ -263,7 +266,7 @@ public void testReadOnlyReplicaCorrupt() throws Exception {
+     waitForLocations(1);
+     
+     // However, the corrupt READ_ONLY_SHARED replica should *not* affect the overall corrupt replicas count
+-    NumberReplicas numberReplicas = blockManager.countNodes(block);
++    NumberReplicas numberReplicas = blockManager.countNodes(storedBlock);
+     assertThat(numberReplicas.corruptReplicas(), is(0));
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+index 215638d..d9b2d5e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+@@ -32,6 +32,7 @@
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+ import org.apache.hadoop.hdfs.server.blockmanagement.NumberReplicas;
+ import org.junit.Test;
+ 
+@@ -259,7 +260,9 @@ public void testWithAllCorruptReplicas() throws Exception {
+   }
+ 
+   private static NumberReplicas countReplicas(final FSNamesystem namesystem, ExtendedBlock block) {
+-    return namesystem.getBlockManager().countNodes(block.getLocalBlock());
++    final BlockManager blockManager = namesystem.getBlockManager();
++    return blockManager.countNodes(blockManager.getStoredBlock(
++        block.getLocalBlock()));
+   }
+ 
+   private void corruptBlock(MiniDFSCluster cluster, FileSystem fs, final Path fileName,
+-- 
+1.7.9.5
+

@@ -1,0 +1,180 @@
+From 11f810c1e695a236bf50344cabdcb72bf7841f65 Mon Sep 17 00:00:00 2001
+From: Rohith Sharma K S <rohithsharmaks@apache.org>
+Date: Wed, 2 Sep 2015 15:22:48 +0530
+Subject: [PATCH 1913/2848] YARN-3893. Both RM in active state when
+ Admin#transitionToActive failure from refeshAll()
+ (Bibin A Chundatt via rohithsharmaks)
+
+(cherry picked from commit 7d6687fe76f6152a577ff2298c358dd30fce41fb)
+(cherry picked from commit 6e41aa64a5ccdc4ef567f1293e1eaa273ec64f1e)
+
+Change-Id: I795ea5e4ba3c118abe3f7b634d2744978cbbb01f
+---
+ .../yarn/server/resourcemanager/AdminService.java  |   20 ++++--
+ .../server/resourcemanager/RMFatalEventType.java   |    5 +-
+ .../yarn/server/resourcemanager/TestRMHA.java      |   71 ++++++++++++++++++++
+ 3 files changed, 91 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+index 0c3f925..f20e22f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+@@ -288,6 +288,7 @@ public synchronized void monitorHealth()
+     }
+   }
+ 
++  @SuppressWarnings("unchecked")
+   @Override
+   public synchronized void transitionToActive(
+       HAServiceProtocol.StateChangeRequestInfo reqInfo) throws IOException {
+@@ -303,10 +304,6 @@ public synchronized void transitionToActive(
+     checkHaStateChange(reqInfo);
+     try {
+       rm.transitionToActive();
+-      // call all refresh*s for active RM to get the updated configurations.
+-      refreshAll();
+-      RMAuditLogger.logSuccess(user.getShortUserName(),
+-          "transitionToActive", "RMHAProtocolService");
+     } catch (Exception e) {
+       RMAuditLogger.logFailure(user.getShortUserName(), "transitionToActive",
+           "", "RMHAProtocolService",
+@@ -314,6 +311,21 @@ public synchronized void transitionToActive(
+       throw new ServiceFailedException(
+           "Error when transitioning to Active mode", e);
+     }
++    try {
++      // call all refresh*s for active RM to get the updated configurations.
++      refreshAll();
++    } catch (Exception e) {
++      LOG.error("RefreshAll failed so firing fatal event", e);
++      rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++          new RMFatalEvent(RMFatalEventType.TRANSITION_TO_ACTIVE_FAILED, e));
++      throw new ServiceFailedException(
++          "Error on refreshAll during transistion to Active", e);
++    }
++    RMAuditLogger.logSuccess(user.getShortUserName(), "transitionToActive",
++        "RMHAProtocolService");
+   }
+ 
+   @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+index 789c018..87cc496 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+@@ -26,5 +26,8 @@
+   STATE_STORE_OP_FAILED,
+ 
+   // Source <- Embedded Elector
+-  EMBEDDED_ELECTOR_FAILED
++  EMBEDDED_ELECTOR_FAILED,
++
++  // Source <- Admin Service
++  TRANSITION_TO_ACTIVE_FAILED
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+index 0200e85..62cfe84 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+@@ -43,6 +43,8 @@
+ import org.apache.hadoop.yarn.conf.HAUtil;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.Dispatcher;
++import org.apache.hadoop.yarn.event.DrainDispatcher;
++import org.apache.hadoop.yarn.event.Event;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationStateData;
+@@ -52,6 +54,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration;
+ import org.codehaus.jettison.json.JSONException;
+ import org.codehaus.jettison.json.JSONObject;
+ import org.junit.Assert;
+@@ -577,6 +580,56 @@ protected void serviceStart() throws Exception {
+     assertEquals(0, rm.getRMContext().getRMApps().size());
+   }
+ 
++  @Test(timeout = 90000)
++  public void testTransitionedToActiveRefreshFail() throws Exception {
++    configuration.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
++    YarnConfiguration conf = new YarnConfiguration(configuration);
++    configuration = new CapacitySchedulerConfiguration(conf);
++    rm = new MockRM(configuration) {
++      @Override
++      protected AdminService createAdminService() {
++        return new AdminService(this, getRMContext()) {
++          @Override
++          protected void setConfig(Configuration conf) {
++            super.setConfig(configuration);
++          }
++        };
++      }
++
++      @Override
++      protected Dispatcher createDispatcher() {
++        return new FailFastDispatcher();
++      }
++    };
++
++    rm.init(configuration);
++    rm.start();
++    final StateChangeRequestInfo requestInfo =
++        new StateChangeRequestInfo(
++            HAServiceProtocol.RequestSource.REQUEST_BY_USER);
++
++    configuration.set("yarn.scheduler.capacity.root.default.capacity", "100");
++    rm.adminService.transitionToStandby(requestInfo);
++    assertEquals(HAServiceState.STANDBY, rm.getRMContext().getHAServiceState());
++    configuration.set("yarn.scheduler.capacity.root.default.capacity", "200");
++    try {
++      rm.adminService.transitionToActive(requestInfo);
++    } catch (Exception e) {
++      assertTrue("Error on refreshAll during transistion to Active".contains(e
++          .getMessage()));
++    }
++    FailFastDispatcher dispatcher =
++        ((FailFastDispatcher) rm.rmContext.getDispatcher());
++    dispatcher.await();
++    assertEquals(1, dispatcher.getEventCount());
++    // Making correct conf and check the state
++    configuration.set("yarn.scheduler.capacity.root.default.capacity", "100");
++    rm.adminService.transitionToActive(requestInfo);
++    assertEquals(HAServiceState.ACTIVE, rm.getRMContext().getHAServiceState());
++    rm.adminService.transitionToStandby(requestInfo);
++    assertEquals(HAServiceState.STANDBY, rm.getRMContext().getHAServiceState());
++  }
++
+   public void innerTestHAWithRMHostName(boolean includeBindHost) {
+     //this is run two times, with and without a bind host configured
+     if (includeBindHost) {
+@@ -713,4 +766,22 @@ public boolean isStopped() {
+       return this.stopped;
+     }
+   }
++
++  class FailFastDispatcher extends DrainDispatcher {
++    int eventreceived = 0;
++
++    @SuppressWarnings("rawtypes")
++    @Override
++    protected void dispatch(Event event) {
++      if (event.getType() == RMFatalEventType.TRANSITION_TO_ACTIVE_FAILED) {
++        eventreceived++;
++      } else {
++        super.dispatch(event);
++      }
++    }
++
++    public int getEventCount() {
++      return eventreceived;
++    }
++  }
+ }
+-- 
+1.7.9.5
+
