@@ -1,0 +1,315 @@
+From 24784939e37135d1e89aebc6d63e9810705c940b Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Sat, 6 Feb 2016 18:17:30 +0000
+Subject: [PATCH 1814/2848] HADOOP-12292. Make use of DeleteObjects optional. 
+ (Thomas Demoor via stevel)
+
+(cherry picked from commit f4bcc76df6ab305894c16ab4b511fc0d45313290)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/CHANGES.txt
+	hadoop-project/pom.xml
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+
+Change-Id: I5eff672b0cc8f03dfe8d0659d90a29a17cab1ffd
+---
+ .../src/main/resources/core-default.xml            |    9 ++++
+ hadoop-project/pom.xml                             |    3 +-
+ .../java/org/apache/hadoop/fs/s3a/Constants.java   |    3 ++
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   57 +++++++++++++-------
+ .../src/site/markdown/tools/hadoop-aws/index.md    |    9 ++++
+ .../hadoop/fs/s3a/scale/S3AScaleTestBase.java      |   11 +++-
+ .../fs/s3a/scale/TestS3ADeleteFilesOneByOne.java   |   40 ++++++++++++++
+ .../fs/s3a/scale/TestS3ADeleteManyFiles.java       |    2 +-
+ 8 files changed, 112 insertions(+), 22 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteFilesOneByOne.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 0a1998b..bec0288 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -937,6 +937,15 @@ for ldap providers in the same way as above does.
+ </property>
+ 
+ <property>
++  <name>fs.s3a.multiobjectdelete.enable</name>
++  <value>true</value>
++  <description>When enabled, multiple single-object delete requests are replaced by
++    a single 'delete multiple objects'-request, reducing the number of requests.
++    Beware: legacy S3-compatible object stores might not support this request.
++  </description>
++</property>
++
++<property>
+   <name>fs.s3a.acl.default</name>
+   <description>Set a canned ACL for newly created and copied objects. Value may be private, 
+      public-read, public-read-write, authenticated-read, log-delivery-write, 
+diff --git a/hadoop-project/pom.xml b/hadoop-project/pom.xml
+index 6245f38..4f6d726 100644
+--- a/hadoop-project/pom.xml
++++ b/hadoop-project/pom.xml
+@@ -98,6 +98,7 @@
+     <maven-surefire-report-plugin.version>${maven-surefire-plugin.version}</maven-surefire-report-plugin.version>
+     <maven-failsafe-plugin.version>${maven-surefire-plugin.version}</maven-failsafe-plugin.version>
+     <aws-java-sdk.version>1.10.6</aws-java-sdk.version>
++    <surefire.fork.timeout>900</surefire.fork.timeout>
+   </properties>
+ 
+   <dependencyManagement>
+@@ -1185,7 +1186,7 @@
+         <artifactId>maven-surefire-plugin</artifactId>
+         <configuration>
+           <reuseForks>false</reuseForks>
+-          <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
++          <forkedProcessTimeoutInSeconds>${surefire.fork.timeout}</forkedProcessTimeoutInSeconds>
+           <argLine>${maven-surefire-plugin.argLine}</argLine>
+           <environmentVariables>
+             <HADOOP_COMMON_HOME>${hadoop.common.build.dir}</HADOOP_COMMON_HOME>
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index 7b121f7..aff4e5a 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -95,6 +95,9 @@
+   public static final String MIN_MULTIPART_THRESHOLD = "fs.s3a.multipart.threshold";
+   public static final long DEFAULT_MIN_MULTIPART_THRESHOLD = Integer.MAX_VALUE;
+ 
++  //enable multiobject-delete calls?
++  public static final String ENABLE_MULTI_DELETE = "fs.s3a.multiobjectdelete.enable";
++
+   // comma separated list of directories
+   public static final String BUFFER_DIR = "fs.s3a.buffer.dir";
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 0253c87..9633340 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -43,6 +43,7 @@
+ import com.amazonaws.services.s3.AmazonS3Client;
+ import com.amazonaws.services.s3.S3ClientOptions;
+ import com.amazonaws.services.s3.model.CannedAccessControlList;
++import com.amazonaws.services.s3.model.DeleteObjectRequest;
+ import com.amazonaws.services.s3.model.DeleteObjectsRequest;
+ import com.amazonaws.services.s3.model.ListObjectsRequest;
+ import com.amazonaws.services.s3.model.ObjectListing;
+@@ -86,6 +87,7 @@
+   private String bucket;
+   private int maxKeys;
+   private long partSize;
++  private boolean enableMultiObjectsDelete;
+   private TransferManager transfers;
+   private ThreadPoolExecutor threadPoolExecutor;
+   private long multiPartThreshold;
+@@ -200,6 +202,7 @@ public void initialize(URI name, Configuration conf) throws IOException {
+     partSize = conf.getLong(MULTIPART_SIZE, DEFAULT_MULTIPART_SIZE);
+     multiPartThreshold = conf.getLong(MIN_MULTIPART_THRESHOLD,
+       DEFAULT_MIN_MULTIPART_THRESHOLD);
++    enableMultiObjectsDelete = conf.getBoolean(ENABLE_MULTI_DELETE, true);
+ 
+     if (partSize < 5 * 1024 * 1024) {
+       LOG.error(MULTIPART_SIZE + " must be at least 5 MB");
+@@ -701,11 +704,7 @@ public boolean rename(Path src, Path dst) throws IOException {
+           copyFile(summary.getKey(), newDstKey);
+ 
+           if (keysToDelete.size() == MAX_ENTRIES_TO_DELETE) {
+-            DeleteObjectsRequest deleteRequest =
+-                new DeleteObjectsRequest(bucket).withKeys(keysToDelete);
+-            s3.deleteObjects(deleteRequest);
+-            statistics.incrementWriteOps(1);
+-            keysToDelete.clear();
++            removeKeys(keysToDelete, true);
+           }
+         }
+ 
+@@ -713,11 +712,8 @@ public boolean rename(Path src, Path dst) throws IOException {
+           objects = s3.listNextBatchOfObjects(objects);
+           statistics.incrementReadOps(1);
+         } else {
+-          if (keysToDelete.size() > 0) {
+-            DeleteObjectsRequest deleteRequest =
+-                new DeleteObjectsRequest(bucket).withKeys(keysToDelete);
+-            s3.deleteObjects(deleteRequest);
+-            statistics.incrementWriteOps(1);
++          if (!keysToDelete.isEmpty()) {
++            removeKeys(keysToDelete, false);
+           }
+           break;
+         }
+@@ -731,6 +727,36 @@ public boolean rename(Path src, Path dst) throws IOException {
+     return true;
+   }
+ 
++  /**
++   * A helper method to delete a list of keys on a s3-backend.
++   *
++   * @param keysToDelete collection of keys to delete on the s3-backend
++   * @param clearKeys clears the keysToDelete-list after processing the list
++   *            when set to true
++   */
++  private void removeKeys(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++          boolean clearKeys) {
++    if (enableMultiObjectsDelete) {
++      DeleteObjectsRequest deleteRequest
++          = new DeleteObjectsRequest(bucket).withKeys(keysToDelete);
++      s3.deleteObjects(deleteRequest);
++      statistics.incrementWriteOps(1);
++    } else {
++      int writeops = 0;
++
++      for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
++        s3.deleteObject(
++            new DeleteObjectRequest(bucket, keyVersion.getKey()));
++        writeops++;
++      }
++
++      statistics.incrementWriteOps(writeops);
++    }
++    if (clearKeys) {
++      keysToDelete.clear();
++    }
++  }
++
+   /** Delete a file.
+    *
+    * @param f the path to delete.
+@@ -805,11 +831,7 @@ public boolean delete(Path f, boolean recursive) throws IOException {
+             }
+ 
+             if (keys.size() == MAX_ENTRIES_TO_DELETE) {
+-              DeleteObjectsRequest deleteRequest =
+-                  new DeleteObjectsRequest(bucket).withKeys(keys);
+-              s3.deleteObjects(deleteRequest);
+-              statistics.incrementWriteOps(1);
+-              keys.clear();
++              removeKeys(keys, true);
+             }
+           }
+ 
+@@ -818,10 +840,7 @@ public boolean delete(Path f, boolean recursive) throws IOException {
+             statistics.incrementReadOps(1);
+           } else {
+             if (!keys.isEmpty()) {
+-              DeleteObjectsRequest deleteRequest =
+-                  new DeleteObjectsRequest(bucket).withKeys(keys);
+-              s3.deleteObjects(deleteRequest);
+-              statistics.incrementWriteOps(1);
++              removeKeys(keys, false);
+             }
+             break;
+           }
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+index 3123459..f6fc124 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+@@ -400,6 +400,15 @@ this capability.
+     </property>
+ 
+     <property>
++      <name>fs.s3a.multiobjectdelete.enable</name>
++      <value>false</value>
++      <description>When enabled, multiple single-object delete requests are replaced by
++        a single 'delete multiple objects'-request, reducing the number of requests.
++        Beware: legacy S3-compatible object stores might not support this request.
++      </description>
++    </property>
++
++    <property>
+       <name>fs.s3a.acl.default</name>
+       <description>Set a canned ACL for newly created and copied objects. Value may be private,
+          public-read, public-read-write, authenticated-read, log-delivery-write,
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/S3AScaleTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/S3AScaleTestBase.java
+index e0cbc92..e44a90e 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/S3AScaleTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/S3AScaleTestBase.java
+@@ -36,13 +36,21 @@
+ 
+ /**
+  * Base class for scale tests; here is where the common scale configuration
+- * keys are defined
++ * keys are defined.
+  */
+ public class S3AScaleTestBase {
+ 
+   public static final String SCALE_TEST = "scale.test.";
++
++  /**
++   * The number of operations to perform: {@value}
++   */
+   public static final String KEY_OPERATION_COUNT =
+       SCALE_TEST + "operation.count";
++
++  /**
++   * The default number of operations to perform: {@value}
++   */
+   public static final long DEFAULT_OPERATION_COUNT = 2005;
+ 
+   protected S3AFileSystem fs;
+@@ -71,6 +79,7 @@ public Configuration getConf() {
+   @Before
+   public void setUp() throws Exception {
+     conf = createConfiguration();
++    LOG.info("Scale test operation count = {}", getOperationCount());
+     fs = S3ATestUtils.createTestFileSystem(conf);
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteFilesOneByOne.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteFilesOneByOne.java
+new file mode 100644
+index 0000000..77c85a9
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteFilesOneByOne.java
+@@ -0,0 +1,40 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ *  or more contributor license agreements.  See the NOTICE file
++ *  distributed with this work for additional information
++ *  regarding copyright ownership.  The ASF licenses this file
++ *  to you under the Apache License, Version 2.0 (the
++ *  "License"); you may not use this file except in compliance
++ *  with the License.  You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a.scale;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.s3a.Constants;
++import org.junit.Test;
++
++import java.io.IOException;
++
++public class TestS3ADeleteFilesOneByOne extends TestS3ADeleteManyFiles {
++
++  @Override
++  protected Configuration createConfiguration() {
++    Configuration configuration = super.createConfiguration();
++    configuration.setBoolean(Constants.ENABLE_MULTI_DELETE, false);
++    return configuration;
++  }
++
++  @Test
++  public void testOpenCreate() throws IOException {
++
++  }
++}
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteManyFiles.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteManyFiles.java
+index c913a67..d521ba8 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteManyFiles.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/TestS3ADeleteManyFiles.java
+@@ -61,7 +61,7 @@ public void testBulkRenameAndDelete() throws Throwable {
+     // use Executor to speed up file creation
+     ExecutorService exec = Executors.newFixedThreadPool(16);
+     final ExecutorCompletionService<Boolean> completionService =
+-        new ExecutorCompletionService<Boolean>(exec);
++        new ExecutorCompletionService<>(exec);
+     try {
+       final byte[] data = ContractTestUtils.dataset(testBufferSize, 'a', 'z');
+ 
+-- 
+1.7.9.5
+

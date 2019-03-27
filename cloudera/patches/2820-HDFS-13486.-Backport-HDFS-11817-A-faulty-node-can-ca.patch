@@ -1,0 +1,287 @@
+From 8ec05cee57054c37ffed50c686fc859ac187a84c Mon Sep 17 00:00:00 2001
+From: Wei-Chiu Chuang <weichiu@apache.org>
+Date: Mon, 7 May 2018 16:22:34 -0700
+Subject: [PATCH 2820/2848] HDFS-13486. Backport HDFS-11817 (A faulty node can
+ cause a lease leak and NPE on accessing data) to
+ branch-2.7. Contributed by Kihwal Lee.
+
+(cherry picked from commit e8777342d3d916276a06bbd8cb2257159402bd58)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockInfoUnderConstruction.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
+
+Change-Id: I398730b937fea3d8142397f8df670421764f4f61
+---
+ .../BlockInfoUnderConstruction.java                |   66 +++++++++++++-------
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    2 +-
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   13 +++-
+ .../TestBlockInfoUnderConstruction.java            |    8 +--
+ .../namenode/TestBlockUnderConstruction.java       |   44 +++++++++++++
+ .../namenode/TestCommitBlockSynchronization.java   |    2 +-
+ 6 files changed, 104 insertions(+), 31 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+index 5b23d09..3405b8c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+@@ -187,12 +187,23 @@ assert getBlockUCState() != BlockUCState.COMPLETE :
+ 
+   /** Set expected locations */
+   public void setExpectedLocations(DatanodeStorageInfo[] targets) {
+-    int numLocations = targets == null ? 0 : targets.length;
++    if (targets == null) {
++      return;
++    }
++    int numLocations = 0;
++    for (DatanodeStorageInfo target : targets) {
++      if (target != null) {
++        numLocations++;
++      }
++    }
++
+     this.replicas = new ArrayList<ReplicaUnderConstruction>(numLocations);
+-    for(int i = 0; i < numLocations; i++)
++    for(int i = 0; i < targets.length; i++) {
++      // Only store non-null DatanodeStorageInfo.
+       if (targets[i] != null) {
+         replicas.add(new ReplicaUnderConstruction(this, targets[i], ReplicaState.RBW));
+       }
++    }
+   }
+ 
+   /**
+@@ -274,10 +285,15 @@ public long getBlockRecoveryId() {
+    * Initialize lease recovery for this block.
+    * Find the first alive data-node starting from the previous primary and
+    * make it primary.
++   * @param recoveryId Recovery ID (new gen stamp)
++   * @param startRecovery Issue recovery command to datanode if true.
+    */
+-  public void initializeBlockRecovery(long recoveryId) {
++  public void initializeBlockRecovery(long recoveryId, boolean startRecovery) {
+     setBlockUCState(BlockUCState.UNDER_RECOVERY);
+     blockRecoveryId = recoveryId;
++    if (!startRecovery) {
++      return;
++    }
+     if (replicas.size() == 0) {
+       NameNode.blockStateChangeLog.warn("BLOCK*"
+         + " BlockInfoUnderConstruction.initLeaseRecovery:"
+@@ -324,27 +340,33 @@ public void initializeBlockRecovery(long recoveryId) {
+   void addReplicaIfNotPresent(DatanodeStorageInfo storage,
+                      Block block,
+                      ReplicaState rState) {
+-    Iterator<ReplicaUnderConstruction> it = replicas.iterator();
+-    while (it.hasNext()) {
+-      ReplicaUnderConstruction r = it.next();
+-      DatanodeStorageInfo expectedLocation = r.getExpectedStorageLocation();
+-      if(expectedLocation == storage) {
+-        // Record the gen stamp from the report
+-        r.setGenerationStamp(block.getGenerationStamp());
+-        return;
+-      } else if (expectedLocation != null &&
+-                 expectedLocation.getDatanodeDescriptor() ==
+-                     storage.getDatanodeDescriptor()) {
+-
+-        // The Datanode reported that the block is on a different storage
+-        // than the one chosen by BlockPlacementPolicy. This can occur as
+-        // we allow Datanodes to choose the target storage. Update our
+-        // state by removing the stale entry and adding a new one.
+-        it.remove();
+-        break;
++    if (replicas == null) {
++      replicas = new ArrayList<ReplicaUnderConstruction>(1);
++      replicas.add(new ReplicaUnderConstruction(block, storage,
++          rState));
++    } else {
++      Iterator<ReplicaUnderConstruction> it = replicas.iterator();
++      while (it.hasNext()) {
++        ReplicaUnderConstruction r = it.next();
++        DatanodeStorageInfo expectedLocation = r.getExpectedStorageLocation();
++        if (expectedLocation == storage) {
++          // Record the gen stamp from the report
++          r.setGenerationStamp(block.getGenerationStamp());
++          return;
++        } else if (expectedLocation != null
++            && expectedLocation.getDatanodeDescriptor() ==
++            storage.getDatanodeDescriptor()) {
++
++          // The Datanode reported that the block is on a different storage
++          // than the one chosen by BlockPlacementPolicy. This can occur as
++          // we allow Datanodes to choose the target storage. Update our
++          // state by removing the stale entry and adding a new one.
++          it.remove();
++          break;
++        }
+       }
++      replicas.add(new ReplicaUnderConstruction(block, storage, rState));
+     }
+-    replicas.add(new ReplicaUnderConstruction(block, storage, rState));
+   }
+ 
+   @Override // BlockInfo
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index f1a7858..a067fb9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -4912,7 +4912,7 @@ boolean internalReleaseLease(Lease lease, String src, INodesInPath iip,
+       // or the previous recovery for this block timed out.
+       if (blockManager.addBlockRecoveryAttempt(lastBlock)) {
+         long blockRecoveryId = nextGenerationStamp(isLegacyBlock(lastBlock));
+-        uc.initializeBlockRecovery(blockRecoveryId);
++        uc.initializeBlockRecovery(blockRecoveryId, true);
+ 
+         // Cannot close file right now, since the last block requires recovery.
+         // This may potentially cause infinite loop in lease recovery
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 9eda1ad..0ef6e28 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -600,8 +600,15 @@ synchronized boolean checkLeases() {
+             removeLease(lastINode.getId());
+             continue;
+           }
+-          boolean completed = fsnamesystem.internalReleaseLease(
+-              leaseToCheck, p, iip, newHolder);
++          boolean completed = false;
++          try {
++            completed = fsnamesystem.internalReleaseLease(
++                leaseToCheck, p, iip, newHolder);
++          } catch (IOException e) {
++            LOG.warn("Cannot release the path " + p + " in the lease "
++                + leaseToCheck + ". It will be retried.", e);
++            continue;
++          }
+           if (LOG.isDebugEnabled()) {
+             if (completed) {
+               LOG.debug("Lease recovery for inode " + id + " is complete. " +
+@@ -615,7 +622,7 @@ synchronized boolean checkLeases() {
+             needSync = true;
+           }
+         } catch (IOException e) {
+-          LOG.error("Cannot release the path " + p + " in the lease "
++          LOG.warn("Removing lease with an invalid path: " + p + ","
+               + leaseToCheck, e);
+           removing.add(id);
+         }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockInfoUnderConstruction.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockInfoUnderConstruction.java
+index 1a84a4b..c8594a6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockInfoUnderConstruction.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockInfoUnderConstruction.java
+@@ -52,7 +52,7 @@ public void testInitializeBlockRecovery() throws Exception {
+     dd1.setLastUpdate(currentTime - 3 * 1000);
+     dd2.setLastUpdate(currentTime - 1 * 1000);
+     dd3.setLastUpdate(currentTime - 2 * 1000);
+-    blockInfo.initializeBlockRecovery(1);
++    blockInfo.initializeBlockRecovery(1, true);
+     BlockInfoUnderConstruction[] blockInfoRecovery = dd2.getLeaseRecoveryCommand(1);
+     assertEquals(blockInfoRecovery[0], blockInfo);
+ 
+@@ -61,7 +61,7 @@ public void testInitializeBlockRecovery() throws Exception {
+     dd1.setLastUpdate(currentTime - 2 * 1000);
+     dd2.setLastUpdate(currentTime - 1 * 1000);
+     dd3.setLastUpdate(currentTime - 3 * 1000);
+-    blockInfo.initializeBlockRecovery(2);
++    blockInfo.initializeBlockRecovery(2, true);
+     blockInfoRecovery = dd1.getLeaseRecoveryCommand(1);
+     assertEquals(blockInfoRecovery[0], blockInfo);
+ 
+@@ -71,7 +71,7 @@ public void testInitializeBlockRecovery() throws Exception {
+     dd2.setLastUpdate(currentTime - 1 * 1000);
+     dd3.setLastUpdate(currentTime - 3 * 1000);
+     currentTime = System.currentTimeMillis();
+-    blockInfo.initializeBlockRecovery(3);
++    blockInfo.initializeBlockRecovery(3, true);
+     blockInfoRecovery = dd3.getLeaseRecoveryCommand(1);
+     assertEquals(blockInfoRecovery[0], blockInfo);
+ 
+@@ -82,7 +82,7 @@ public void testInitializeBlockRecovery() throws Exception {
+     dd2.setLastUpdate(currentTime - 1 * 1000);
+     dd3.setLastUpdate(currentTime);
+     currentTime = System.currentTimeMillis();
+-    blockInfo.initializeBlockRecovery(3);
++    blockInfo.initializeBlockRecovery(3, true);
+     blockInfoRecovery = dd3.getLeaseRecoveryCommand(1);
+     assertEquals(blockInfoRecovery[0], blockInfo);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
+index 872ff9c..2702d81 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
+@@ -37,6 +37,7 @@
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoUnderConstruction;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.BlockUCState;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.junit.AfterClass;
+@@ -181,4 +182,47 @@ public void testGetBlockLocations() throws IOException {
+     // close file
+     out.close();
+   }
++
++  /**
++   * A storage ID can be invalid if the storage failed or the node
++   * reregisters. When the node heart-beats, the storage report in it
++   * causes storage volumes to be added back. An invalid storage ID
++   * should not cause an NPE.
++   */
++  @Test
++  public void testEmptyExpectedLocations() throws Exception {
++    final NamenodeProtocols namenode = cluster.getNameNodeRpc();
++    final FSNamesystem fsn = cluster.getNamesystem();
++    final BlockManager bm = fsn.getBlockManager();
++    final Path p = new Path(BASE_DIR, "file2.dat");
++    final String src = p.toString();
++    final FSDataOutputStream out = TestFileCreation.createFile(hdfs, p, 1);
++    writeFile(p, out, 256);
++    out.hflush();
++
++    // make sure the block is readable
++    LocatedBlocks lbs = namenode.getBlockLocations(src, 0, 256);
++    LocatedBlock lastLB = lbs.getLocatedBlocks().get(0);
++    final Block b = lastLB.getBlock().getLocalBlock();
++
++    // fake a block recovery
++    fsn.writeLock();
++    long blockRecoveryId = fsn.nextGenerationStamp(false);
++    fsn.writeUnlock();
++    BlockInfoUnderConstruction uc = bm.getStoredBlock(b).
++        convertToBlockUnderConstruction(BlockUCState.UNDER_CONSTRUCTION, null);
++    uc.initializeBlockRecovery(blockRecoveryId, false);
++
++    try {
++      String[] storages = { "invalid-storage-id1" };
++      fsn.commitBlockSynchronization(lastLB.getBlock(), blockRecoveryId, 256L,
++          true, false, lastLB.getLocations(), storages);
++    } catch (java.lang.IllegalStateException ise) {
++       // Although a failure is expected as of now, future commit policy
++       // changes may make it not fail. This is not critical to the test.
++    }
++
++    // Invalid storage should not trigger an exception.
++    lbs = namenode.getBlockLocations(src, 0, 256);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java
+index a34d5e4..f5e5e95 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java
+@@ -68,7 +68,7 @@ private FSNamesystem makeNameSystemSpy(Block block, INodeFile file)
+         block, (short) 1, HdfsServerConstants.BlockUCState.UNDER_CONSTRUCTION, targets);
+     blockInfo.setBlockCollection(file);
+     blockInfo.setGenerationStamp(genStamp);
+-    blockInfo.initializeBlockRecovery(genStamp);
++    blockInfo.initializeBlockRecovery(genStamp, true);
+     doReturn(true).when(file).removeLastBlock(any(Block.class));
+     doReturn(true).when(file).isUnderConstruction();
+     doReturn(new BlockInfo[1]).when(file).getBlocks();
+-- 
+1.7.9.5
+

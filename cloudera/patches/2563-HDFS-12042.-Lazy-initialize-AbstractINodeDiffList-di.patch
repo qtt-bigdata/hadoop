@@ -1,0 +1,194 @@
+From 169845a86d95b37638ce9480b50c7cadb5c12be5 Mon Sep 17 00:00:00 2001
+From: Wei-Chiu Chuang <weichiu@apache.org>
+Date: Fri, 30 Jun 2017 10:28:01 -0700
+Subject: [PATCH 2563/2848] HDFS-12042. Lazy initialize
+ AbstractINodeDiffList#diffs for snapshots to
+ reduce memory consumption. Contributed by Misha
+ Dmitriev.
+
+(cherry picked from commit bcba844d1144cc334e2babbc34c9d42eac1c203a)
+(cherry picked from commit 94bc5cdbb3d0fd9133a8cab9d3daac6798e8d8dd)
+(cherry picked from commit 8027246306378a479de0c6fe74b1f56239567396)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/AbstractINodeDiffList.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestTruncateQuotaUpdate.java
+
+Change-Id: I130d1a70777bc48d865a2cc29690906cdb3251fb
+---
+ .../hdfs/server/namenode/INodeDirectory.java       |    7 ++-
+ .../namenode/snapshot/AbstractINodeDiffList.java   |   54 +++++++++++++++-----
+ 2 files changed, 45 insertions(+), 16 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+index c68202d..00b922d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+@@ -63,8 +63,11 @@ public static INodeDirectory valueOf(INode inode, Object path
+     return inode.asDirectory(); 
+   }
+ 
+-  protected static final int DEFAULT_FILES_PER_DIRECTORY = 5;
+-  final static byte[] ROOT_NAME = DFSUtil.string2Bytes("");
++  // Profiling shows that most of the file lists are between 1 and 4 elements.
++  // Thus allocate the corresponding ArrayLists with a small initial capacity.
++  public static final int DEFAULT_FILES_PER_DIRECTORY = 2;
++
++  static final byte[] ROOT_NAME = DFSUtil.string2Bytes("");
+ 
+   private List<INode> children = null;
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/AbstractINodeDiffList.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/AbstractINodeDiffList.java
+index 0580189..e2c6556 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/AbstractINodeDiffList.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/AbstractINodeDiffList.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo;
+ import org.apache.hadoop.hdfs.server.namenode.INodeAttributes;
+ import org.apache.hadoop.hdfs.server.namenode.Quota;
++import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
+ 
+ /**
+  * A list of snapshot diffs for storing snapshot data.
+@@ -37,17 +38,19 @@
+                                      A extends INodeAttributes,
+                                      D extends AbstractINodeDiff<N, A, D>> 
+     implements Iterable<D> {
+-  /** Diff list sorted by snapshot IDs, i.e. in chronological order. */
+-  private final List<D> diffs = new ArrayList<D>();
++  /** Diff list sorted by snapshot IDs, i.e. in chronological order.
++    * Created lazily to avoid wasting memory by empty lists. */
++  private List<D> diffs;
+ 
+   /** @return this list as a unmodifiable {@link List}. */
+   public final List<D> asList() {
+-    return Collections.unmodifiableList(diffs);
++    return diffs != null ?
++        Collections.unmodifiableList(diffs) : Collections.<D>emptyList();
+   }
+   
+-  /** Get the size of the list and then clear it. */
++  /** Clear the list. */
+   public void clear() {
+-    diffs.clear();
++    diffs = null;
+   }
+ 
+   /** @return an {@link AbstractINodeDiff}. */
+@@ -70,9 +73,12 @@ public void clear() {
+       final int prior, final N currentINode,
+       final BlocksMapUpdateInfo collectedBlocks,
+       final List<INode> removedINodes) {
+-    int snapshotIndex = Collections.binarySearch(diffs, snapshot);
+-    
+     Quota.Counts counts = Quota.Counts.newInstance();
++    if (diffs == null) {
++      return counts;
++    }
++    int snapshotIndex = Collections.binarySearch(diffs, snapshot);
++
+     D removed = null;
+     if (snapshotIndex == 0) {
+       if (prior != Snapshot.NO_SNAPSHOT_ID) { // there is still snapshot before
+@@ -80,6 +86,9 @@ public void clear() {
+         diffs.get(snapshotIndex).setSnapshotId(prior);
+       } else { // there is no snapshot before
+         removed = diffs.remove(0);
++        if (diffs.isEmpty()) {
++          diffs = null;
++        }
+         counts.add(removed.destroyDiffAndCollectBlocks(currentINode,
+             collectedBlocks, removedINodes));
+       }
+@@ -110,6 +119,7 @@ final D addDiff(int latestSnapshotId, N currentINode) {
+ 
+   /** Append the diff at the end of the list. */
+   private final D addLast(D diff) {
++    createDiffsIfNeeded();
+     final D last = getLast();
+     diffs.add(diff);
+     if (last != null) {
+@@ -120,15 +130,25 @@ private final D addLast(D diff) {
+   
+   /** Add the diff to the beginning of the list. */
+   final void addFirst(D diff) {
+-    final D first = diffs.isEmpty()? null: diffs.get(0);
++    createDiffsIfNeeded();
++    final D first = diffs.isEmpty()? null : diffs.get(0);
+     diffs.add(0, diff);
+     diff.setPosterior(first);
+   }
+ 
+   /** @return the last diff. */
+   public final D getLast() {
+-    final int n = diffs.size();
+-    return n == 0? null: diffs.get(n - 1);
++    if (diffs == null) {
++      return null;
++    }
++    int n = diffs.size();
++    return n == 0 ? null : diffs.get(n - 1);
++  }
++
++  private void createDiffsIfNeeded() {
++    if (diffs == null) {
++      diffs = new ArrayList<>(INodeDirectory.DEFAULT_FILES_PER_DIRECTORY);
++    }
+   }
+ 
+   /** @return the id of the last snapshot. */
+@@ -146,6 +166,9 @@ public final int getLastSnapshotId() {
+    * @return The id of the latest snapshot before the given snapshot.
+    */
+   private final int getPrior(int anchorId, boolean exclusive) {
++    if (diffs == null) {
++      return Snapshot.NO_SNAPSHOT_ID;
++    }
+     if (anchorId == Snapshot.CURRENT_STATE_ID) {
+       return getLastSnapshotId();
+     }
+@@ -185,7 +208,7 @@ final int updatePrior(int snapshot, int prior) {
+   }
+   
+   public final D getDiffById(final int snapshotId) {
+-    if (snapshotId == Snapshot.CURRENT_STATE_ID) {
++    if (snapshotId == Snapshot.CURRENT_STATE_ID || diffs == null) {
+       return null;
+     }
+     final int i = Collections.binarySearch(diffs, snapshotId);
+@@ -197,7 +220,7 @@ public final D getDiffById(final int snapshotId) {
+       // given snapshot and the next state so that the diff for the given
+       // snapshot was not recorded. Thus, return the next state.
+       final int j = -i - 1;
+-      return j < diffs.size()? diffs.get(j): null;
++      return j < diffs.size() ? diffs.get(j) : null;
+     }
+   }
+   
+@@ -211,6 +234,9 @@ public final int getSnapshotById(final int snapshotId) {
+   }
+ 
+   final int[] changedBetweenSnapshots(Snapshot from, Snapshot to) {
++    if (diffs == null) {
++      return null;
++    }
+     Snapshot earlier = from;
+     Snapshot later = to;
+     if (Snapshot.ID_COMPARATOR.compare(from, to) > 0) {
+@@ -277,11 +303,11 @@ public void saveSelf2Snapshot(int latestSnapshotId, N currentINode,
+   
+   @Override
+   public Iterator<D> iterator() {
+-    return diffs.iterator();
++    return diffs != null ? diffs.iterator() : Collections.<D>emptyIterator();
+   }
+ 
+   @Override
+   public String toString() {
+-    return getClass().getSimpleName() + ": " + diffs;
++    return getClass().getSimpleName() + ": " + (diffs != null ? diffs : "[]");
+   }
+ }
+-- 
+1.7.9.5
+

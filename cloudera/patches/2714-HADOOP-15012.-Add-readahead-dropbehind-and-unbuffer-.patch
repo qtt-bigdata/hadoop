@@ -1,0 +1,343 @@
+From 6a3a8bf008dd4e45f1903d6414c006de763e59d6 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 7 Dec 2017 21:11:29 -0800
+Subject: [PATCH 2714/2848] HADOOP-15012. Add readahead, dropbehind, and
+ unbuffer to StreamCapabilities. Contributed by
+ John Zhuge.
+
+(cherry picked from commit c9d48352c232ac9e031559cb99a18ff249d2b6c1)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+	hadoop-tools/hadoop-azure/src/main/java/org/apache/hadoop/fs/azure/BlockBlobAppendStream.java
+
+Change-Id: I6cae88506d33e4152fd4abaf97f9bd130952165f
+---
+ .../org/apache/hadoop/fs/FSDataInputStream.java    |   15 +++---
+ .../org/apache/hadoop/fs/StreamCapabilities.java   |   48 +++++++++++++-----
+ .../apache/hadoop/fs/StreamCapabilitiesPolicy.java |   51 ++++++++++++++++++++
+ .../java/org/apache/hadoop/util/StringUtils.java   |   24 ++++++++-
+ .../src/site/markdown/filesystem/filesystem.md     |   21 +++++---
+ .../org/apache/hadoop/hdfs/DFSInputStream.java     |   16 +++++-
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   11 +++--
+ 7 files changed, 152 insertions(+), 34 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilitiesPolicy.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FSDataInputStream.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FSDataInputStream.java
+index a80279d..08d71f1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FSDataInputStream.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FSDataInputStream.java
+@@ -38,7 +38,7 @@
+ public class FSDataInputStream extends DataInputStream
+     implements Seekable, PositionedReadable, 
+       ByteBufferReadable, HasFileDescriptor, CanSetDropBehind, CanSetReadahead,
+-      HasEnhancedByteBufferAccess, CanUnbuffer {
++      HasEnhancedByteBufferAccess, CanUnbuffer, StreamCapabilities {
+   /**
+    * Map ByteBuffers that we have handed out to readers to ByteBufferPool 
+    * objects
+@@ -227,12 +227,15 @@ public void releaseBuffer(ByteBuffer buffer) {
+ 
+   @Override
+   public void unbuffer() {
+-    try {
+-      ((CanUnbuffer)in).unbuffer();
+-    } catch (ClassCastException e) {
+-      throw new UnsupportedOperationException("this stream " +
+-          in.getClass().getName() + " does not " + "support unbuffering.");
++    StreamCapabilitiesPolicy.unbuffer(in);
++  }
++
++  @Override
++  public boolean hasCapability(String capability) {
++    if (in instanceof StreamCapabilities) {
++      return ((StreamCapabilities) in).hasCapability(capability);
+     }
++    return false;
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilities.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilities.java
+index 65aa679..3549cdc 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilities.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilities.java
+@@ -23,27 +23,49 @@
+ 
+ /**
+  * Interface to query streams for supported capabilities.
++ *
++ * Capability strings must be in lower case.
++ *
++ * Constant strings are chosen over enums in order to allow other file systems
++ * to define their own capabilities.
+  */
+ @InterfaceAudience.Public
+ @InterfaceStability.Evolving
+ public interface StreamCapabilities {
+   /**
++   * Stream hflush capability implemented by {@link Syncable#hflush()}.
++   */
++  String HFLUSH = "hflush";
++
++  /**
++   * Stream hsync capability implemented by {@link Syncable#hsync()}.
++   */
++  String HSYNC = "hsync";
++
++  /**
++   * Stream setReadahead capability implemented by
++   * {@link CanSetReadahead#setReadahead(Long)}.
++   */
++  String READAHEAD = "in:readahead";
++
++  /**
++   * Stream setDropBehind capability implemented by
++   * {@link CanSetDropBehind#setDropBehind(Boolean)}.
++   */
++  String DROPBEHIND = "dropbehind";
++
++  /**
++   * Stream unbuffer capability implemented by {@link CanUnbuffer#unbuffer()}.
++   */
++  String UNBUFFER = "in:unbuffer";
++
++  /**
+    * Capabilities that a stream can support and be queried for.
+    */
++  @Deprecated
+   enum StreamCapability {
+-    /**
+-     * Stream hflush capability to flush out the data in client's buffer.
+-     * Streams with this capability implement {@link Syncable} and support
+-     * {@link Syncable#hflush()}.
+-     */
+-    HFLUSH("hflush"),
+-
+-    /**
+-     * Stream hsync capability to flush out the data in client's buffer and
+-     * the disk device. Streams with this capability implement {@link Syncable}
+-     * and support {@link Syncable#hsync()}.
+-     */
+-    HSYNC("hsync");
++    HFLUSH(StreamCapabilities.HFLUSH),
++    HSYNC(StreamCapabilities.HSYNC);
+ 
+     private final String capability;
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilitiesPolicy.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilitiesPolicy.java
+new file mode 100644
+index 0000000..3080780
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/StreamCapabilitiesPolicy.java
+@@ -0,0 +1,51 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs;
++
++import java.io.InputStream;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++
++/**
++ * Static methods to implement policies for {@link StreamCapabilities}.
++ */
++@InterfaceAudience.Public
++@InterfaceStability.Evolving
++public class StreamCapabilitiesPolicy {
++  /**
++   * Implement the policy for {@link CanUnbuffer#unbuffer()}.
++   *
++   * @param in the input stream
++   */
++  public static void unbuffer(InputStream in) {
++    try {
++      if (in instanceof StreamCapabilities
++          && ((StreamCapabilities) in).hasCapability(
++          StreamCapabilities.UNBUFFER)) {
++        ((CanUnbuffer) in).unbuffer();
++      }
++    } catch (ClassCastException e) {
++      throw new UnsupportedOperationException("this stream " +
++          in.getClass().getName() +
++          " claims to unbuffer but forgets to implement CanUnbuffer");
++    }
++  }
++}
++
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/StringUtils.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/StringUtils.java
+index f88374b..7f92536 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/StringUtils.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/StringUtils.java
+@@ -1028,4 +1028,26 @@ public static String popFirstNonOption(List<String> args) {
+     }
+     return null;
+   }
+-}
++
++  /**
++   * Converts all of the characters in this String to lower case with
++   * Locale.ENGLISH.
++   *
++   * @param str  string to be converted
++   * @return     the str, converted to lowercase.
++   */
++  public static String toLowerCase(String str) {
++    return str.toLowerCase(Locale.ENGLISH);
++  }
++
++  /**
++   * Converts all of the characters in this String to upper case with
++   * Locale.ENGLISH.
++   *
++   * @param str  string to be converted
++   * @return     the str, converted to uppercase.
++   */
++  public static String toUpperCase(String str) {
++    return str.toUpperCase(Locale.ENGLISH);
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+index 04bdf44..71cf06c 100644
+--- a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+@@ -1204,7 +1204,8 @@ problems were not considered during the implementation of these loops.
+ ## <a name="StreamCapability"></a> interface `StreamCapabilities`
+ 
+ The `StreamCapabilities` provides a way to programmatically query the
+-capabilities that an `OutputStream` supports.
++capabilities that `OutputStream`, `InputStream`, or other FileSystem class
++supports.
+ 
+ ```java
+ public interface StreamCapabilities {
+@@ -1214,12 +1215,16 @@ public interface StreamCapabilities {
+ 
+ ### `boolean hasCapability(capability)`
+ 
+-Return true if the `OutputStream` has the desired capability.
++Return true if the `OutputStream`, `InputStream`, or other FileSystem class
++has the desired capability.
+ 
+ The caller can query the capabilities of a stream using a string value.
+-It currently supports to query:
+-
+- * `StreamCapabilties.HFLUSH` ("*hflush*"): the capability to flush out the data
+- in client's buffer.
+- * `StreamCapabilities.HSYNC` ("*hsync*"): capability to flush out the data in
+- client's buffer and the disk device.
+\ No newline at end of file
++Here is a table of possible string values:
++
++String       | Constant   | Implements       | Description
++-------------|------------|------------------|-------------------------------
++hflush       | HFLUSH     | Syncable         | Flush out the data in client's user buffer. After the return of this call, new readers will see the data.
++hsync        | HSYNC      | Syncable         | Flush out the data in client's user buffer all the way to the disk device (but the disk may have it in its cache). Similar to POSIX fsync.
++in:readahead | READAHEAD  | CanSetReadahead  | Set the readahead on the input stream.
++dropbehind   | DROPBEHIND | CanSetDropBehind | Drop the cache.
++in:unbuffer  | UNBUFFER   | CanUnbuffer      | Reduce the buffering on the input stream.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+index b49eddc..130aede 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+@@ -58,6 +58,7 @@
+ import org.apache.hadoop.fs.HasEnhancedByteBufferAccess;
+ import org.apache.hadoop.fs.ReadOption;
+ import org.apache.hadoop.fs.UnresolvedLinkException;
++import org.apache.hadoop.fs.StreamCapabilities;
+ import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+@@ -78,6 +79,7 @@
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.util.IdentityHashStore;
++import org.apache.hadoop.util.StringUtils;
+ import org.apache.htrace.core.SpanId;
+ import org.apache.htrace.core.TraceScope;
+ import org.apache.htrace.core.Tracer;
+@@ -92,7 +94,7 @@
+ @InterfaceAudience.Private
+ public class DFSInputStream extends FSInputStream
+ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
+-    HasEnhancedByteBufferAccess, CanUnbuffer {
++    HasEnhancedByteBufferAccess, CanUnbuffer, StreamCapabilities {
+   @VisibleForTesting
+   public static boolean tcpReadsDisabledForTesting = false;
+   private long hedgedReadOpsLoopNumForTesting = 0;
+@@ -1945,4 +1947,16 @@ public synchronized void releaseBuffer(ByteBuffer buffer) {
+   public synchronized void unbuffer() {
+     closeCurrentBlockReader();
+   }
++
++  @Override
++  public boolean hasCapability(String capability) {
++    switch (StringUtils.toLowerCase(capability)) {
++    case StreamCapabilities.READAHEAD:
++    case StreamCapabilities.DROPBEHIND:
++    case StreamCapabilities.UNBUFFER:
++      return true;
++    default:
++      return false;
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index a672224..5d6a57d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -18,8 +18,6 @@
+ package org.apache.hadoop.hdfs;
+ 
+ import static org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.Status.SUCCESS;
+-import static org.apache.hadoop.fs.StreamCapabilities.StreamCapability.HFLUSH;
+-import static org.apache.hadoop.fs.StreamCapabilities.StreamCapability.HSYNC;
+ 
+ import java.io.BufferedOutputStream;
+ import java.io.DataInputStream;
+@@ -98,6 +96,7 @@
+ import org.apache.hadoop.util.DataChecksum;
+ import org.apache.hadoop.util.DataChecksum.Type;
+ import org.apache.hadoop.util.Progressable;
++import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+ import org.apache.htrace.core.Span;
+ import org.apache.htrace.core.SpanId;
+@@ -2420,11 +2419,13 @@ public void hsync(EnumSet<SyncFlag> syncFlags) throws IOException {
+ 
+   @Override
+   public boolean hasCapability(String capability) {
+-    if (capability.equalsIgnoreCase(HSYNC.getValue()) ||
+-        capability.equalsIgnoreCase((HFLUSH.getValue()))) {
++    switch (StringUtils.toLowerCase(capability)) {
++    case StreamCapabilities.HSYNC:
++    case StreamCapabilities.HFLUSH:
+       return true;
++    default:
++      return false;
+     }
+-    return false;
+   }
+ 
+   /**
+-- 
+1.7.9.5
+

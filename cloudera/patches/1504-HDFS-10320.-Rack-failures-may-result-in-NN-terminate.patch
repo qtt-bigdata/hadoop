@@ -1,0 +1,559 @@
+From 1ff7b3561aafcbbd174f4ed11e05d89607979d92 Mon Sep 17 00:00:00 2001
+From: Ming Ma <mingma@apache.org>
+Date: Wed, 4 May 2016 17:02:26 -0700
+Subject: [PATCH 1504/2848] HDFS-10320. Rack failures may result in NN
+ terminate. (Xiao Chen via mingma)
+
+(cherry picked from commit 1268cf5fbe4458fa75ad0662512d352f9e8d3470)
+(cherry picked from commit d6e95ae47b6281219ca2b634507ece3b4ac6a12e)
+
+Change-Id: Ia712417c3751ec2cc8d0dbc71a0961c57fd63bd0
+---
+ .../org/apache/hadoop/net/NetworkTopology.java     |  109 ++++++++++++++------
+ .../AvailableSpaceBlockPlacementPolicy.java        |   11 +-
+ .../BlockPlacementPolicyDefault.java               |   84 +++++++--------
+ .../web/resources/NamenodeWebHdfsMethods.java      |   13 ++-
+ .../org/apache/hadoop/net/TestNetworkTopology.java |   75 ++++++++++++--
+ 5 files changed, 196 insertions(+), 96 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetworkTopology.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetworkTopology.java
+index 573c534..e3cc655 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetworkTopology.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetworkTopology.java
+@@ -28,13 +28,13 @@
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.util.ReflectionUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.Lists;
+@@ -53,8 +53,8 @@
+ public class NetworkTopology {
+   public final static String DEFAULT_RACK = "/default-rack";
+   public final static int DEFAULT_HOST_LEVEL = 2;
+-  public static final Log LOG =
+-    LogFactory.getLog(NetworkTopology.class);
++  public static final Logger LOG =
++      LoggerFactory.getLogger(NetworkTopology.class);
+ 
+   public static class InvalidTopologyException extends RuntimeException {
+     private static final long serialVersionUID = 1L;
+@@ -433,9 +433,7 @@ public void add(Node node) {
+           }
+         }
+       }
+-      if(LOG.isDebugEnabled()) {
+-        LOG.debug("NetworkTopology became:\n" + this.toString());
+-      }
++      LOG.debug("NetworkTopology became:\n{}", this.toString());
+     } finally {
+       netlock.writeLock().unlock();
+     }
+@@ -508,9 +506,7 @@ public void remove(Node node) {
+           numOfRacks--;
+         }
+       }
+-      if(LOG.isDebugEnabled()) {
+-        LOG.debug("NetworkTopology became:\n" + this.toString());
+-      }
++      LOG.debug("NetworkTopology became:\n{}", this.toString());
+     } finally {
+       netlock.writeLock().unlock();
+     }
+@@ -703,26 +699,45 @@ void setRandomSeed(long seed) {
+     r.setSeed(seed);
+   }
+ 
+-  /** randomly choose one node from <i>scope</i>
+-   * if scope starts with ~, choose one from the all nodes except for the
+-   * ones in <i>scope</i>; otherwise, choose one from <i>scope</i>
++  /**
++   * Randomly choose a node.
++   *
+    * @param scope range of nodes from which a node will be chosen
+    * @return the chosen node
++   *
++   * @see #chooseRandom(String, Collection)
+    */
+-  public Node chooseRandom(String scope) {
++  public Node chooseRandom(final String scope) {
++    return chooseRandom(scope, null);
++  }
++
++  /**
++   * Randomly choose one node from <i>scope</i>.
++   *
++   * If scope starts with ~, choose one from the all nodes except for the
++   * ones in <i>scope</i>; otherwise, choose one from <i>scope</i>.
++   * If excludedNodes is given, choose a node that's not in excludedNodes.
++   *
++   * @param scope range of nodes from which a node will be chosen
++   * @param excludedNodes nodes to be excluded from
++   * @return the chosen node
++   */
++  public Node chooseRandom(final String scope,
++      final Collection<Node> excludedNodes) {
+     netlock.readLock().lock();
+     try {
+       if (scope.startsWith("~")) {
+-        return chooseRandom(NodeBase.ROOT, scope.substring(1));
++        return chooseRandom(NodeBase.ROOT, scope.substring(1), excludedNodes);
+       } else {
+-        return chooseRandom(scope, null);
++        return chooseRandom(scope, null, excludedNodes);
+       }
+     } finally {
+       netlock.readLock().unlock();
+     }
+   }
+ 
+-  private Node chooseRandom(String scope, String excludedScope){
++  private Node chooseRandom(final String scope, String excludedScope,
++      final Collection<Node> excludedNodes) {
+     if (excludedScope != null) {
+       if (scope.startsWith(excludedScope)) {
+         return null;
+@@ -733,7 +748,8 @@ private Node chooseRandom(String scope, String excludedScope){
+     }
+     Node node = getNode(scope);
+     if (!(node instanceof InnerNode)) {
+-      return node;
++      return excludedNodes != null && excludedNodes.contains(node) ?
++          null : node;
+     }
+     InnerNode innerNode = (InnerNode)node;
+     int numOfDatanodes = innerNode.getNumOfLeaves();
+@@ -748,12 +764,36 @@ private Node chooseRandom(String scope, String excludedScope){
+       }
+     }
+     if (numOfDatanodes == 0) {
+-      throw new InvalidTopologyException(
+-          "Failed to find datanode (scope=\"" + String.valueOf(scope) +
+-          "\" excludedScope=\"" + String.valueOf(excludedScope) + "\").");
++      LOG.warn("Failed to find datanode (scope=\"{}\" excludedScope=\"{}\").",
++          String.valueOf(scope), String.valueOf(excludedScope));
++      return null;
++    }
++    Node ret = null;
++    final int availableNodes;
++    if (excludedScope == null) {
++      availableNodes = countNumOfAvailableNodes(scope, excludedNodes);
++    } else {
++      availableNodes =
++          countNumOfAvailableNodes("~" + excludedScope, excludedNodes);
++    }
++    LOG.debug("Choosing random from {} available nodes on node {},"
++        + " scope={}, excludedScope={}, excludeNodes={}", availableNodes,
++        innerNode.toString(), scope, excludedScope, excludedNodes);
++    if (availableNodes > 0) {
++      do {
++        int leaveIndex = r.nextInt(numOfDatanodes);
++        ret = innerNode.getLeaf(leaveIndex, node);
++        if (excludedNodes == null || !excludedNodes.contains(ret)) {
++          break;
++        } else {
++          LOG.debug("Node {} is excluded, continuing.", ret);
++        }
++        // We've counted numOfAvailableNodes inside the lock, so there must be
++        // at least 1 satisfying node. Keep trying until we found it.
++      } while (true);
+     }
+-    int leaveIndex = r.nextInt(numOfDatanodes);
+-    return innerNode.getLeaf(leaveIndex, node);
++    LOG.debug("chooseRandom returning {}", ret);
++    return ret;
+   }
+ 
+   /** return leaves in <i>scope</i>
+@@ -781,6 +821,7 @@ private Node chooseRandom(String scope, String excludedScope){
+    * @param excludedNodes a list of nodes
+    * @return number of available nodes
+    */
++  @VisibleForTesting
+   public int countNumOfAvailableNodes(String scope,
+                                       Collection<Node> excludedNodes) {
+     boolean isExcluded=false;
+@@ -793,16 +834,18 @@ public int countNumOfAvailableNodes(String scope,
+     int excludedCountOffScope = 0; // the number of nodes outside scope & excludedNodes
+     netlock.readLock().lock();
+     try {
+-      for (Node node : excludedNodes) {
+-        node = getNode(NodeBase.getPath(node));
+-        if (node == null) {
+-          continue;
+-        }
+-        if ((NodeBase.getPath(node) + NodeBase.PATH_SEPARATOR_STR)
+-            .startsWith(scope + NodeBase.PATH_SEPARATOR_STR)) {
+-          excludedCountInScope++;
+-        } else {
+-          excludedCountOffScope++;
++      if (excludedNodes != null) {
++        for (Node node : excludedNodes) {
++          node = getNode(NodeBase.getPath(node));
++          if (node == null) {
++            continue;
++          }
++          if ((NodeBase.getPath(node) + NodeBase.PATH_SEPARATOR_STR)
++              .startsWith(scope + NodeBase.PATH_SEPARATOR_STR)) {
++            excludedCountInScope++;
++          } else {
++            excludedCountOffScope++;
++          }
+         }
+       }
+       Node n = getNode(scope);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/AvailableSpaceBlockPlacementPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/AvailableSpaceBlockPlacementPolicy.java
+index a5805cf..c1e0a19 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/AvailableSpaceBlockPlacementPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/AvailableSpaceBlockPlacementPolicy.java
+@@ -21,6 +21,7 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AVAILABLE_SPACE_BLOCK_PLACEMENT_POLICY_BALANCED_SPACE_PREFERENCE_FRACTION_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AVAILABLE_SPACE_BLOCK_PLACEMENT_POLICY_BALANCED_SPACE_PREFERENCE_FRACTION_DEFAULT;
+ 
++import java.util.Collection;
+ import java.util.Random;
+ 
+ import org.apache.commons.logging.Log;
+@@ -29,6 +30,7 @@
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.server.namenode.FSClusterStats;
+ import org.apache.hadoop.net.NetworkTopology;
++import org.apache.hadoop.net.Node;
+ 
+ /**
+  * Space balanced block placement policy.
+@@ -69,9 +71,12 @@ public void initialize(Configuration conf, FSClusterStats stats,
+   }
+ 
+   @Override
+-  protected DatanodeDescriptor chooseDataNode(String scope) {
+-    DatanodeDescriptor a = (DatanodeDescriptor) clusterMap.chooseRandom(scope);
+-    DatanodeDescriptor b = (DatanodeDescriptor) clusterMap.chooseRandom(scope);
++  protected DatanodeDescriptor chooseDataNode(final String scope,
++      final Collection<Node> excludedNode) {
++    DatanodeDescriptor a =
++        (DatanodeDescriptor) clusterMap.chooseRandom(scope, excludedNode);
++    DatanodeDescriptor b =
++        (DatanodeDescriptor) clusterMap.chooseRandom(scope, excludedNode);
+     int ret = compareDataNode(a, b);
+     if (ret == 0) {
+       return a;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index 036e34a..8f8640f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -21,6 +21,7 @@
+ 
+ import java.util.*;
+ 
++import com.google.common.base.Preconditions;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+@@ -586,10 +587,9 @@ private DatanodeStorageInfo chooseFromNextRack(Node next,
+   /** 
+    * Choose <i>numOfReplicas</i> nodes from the racks 
+    * that <i>localMachine</i> is NOT on.
+-   * if not enough nodes are available, choose the remaining ones 
++   * If not enough nodes are available, choose the remaining ones
+    * from the local rack
+    */
+-    
+   protected void chooseRemoteRack(int numOfReplicas,
+                                 DatanodeDescriptor localMachine,
+                                 Set<Node> excludedNodes,
+@@ -645,10 +645,6 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+                             boolean avoidStaleNodes,
+                             EnumMap<StorageType, Integer> storageTypes)
+                             throws NotEnoughReplicasException {
+-
+-    int numOfAvailableNodes = clusterMap.countNumOfAvailableNodes(
+-        scope, excludedNodes);
+-    int refreshCounter = numOfAvailableNodes;
+     StringBuilder builder = null;
+     if (LOG.isDebugEnabled()) {
+       builder = debugLoggingBuilder.get();
+@@ -657,37 +653,39 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+     }
+     boolean badTarget = false;
+     DatanodeStorageInfo firstChosen = null;
+-    while(numOfReplicas > 0 && numOfAvailableNodes > 0) {
+-      DatanodeDescriptor chosenNode = chooseDataNode(scope);
+-      if (excludedNodes.add(chosenNode)) { //was not in the excluded list
+-        if (LOG.isDebugEnabled()) {
+-          builder.append("\nNode ").append(NodeBase.getPath(chosenNode)).append(" [");
+-        }
+-        numOfAvailableNodes--;
+-        DatanodeStorageInfo storage = null;
+-        if (isGoodDatanode(chosenNode, maxNodesPerRack, considerLoad,
+-            results, avoidStaleNodes)) {
+-          for (Iterator<Map.Entry<StorageType, Integer>> iter = storageTypes
+-              .entrySet().iterator(); iter.hasNext(); ) {
+-            Map.Entry<StorageType, Integer> entry = iter.next();
+-            storage = chooseStorage4Block(
+-                chosenNode, blocksize, results, entry.getKey());
+-            if (storage != null) {
+-              numOfReplicas--;
+-              if (firstChosen == null) {
+-                firstChosen = storage;
+-              }
+-              // add node and related nodes to excludedNode
+-              numOfAvailableNodes -=
+-                  addToExcludedNodes(chosenNode, excludedNodes);
+-              int num = entry.getValue();
+-              if (num == 1) {
+-                iter.remove();
+-              } else {
+-                entry.setValue(num - 1);
+-              }
+-              break;
++    while (numOfReplicas > 0) {
++      DatanodeDescriptor chosenNode = chooseDataNode(scope, excludedNodes);
++      if (chosenNode == null) {
++        break;
++      }
++      Preconditions.checkState(excludedNodes.add(chosenNode), "chosenNode "
++          + chosenNode + " is already in excludedNodes " + excludedNodes);
++      if (LOG.isDebugEnabled()) {
++        builder.append("\nNode ").append(NodeBase.getPath(chosenNode))
++            .append(" [");
++      }
++      DatanodeStorageInfo storage = null;
++      if (isGoodDatanode(chosenNode, maxNodesPerRack, considerLoad,
++          results, avoidStaleNodes)) {
++        for (Iterator<Map.Entry<StorageType, Integer>> iter = storageTypes
++            .entrySet().iterator(); iter.hasNext();) {
++          Map.Entry<StorageType, Integer> entry = iter.next();
++          storage = chooseStorage4Block(
++              chosenNode, blocksize, results, entry.getKey());
++          if (storage != null) {
++            numOfReplicas--;
++            if (firstChosen == null) {
++              firstChosen = storage;
+             }
++            // add node (subclasses may also add related nodes) to excludedNode
++            addToExcludedNodes(chosenNode, excludedNodes);
++            int num = entry.getValue();
++            if (num == 1) {
++              iter.remove();
++            } else {
++              entry.setValue(num - 1);
++            }
++            break;
+           }
+         }
+ 
+@@ -698,16 +696,7 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+         // If no candidate storage was found on this DN then set badTarget.
+         badTarget = (storage == null);
+       }
+-      // Refresh the node count. If the live node count became smaller,
+-      // but it is not reflected in this loop, it may loop forever in case
+-      // the replicas/rack cannot be satisfied.
+-      if (--refreshCounter == 0) {
+-        numOfAvailableNodes = clusterMap.countNumOfAvailableNodes(scope,
+-            excludedNodes);
+-        refreshCounter = numOfAvailableNodes;
+-      }
+     }
+-      
+     if (numOfReplicas>0) {
+       String detail = enableDebugLogging;
+       if (LOG.isDebugEnabled()) {
+@@ -728,8 +717,9 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+    * Choose a datanode from the given <i>scope</i>.
+    * @return the chosen node, if there is any.
+    */
+-  protected DatanodeDescriptor chooseDataNode(final String scope) {
+-    return (DatanodeDescriptor) clusterMap.chooseRandom(scope);
++  protected DatanodeDescriptor chooseDataNode(final String scope,
++      final Collection<Node> excludedNodes) {
++    return (DatanodeDescriptor) clusterMap.chooseRandom(scope, excludedNodes);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
+index e688bb6..49d21af 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
+@@ -79,7 +79,6 @@
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.ipc.RetriableException;
+ import org.apache.hadoop.ipc.Server;
+-import org.apache.hadoop.net.NetworkTopology.InvalidTopologyException;
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.net.NodeBase;
+ import org.apache.hadoop.security.Credentials;
+@@ -219,7 +218,7 @@ static DatanodeInfo chooseDatanode(final NameNode namenode,
+     } 
+ 
+     return (DatanodeDescriptor)bm.getDatanodeManager().getNetworkTopology(
+-        ).chooseRandom(NodeBase.ROOT);
++        ).chooseRandom(NodeBase.ROOT, excludes);
+   }
+ 
+   /**
+@@ -259,11 +258,11 @@ private URI redirectURI(final NameNode namenode,
+       final long blocksize, final String excludeDatanodes,
+       final Param<?, ?>... parameters) throws URISyntaxException, IOException {
+     final DatanodeInfo dn;
+-    try {
+-      dn = chooseDatanode(namenode, path, op, openOffset, blocksize,
+-          excludeDatanodes);
+-    } catch (InvalidTopologyException ite) {
+-      throw new IOException("Failed to find datanode, suggest to check cluster health.", ite);
++    dn = chooseDatanode(namenode, path, op, openOffset, blocksize,
++        excludeDatanodes);
++    if (dn == null) {
++      throw new IOException("Failed to find datanode, suggest to check cluster"
++          + " health. excludeDatanodes=" + excludeDatanodes);
+     }
+ 
+     final String delegationQuery;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/net/TestNetworkTopology.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/net/TestNetworkTopology.java
+index 1758807..67c8dd6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/net/TestNetworkTopology.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/net/TestNetworkTopology.java
+@@ -23,8 +23,11 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import java.util.Collection;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -38,13 +41,18 @@
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.junit.Assert;
+ import org.junit.Before;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ 
+ public class TestNetworkTopology {
+   private static final Log LOG = LogFactory.getLog(TestNetworkTopology.class);
+   private final static NetworkTopology cluster = new NetworkTopology();
+   private DatanodeDescriptor dataNodes[];
+-  
++
++  @Rule
++  public Timeout testTimeout = new Timeout(30000);
++
+   @Before
+   public void setupDatanodes() {
+     dataNodes = new DatanodeDescriptor[] {
+@@ -264,15 +272,17 @@ public void testRemove() throws Exception {
+    * @return the frequency that nodes were chosen
+    */
+   private Map<Node, Integer> pickNodesAtRandom(int numNodes,
+-      String excludedScope) {
++      String excludedScope, Collection<Node> excludedNodes) {
+     Map<Node, Integer> frequency = new HashMap<Node, Integer>();
+     for (DatanodeDescriptor dnd : dataNodes) {
+       frequency.put(dnd, 0);
+     }
+ 
+     for (int j = 0; j < numNodes; j++) {
+-      Node random = cluster.chooseRandom(excludedScope);
+-      frequency.put(random, frequency.get(random) + 1);
++      Node random = cluster.chooseRandom(excludedScope, excludedNodes);
++      if (random != null) {
++        frequency.put(random, frequency.get(random) + 1);
++      }
+     }
+     return frequency;
+   }
+@@ -283,7 +293,7 @@ public void testRemove() throws Exception {
+   @Test
+   public void testChooseRandomExcludedNode() {
+     String scope = "~" + NodeBase.getPath(dataNodes[0]);
+-    Map<Node, Integer> frequency = pickNodesAtRandom(100, scope);
++    Map<Node, Integer> frequency = pickNodesAtRandom(100, scope, null);
+ 
+     for (Node key : dataNodes) {
+       // all nodes except the first should be more than zero
+@@ -296,7 +306,7 @@ public void testChooseRandomExcludedNode() {
+    */
+   @Test
+   public void testChooseRandomExcludedRack() {
+-    Map<Node, Integer> frequency = pickNodesAtRandom(100, "~" + "/d2");
++    Map<Node, Integer> frequency = pickNodesAtRandom(100, "~" + "/d2", null);
+     // all the nodes on the second rack should be zero
+     for (int j = 0; j < dataNodes.length; j++) {
+       int freq = frequency.get(dataNodes[j]);
+@@ -308,6 +318,59 @@ public void testChooseRandomExcludedRack() {
+     }
+   }
+ 
++  /**
++   * This test checks that chooseRandom works for a list of excluded nodes.
++   */
++  @Test
++  public void testChooseRandomExcludedNodeList() {
++    String scope = "~" + NodeBase.getPath(dataNodes[0]);
++    Set<Node> excludedNodes = new HashSet<>();
++    excludedNodes.add(dataNodes[3]);
++    excludedNodes.add(dataNodes[5]);
++    excludedNodes.add(dataNodes[7]);
++    excludedNodes.add(dataNodes[9]);
++    excludedNodes.add(dataNodes[13]);
++    excludedNodes.add(dataNodes[18]);
++    Map<Node, Integer> frequency = pickNodesAtRandom(100, scope, excludedNodes);
++
++    assertEquals("dn[3] should be excluded", 0,
++        frequency.get(dataNodes[3]).intValue());
++    assertEquals("dn[5] should be exclude18d", 0,
++        frequency.get(dataNodes[5]).intValue());
++    assertEquals("dn[7] should be excluded", 0,
++        frequency.get(dataNodes[7]).intValue());
++    assertEquals("dn[9] should be excluded", 0,
++        frequency.get(dataNodes[9]).intValue());
++    assertEquals("dn[13] should be excluded", 0,
++        frequency.get(dataNodes[13]).intValue());
++    assertEquals("dn[18] should be excluded", 0,
++        frequency.get(dataNodes[18]).intValue());
++    for (Node key : dataNodes) {
++      if (excludedNodes.contains(key)) {
++        continue;
++      }
++      // all nodes except the first should be more than zero
++      assertTrue(frequency.get(key) > 0 || key == dataNodes[0]);
++    }
++  }
++
++  /**
++   * This test checks that chooseRandom works when all nodes are excluded.
++   */
++  @Test
++  public void testChooseRandomExcludeAllNodes() {
++    String scope = "~" + NodeBase.getPath(dataNodes[0]);
++    Set<Node> excludedNodes = new HashSet<>();
++    for (int i = 0; i < dataNodes.length; i++) {
++      excludedNodes.add(dataNodes[i]);
++    }
++    Map<Node, Integer> frequency = pickNodesAtRandom(100, scope, excludedNodes);
++    for (Node key : dataNodes) {
++      // all nodes except the first should be more than zero
++      assertTrue(frequency.get(key) == 0);
++    }
++  }
++
+   @Test(timeout=180000)
+   public void testInvalidNetworkTopologiesNotCachedInHdfs() throws Exception {
+     // start a cluster
+-- 
+1.7.9.5
+

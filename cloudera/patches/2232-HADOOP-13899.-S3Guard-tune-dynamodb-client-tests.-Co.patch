@@ -1,0 +1,711 @@
+From 627c9283a666828dfbac20ad33c238b76e7d10c9 Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Wed, 14 Dec 2016 15:19:10 -0800
+Subject: [PATCH 2232/2848] HADOOP-13899. S3Guard: tune dynamodb client &
+ tests. Contributed by Steve Loughran
+
+(cherry picked from commit 02d9c0f3763813efb699438aaddb3f665048cfcc)
+
+Conflicts:
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+	hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+
+Change-Id: Ibcbaba547fadfefd9beb219cd1046b6e21cd1880
+---
+ .../java/org/apache/hadoop/fs/s3a/Constants.java   |   68 +++++++++++++++++
+ .../fs/s3a/s3guard/DynamoDBClientFactory.java      |    7 +-
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |   59 ++++++++-------
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |   77 ++++++--------------
+ .../apache/hadoop/fs/s3a/AbstractS3AMockTest.java  |    1 -
+ .../org/apache/hadoop/fs/s3a/S3ATestUtils.java     |   60 +++++++++++++++
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |   16 ++--
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |    8 +-
+ .../fs/s3a/s3guard/TestLocalMetadataStore.java     |   34 +++------
+ 9 files changed, 215 insertions(+), 115 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index 7dee6c6..bdbc333 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -326,4 +326,72 @@ private Constants() {
+   @InterfaceAudience.Private
+   public static final String SSE_S3_WITH_KEY_ERROR = S3AEncryptionMethods.SSE_S3
+       .getMethod() +" is configured and an " + "encryption key is provided";
++
++  /**
++   * Classname of the S3A-specific output committer factory. This
++   * is what must be declared when attempting to use
++   */
++  @InterfaceStability.Unstable
++  public static final String S3A_OUTPUT_COMMITTER_FACTORY =
++      "org.apache.hadoop.fs.s3a.commit.S3AOutputCommitterFactory";
++
++  /* Constants. */
++  public static final String S3_METADATA_STORE_IMPL =
++      "fs.s3a.metadatastore.impl";
++  /**
++   * The endpoint of the DynamoDB service.
++   *
++   * This config has no default value. If the user does not set this, the AWS
++   * SDK will find the endpoint automatically by the Region.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_ENDPOINT_KEY =
++      "fs.s3a.s3guard.ddb.endpoint";
++  /**
++   * The DynamoDB table name to use.
++   *
++   * This config has no default value. If the user does not set this, the
++   * S3Guard implementation will use the respective S3 bucket name.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_TABLE_NAME_KEY =
++      "fs.s3a.s3guard.ddb.table";
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_TABLE_CAPACITY_READ_KEY =
++      "fs.s3a.s3guard.ddb.table.capacity.read";
++  public static final long S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT = 500;
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY =
++      "fs.s3a.s3guard.ddb.table.capacity.write";
++  public static final long S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT = 100;
++
++  /**
++   * V1 committer.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3A_OUTPUT_COMMITTER_MRV1 =
++      "org.apache.hadoop.fs.s3a.commit.S3OutputCommitterMRv1";
++
++  /**
++   * The default "Null" metadata store: {@value}.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_METASTORE_NULL
++      = "org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore";
++
++  /**
++   * Use Local memory for the metadata: {@value}.
++   * This is not coherent across processes and must be used for testing only.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_METASTORE_LOCAL
++      = "org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore";
++
++  /**
++   * Use DynamoDB for the metadata: {@value}.
++   */
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_METASTORE_DYNAMO
++      = "org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore";
++
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+index a06197f..1cbf464 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBClientFactory.java
+@@ -34,6 +34,7 @@
+ import org.apache.hadoop.conf.Configured;
+ import org.apache.hadoop.fs.s3a.DefaultS3ClientFactory;
+ 
++import static org.apache.hadoop.fs.s3a.Constants.S3GUARD_DDB_ENDPOINT_KEY;
+ import static org.apache.hadoop.fs.s3a.S3AUtils.createAWSCredentialProviderSet;
+ 
+ /**
+@@ -73,7 +74,7 @@ public AmazonDynamoDBClient createDynamoDBClient(URI fsUri, String s3Region)
+         LOG.error(msg);
+         throw new IllegalArgumentException(msg, e);
+       }
+-      LOG.info("Creating DynamoDBClient for fsUri {} in region {}",
++      LOG.debug("Creating DynamoDBClient for fsUri {} in region {}",
+           fsUri, region);
+ 
+       final Configuration conf = getConf();
+@@ -84,10 +85,10 @@ public AmazonDynamoDBClient createDynamoDBClient(URI fsUri, String s3Region)
+       AmazonDynamoDBClient ddb = new AmazonDynamoDBClient(credentials, awsConf);
+ 
+       ddb.withRegion(region.toAWSRegion());
+-      final String endPoint = conf.get(S3Guard.S3GUARD_DDB_ENDPOINT_KEY);
++      final String endPoint = conf.getTrimmed(S3GUARD_DDB_ENDPOINT_KEY);
+       if (StringUtils.isNotEmpty(endPoint)) {
+         try {
+-          ddb.withEndpoint(conf.get(S3Guard.S3GUARD_DDB_ENDPOINT_KEY));
++          ddb.withEndpoint(endPoint);
+         } catch (IllegalArgumentException e) {
+           final String msg = "Incorrect DynamoDB endpoint: "  + endPoint;
+           LOG.error(msg, e);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index aad43ae..220bdfd 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.fs.s3a.s3guard;
+ 
+ import java.io.IOException;
++import java.io.InterruptedIOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Iterator;
+@@ -26,7 +27,6 @@
+ import java.util.Map;
+ 
+ import com.amazonaws.AmazonClientException;
+-import com.amazonaws.regions.Region;
+ import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
+ import com.amazonaws.services.dynamodbv2.document.BatchWriteItemOutcome;
+ import com.amazonaws.services.dynamodbv2.document.DynamoDB;
+@@ -56,12 +56,13 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.fs.s3a.Constants;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
+ import org.apache.hadoop.fs.s3a.S3AFileSystem;
+ import org.apache.hadoop.fs.s3a.S3ClientFactory;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
++import static org.apache.hadoop.fs.s3a.s3guard.S3Guard.*;
++import static org.apache.hadoop.fs.s3a.Constants.*;
+ import static org.apache.hadoop.fs.s3a.S3AUtils.*;
+ import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.*;
+ 
+@@ -71,7 +72,7 @@
+  *
+  * The current implementation uses a schema consisting of a single table.  The
+  * name of the table can be configured by config key
+- * {@link S3Guard#S3GUARD_DDB_TABLE_NAME_KEY}.
++ * {@link org.apache.hadoop.fs.s3a.Constants#S3GUARD_DDB_TABLE_NAME_KEY}.
+  * By default, it matches the name of the S3 bucket.  Each item in the table
+  * represents a single directory or file.  Its path is split into separate table
+  * attributes:
+@@ -164,29 +165,30 @@ public void initialize(FileSystem fs) throws IOException {
+     Preconditions.checkArgument(fs instanceof S3AFileSystem,
+         "DynamoDBMetadataStore only supports S3A filesystem.");
+     s3afs = (S3AFileSystem) fs;
+-    final String bucket = s3afs.getUri().getAuthority();
++    final String bucket = s3afs.getBucket();
+     try {
+       region = s3afs.getAmazonS3Client().getBucketLocation(bucket);
+     } catch (AmazonClientException e) {
+-      throw new IOException("Can not find location for bucket " + bucket, e);
++      throw translateException("Determining bucket location",
++          fs.getUri().toString(), e);
+     }
+ 
+     username = s3afs.getUsername();
+ 
+     final Configuration conf = s3afs.getConf();
+     Class<? extends DynamoDBClientFactory> cls = conf.getClass(
+-        S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL,
+-        S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT,
++        S3GUARD_DDB_CLIENT_FACTORY_IMPL,
++        S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT,
+         DynamoDBClientFactory.class);
+     AmazonDynamoDBClient dynamoDBClient = ReflectionUtils.newInstance(cls, conf)
+         .createDynamoDBClient(s3afs.getUri(), region);
+     dynamoDB = new DynamoDB(dynamoDBClient);
+ 
+     // use the bucket as the DynamoDB table name if not specified in config
+-    tableName = conf.getTrimmed(S3Guard.S3GUARD_DDB_TABLE_NAME_KEY, bucket);
++    tableName = conf.getTrimmed(S3GUARD_DDB_TABLE_NAME_KEY, bucket);
+ 
+     // create the table unless it's explicitly told not to do so
+-    if (conf.getBoolean(S3Guard.S3GUARD_DDB_TABLE_CREATE_KEY, true)) {
++    if (conf.getBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, true)) {
+       createTable();
+     }
+   }
+@@ -210,12 +212,12 @@ void initialize(Configuration conf) throws IOException {
+     s3afs = (S3AFileSystem) defautFs;
+ 
+     // use the bucket as the DynamoDB table name if not specified in config
+-    tableName = conf.getTrimmed(S3Guard.S3GUARD_DDB_TABLE_NAME_KEY);
++    tableName = conf.getTrimmed(S3GUARD_DDB_TABLE_NAME_KEY);
+     Preconditions.checkNotNull(tableName, "No DynamoDB table name configured!");
+ 
+     final Class<? extends S3ClientFactory> clsS3 = conf.getClass(
+-        Constants.S3_CLIENT_FACTORY_IMPL,
+-        Constants.DEFAULT_S3_CLIENT_FACTORY_IMPL,
++        S3_CLIENT_FACTORY_IMPL,
++        DEFAULT_S3_CLIENT_FACTORY_IMPL,
+         S3ClientFactory.class);
+     final S3ClientFactory factory = ReflectionUtils.newInstance(clsS3, conf);
+     AmazonS3 s3 = factory.createS3Client(s3afs.getUri(), s3afs.getUri());
+@@ -226,9 +228,10 @@ void initialize(Configuration conf) throws IOException {
+     }
+ 
+     Class<? extends DynamoDBClientFactory> clsDdb = conf.getClass(
+-        S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL,
+-        S3Guard.S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT,
++        S3GUARD_DDB_CLIENT_FACTORY_IMPL,
++        S3GUARD_DDB_CLIENT_FACTORY_IMPL_DEFAULT,
+         DynamoDBClientFactory.class);
++    LOG.debug("Creating dynamo DB client {}", clsDdb);
+     AmazonDynamoDBClient dynamoDBClient =
+         ReflectionUtils.newInstance(clsDdb, conf)
+             .createDynamoDBClient(s3afs.getUri(), region);
+@@ -408,9 +411,9 @@ public void put(DirListingMetadata meta) throws IOException {
+   }
+ 
+   @Override
+-  public void close() {
++  public synchronized void close() {
+     if (dynamoDB != null) {
+-      LOG.info("Shutting down {}", this);
++      LOG.debug("Shutting down {}", this);
+       dynamoDB.shutdown();
+       dynamoDB = null;
+     }
+@@ -418,7 +421,12 @@ public void close() {
+ 
+   @Override
+   public void destroy() throws IOException {
++    if (table == null) {
++      LOG.debug("In destroy(): no table to delete");
++      return;
++    }
+     LOG.info("Deleting DynamoDB table {} in region {}", tableName, region);
++    Preconditions.checkNotNull(dynamoDB, "Not connected to Dynamo");
+     try {
+       table.delete();
+       table.waitForDelete();
+@@ -431,8 +439,8 @@ public void destroy() throws IOException {
+       Thread.currentThread().interrupt();
+       LOG.warn("Interrupted while waiting for DynamoDB table {} being deleted",
+           tableName, ie);
+-      throw new IOException("Table " + tableName + " in region " + region
+-          + " has not been deleted");
++      throw new InterruptedIOException("Table " + tableName
++          + " in region " + region + " has not been deleted");
+     } catch (AmazonClientException e) {
+       throw translateException("destroy", (String) null, e);
+     }
+@@ -447,7 +455,7 @@ public String toString() {
+   }
+ 
+   /**
+-   * Get the existing table and wait for it to become active.
++   * Create a table if it does not exist and wait for it to become active.
+    *
+    * If a table with the intended name already exists, then it logs the
+    * {@link ResourceInUseException} and uses that table. The DynamoDB table
+@@ -456,13 +464,14 @@ public String toString() {
+    * synchronous, and the table is guaranteed to exist after this method
+    * returns successfully.
+    */
++  @VisibleForTesting
+   void createTable() throws IOException {
+     final Configuration conf = s3afs.getConf();
+     final ProvisionedThroughput capacity = new ProvisionedThroughput(
+-        conf.getLong(S3Guard.S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
+-            S3Guard.S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
+-        conf.getLong(S3Guard.S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY,
+-            S3Guard.S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT));
++        conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
++            S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
++        conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY,
++            S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT));
+ 
+     try {
+       LOG.info("Creating DynamoDB table {} in region {}", tableName, region);
+@@ -485,8 +494,8 @@ void createTable() throws IOException {
+       LOG.warn("Interrupted while waiting for DynamoDB table {} active",
+           tableName, e);
+       Thread.currentThread().interrupt();
+-      throw new IOException("DynamoDB table '" + tableName + "' is not active "
+-          + "yet in region " + region);
++      throw new InterruptedIOException("DynamoDB table '" + tableName + "'" +
++          " is not active yet in region " + region);
+     } catch (AmazonClientException e) {
+       throw translateException("createTable", (String) null, e);
+     }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index d8469de..7aa6479 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -38,16 +38,16 @@
+ import java.util.Collection;
+ import java.util.List;
+ 
++import static org.apache.hadoop.fs.s3a.Constants.*;
++
+ /**
+  * Logic for integrating MetadataStore with S3A.
+  */
+-final public class S3Guard {
++@InterfaceAudience.Private
++@InterfaceStability.Unstable
++public final class S3Guard {
+   private static final Logger LOG = LoggerFactory.getLogger(S3Guard.class);
+ 
+-  /* Constants. */
+-  public static final String S3_METADATA_STORE_IMPL =
+-      "fs.s3a.metadatastore.impl";
+-
+   @InterfaceAudience.Private
+   @InterfaceStability.Unstable
+   static final String S3GUARD_DDB_CLIENT_FACTORY_IMPL =
+@@ -58,26 +58,6 @@
+       DynamoDBClientFactory.DefaultDynamoDBClientFactory.class;
+ 
+   /**
+-   * The endpoint of the DynamoDB service.
+-   *
+-   * This config has not default value. If the user does not set this, the AWS
+-   * SDK will find the endpoint automatically by the Region.
+-   */
+-  @InterfaceStability.Unstable
+-  static final String S3GUARD_DDB_ENDPOINT_KEY =
+-      "fs.s3a.s3guard.ddb.endpoint";
+-
+-  /**
+-   * The DynamoDB table name to use.
+-   *
+-   * This config has no default value. If the user does not set this, the
+-   * S3Guard implementation will use the respective S3 bucket name.
+-   */
+-  @InterfaceStability.Unstable
+-  static final String S3GUARD_DDB_TABLE_NAME_KEY =
+-      "fs.s3a.s3guard.ddb.table";
+-
+-  /**
+    * Whether to create the table.
+    *
+    * This is for internal usage and users should not set this one directly.
+@@ -87,18 +67,6 @@
+   static final String S3GUARD_DDB_TABLE_CREATE_KEY =
+       "fs.s3a.s3guard.ddb.table.create";
+ 
+-  @InterfaceStability.Unstable
+-  static final String S3GUARD_DDB_TABLE_CAPACITY_READ_KEY =
+-      "fs.s3a.s3guard.ddb.table.capacity.read";
+-
+-  static final long S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT = 500;
+-
+-  @InterfaceStability.Unstable
+-  static final String S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY =
+-      "fs.s3a.s3guard.ddb.table.capacity.write";
+-
+-  static final long S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT = 100;
+-
+   // Utility class.  All static functions.
+   private S3Guard() { }
+ 
+@@ -118,8 +86,10 @@ private S3Guard() { }
+    * @param fs  FileSystem whose Configuration specifies which
+    *            implementation to use.
+    * @return Reference to new MetadataStore.
++   * @throws IOException if the metadata store cannot be instantiated
+    */
+-  public static MetadataStore getMetadataStore(FileSystem fs) {
++  public static MetadataStore getMetadataStore(FileSystem fs)
++      throws IOException {
+     Preconditions.checkNotNull(fs);
+     Configuration conf = fs.getConf();
+     Preconditions.checkNotNull(conf);
+@@ -129,26 +99,27 @@ public static MetadataStore getMetadataStore(FileSystem fs) {
+       msInstance = ReflectionUtils.newInstance(msClass, conf);
+       LOG.debug("Using {} metadata store for {} filesystem",
+           msClass.getSimpleName(), fs.getScheme());
+-    } catch (RuntimeException e) {
+-      LOG.error("Failed to instantiate {}, using NullMetadataStore:",
+-          conf.get(S3_METADATA_STORE_IMPL), e);
+-      msInstance = new NullMetadataStore();
+-    }
+-    try {
+       msInstance.initialize(fs);
+-    } catch (IOException ioe) {
+-      LOG.error("Exception initializing MetadataStore, falling back to " +
+-          "NullMetadataStore: ", ioe);
+-      msInstance = new NullMetadataStore();
+-      // no init needed for NullMetadataStore
++      return msInstance;
++    } catch (RuntimeException | IOException e) {
++      String message = "Failed to instantiate metadata store " +
++          conf.get(S3_METADATA_STORE_IMPL)
++          + " defined in " + S3_METADATA_STORE_IMPL
++          + ": " + e;
++      LOG.error(message, e);
++      if (e instanceof IOException) {
++        throw e;
++      } else {
++        throw new IOException(message, e);
++      }
+     }
+-    return msInstance;
+   }
+ 
+   /**
++   * Predicate to check whether or not the metadata store is the null one.
+    * @param conf Configuration
+    * @return true if NullMetadataStore is configured for s3a, or if the
+-   * configuration is mising.
++   * configuration is missing.
+    */
+   public static boolean isNullMetadataStoreConfigured(Configuration conf) {
+     Class<? extends MetadataStore> msClass = getMetadataStoreClass(conf);
+@@ -379,9 +350,9 @@ public static void assertQualified(Path p) {
+     URI uri = p.toUri();
+     // Paths must include bucket in case MetadataStore is shared between
+     // multiple S3AFileSystem instances
+-    Preconditions.checkNotNull(uri.getHost());
++    Preconditions.checkNotNull(uri.getHost(), "Null host in " + uri);
+ 
+     // I believe this should never fail, since there is a host?
+-    Preconditions.checkNotNull(uri.getScheme());
++    Preconditions.checkNotNull(uri.getScheme(), "Null scheme in " + uri);
+   }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
+index 398d671..0c7f7df 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
+@@ -19,7 +19,6 @@
+ package org.apache.hadoop.fs.s3a;
+ 
+ import static org.apache.hadoop.fs.s3a.Constants.*;
+-import static org.apache.hadoop.fs.s3a.s3guard.S3Guard.*;
+ 
+ import com.amazonaws.AmazonServiceException;
+ import com.amazonaws.services.s3.AmazonS3;
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+index bcf6d06..638fdfe 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+@@ -21,7 +21,9 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.s3a.scale.S3AScaleTestBase;
+ import org.junit.Assert;
+ import org.junit.Assume;
+@@ -610,4 +612,62 @@ public static void assume(String message, boolean condition) {
+     }
+     Assume.assumeTrue(message, condition);
+   }
++
++  public static void verifyFileStatus(FileStatus status, long size,
++      long blockSize, long modTime) {
++    verifyFileStatus(status, size, 0, modTime, 0, blockSize, null, null, null);
++  }
++
++  public static void verifyFileStatus(FileStatus status, long size,
++      int replication,
++      long modTime,
++      long accessTime,
++      long blockSize,
++      String owner,
++      String group,
++      FsPermission permission) {
++    String details = status.toString();
++    assertFalse("Not a dir: " + details, status.isDirectory());
++    assertEquals("Mod time: " + details, modTime, status.getModificationTime());
++    assertEquals("File size: " + details, size, status.getLen());
++    assertEquals("Block size: " + details, blockSize, status.getBlockSize());
++    if (replication > 0) {
++      assertEquals("Replication value: " + details, replication,
++          status.getReplication());
++    }
++    if (accessTime != 0) {
++      assertEquals("Access time: " + details, accessTime,
++          status.getAccessTime());
++    }
++    if (owner != null) {
++      assertEquals("Owner: " + details, owner, status.getOwner());
++    }
++    if (group != null) {
++      assertEquals("Group: " + details, group, status.getGroup());
++    }
++    if (permission != null) {
++      assertEquals("Permission: " + details, permission,
++          status.getPermission());
++    }
++  }
++
++  public static void verifyDirStatus(FileStatus status,
++      int replication,
++      long modTime,
++      long accessTime,
++      String owner,
++      String group,
++      FsPermission permission) {
++    String details = status.toString();
++    assertTrue("Is a dir: " + details, status.isDirectory());
++    assertEquals("zero length: " + details, 0, status.getLen());
++
++    assertEquals("Mod time: " + details, modTime, status.getModificationTime());
++    assertEquals("Replication value: " + details, replication,
++        status.getReplication());
++    assertEquals("Access time: " + details, accessTime, status.getAccessTime());
++    assertEquals("Owner: " + details, owner, status.getOwner());
++    assertEquals("Group: " + details, group, status.getGroup());
++    assertEquals("Permission: " + details, permission, status.getPermission());
++  }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index 478cfb3..c2cdfa2 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -21,6 +21,8 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.fs.s3a.S3ATestUtils;
++import org.apache.hadoop.io.IOUtils;
+ 
+ import com.google.common.collect.Sets;
+ import org.junit.After;
+@@ -94,7 +96,12 @@ public void setUp() throws Exception {
+   public void tearDown() throws Exception {
+     LOG.debug("== Tear down. ==");
+     if (ms != null) {
+-      ms.destroy();
++      try {
++        ms.destroy();
++      } catch (Exception e) {
++        LOG.warn("Failed to destroy tables in teardown", e);
++      }
++      IOUtils.closeStream(ms);
+       ms = null;
+     }
+   }
+@@ -579,10 +586,7 @@ private FileStatus makeFileStatus(String pathStr, int size)
+   }
+ 
+   void verifyFileStatus(FileStatus status, long size) {
+-    assertFalse("Not a dir", status.isDirectory());
+-    assertEquals("Mod time", modTime, status.getModificationTime());
+-    assertEquals("File size", size, status.getLen());
+-    assertEquals("Block size", BLOCK_SIZE, status.getBlockSize());
++    S3ATestUtils.verifyFileStatus(status, size, BLOCK_SIZE, getModTime());
+   }
+ 
+   private FileStatus makeDirStatus(String pathStr) throws IOException {
+@@ -605,4 +609,4 @@ long getAccessTime() {
+     return accessTime;
+   }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index daeb9ac..ec83f73 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -148,7 +148,7 @@ public static void tearDownAfterClass() throws Exception {
+       // setting config for creating a DynamoDBClient against local server
+       conf.set(Constants.ACCESS_KEY, "dummy-access-key");
+       conf.set(Constants.SECRET_KEY, "dummy-secret-key");
+-      conf.set(S3Guard.S3GUARD_DDB_ENDPOINT_KEY, ddbEndpoint);
++      conf.set(Constants.S3GUARD_DDB_ENDPOINT_KEY, ddbEndpoint);
+ 
+       // always create new file system object for a test contract
+       s3afs = (S3AFileSystem) FileSystem.newInstance(conf);
+@@ -189,7 +189,7 @@ public void testInitialize() throws IOException {
+     final String tableName = "testInitializeWithFileSystem";
+     final S3AFileSystem s3afs = createContract().getFileSystem();
+     final Configuration conf = s3afs.getConf();
+-    conf.set(S3Guard.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
++    conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
+     try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+       ddbms.initialize(s3afs);
+       verifyTableInitialized(tableName);
+@@ -209,7 +209,7 @@ public void testInitialize() throws IOException {
+   public void testInitializeWithConfiguration() throws IOException {
+     final String tableName = "testInitializeWithConfiguration";
+     final Configuration conf = createContract().getFileSystem().getConf();
+-    conf.set(S3Guard.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
++    conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
+     try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+       ddbms.initialize(conf);
+       verifyTableInitialized(tableName);
+@@ -274,7 +274,7 @@ public void testDeleteTable() throws IOException {
+     final String tableName = "testDeleteTable";
+     final S3AFileSystem s3afs = createContract().getFileSystem();
+     final Configuration conf = s3afs.getConf();
+-    conf.set(S3Guard.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
++    conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
+     try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+       ddbms.initialize(s3afs);
+       // we can list the empty table
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+index 68e9842..c3eb0d3 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+@@ -22,6 +22,8 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.s3a.S3ATestUtils;
++
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+@@ -35,18 +37,14 @@
+ 
+   private static final String MAX_ENTRIES_STR = "16";
+ 
+-  private static class LocalMSContract extends AbstractMSContract {
++  private final static class LocalMSContract extends AbstractMSContract {
+ 
+     private FileSystem fs;
+ 
+-    public LocalMSContract() {
++    private LocalMSContract() throws IOException {
+       Configuration config = new Configuration();
+       config.set(LocalMetadataStore.CONF_MAX_RECORDS, MAX_ENTRIES_STR);
+-      try {
+-        fs = FileSystem.getLocal(config);
+-      } catch (IOException e) {
+-        fail("Error creating LocalFileSystem");
+-      }
++      fs = FileSystem.getLocal(config);
+     }
+ 
+     @Override
+@@ -62,7 +60,7 @@ public MetadataStore getMetadataStore() throws IOException {
+   }
+ 
+   @Override
+-  public AbstractMSContract createContract() {
++  public AbstractMSContract createContract() throws IOException {
+     return new LocalMSContract();
+   }
+ 
+@@ -103,25 +101,15 @@ private static void assertClearResult(Map <Path, String> map,
+ 
+   @Override
+   protected void verifyFileStatus(FileStatus status, long size) {
+-    super.verifyFileStatus(status, size);
+-
+-    assertEquals("Replication value", REPLICATION, status.getReplication());
+-    assertEquals("Access time", getAccessTime(), status.getAccessTime());
+-    assertEquals("Owner", OWNER, status.getOwner());
+-    assertEquals("Group", GROUP, status.getGroup());
+-    assertEquals("Permission", PERMISSION, status.getPermission());
++    S3ATestUtils.verifyFileStatus(status, size, REPLICATION, getModTime(),
++        getAccessTime(),
++        BLOCK_SIZE, OWNER, GROUP, PERMISSION);
+   }
+ 
+   @Override
+   protected void verifyDirStatus(FileStatus status) {
+-    super.verifyDirStatus(status);
+-
+-    assertEquals("Mod time", getModTime(), status.getModificationTime());
+-    assertEquals("Replication value", REPLICATION, status.getReplication());
+-    assertEquals("Access time", getAccessTime(), status.getAccessTime());
+-    assertEquals("Owner", OWNER, status.getOwner());
+-    assertEquals("Group", GROUP, status.getGroup());
+-    assertEquals("Permission", PERMISSION, status.getPermission());
++    S3ATestUtils.verifyDirStatus(status, REPLICATION, getModTime(),
++        getAccessTime(), OWNER, GROUP, PERMISSION);
+   }
+ 
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,307 @@
+From 8d3f4c0cef9a53d1e4f4f52f349281aa7f0cbc34 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@yahoo-inc.com>
+Date: Thu, 30 Mar 2017 10:57:19 -0500
+Subject: [PATCH 2379/2848] MAPREDUCE-6850. Shuffle Handler keep-alive
+ connections are closed from the server side.
+ Contributed by Jonathan Eagles
+
+(cherry picked from commit c8bd5fc7a86f9890ceaa37a89491ab650e7e9a64)
+
+Change-Id: I4b984c68ea37b68a392370b01f39726ff3a26fb8
+---
+ .../org/apache/hadoop/mapred/ShuffleHandler.java   |   68 ++++++++++++++++++--
+ .../apache/hadoop/mapred/TestShuffleHandler.java   |   31 +++++++++
+ 2 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
+index a22dde7..0f91c66 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
+@@ -104,6 +104,7 @@
+ import org.jboss.netty.channel.ChannelFactory;
+ import org.jboss.netty.channel.ChannelFuture;
+ import org.jboss.netty.channel.ChannelFutureListener;
++import org.jboss.netty.channel.ChannelHandler;
+ import org.jboss.netty.channel.ChannelHandlerContext;
+ import org.jboss.netty.channel.ChannelPipeline;
+ import org.jboss.netty.channel.ChannelPipelineFactory;
+@@ -126,8 +127,14 @@
+ import org.jboss.netty.handler.codec.http.QueryStringDecoder;
+ import org.jboss.netty.handler.ssl.SslHandler;
+ import org.jboss.netty.handler.stream.ChunkedWriteHandler;
++import org.jboss.netty.handler.timeout.IdleState;
++import org.jboss.netty.handler.timeout.IdleStateAwareChannelHandler;
++import org.jboss.netty.handler.timeout.IdleStateEvent;
++import org.jboss.netty.handler.timeout.IdleStateHandler;
+ import org.jboss.netty.util.CharsetUtil;
+ import org.mortbay.jetty.HttpHeaders;
++import org.jboss.netty.util.HashedWheelTimer;
++import org.jboss.netty.util.Timer;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Charsets;
+@@ -230,6 +237,7 @@
+   public static final boolean DEFAULT_SHUFFLE_TRANSFERTO_ALLOWED = true;
+   public static final boolean WINDOWS_DEFAULT_SHUFFLE_TRANSFERTO_ALLOWED = 
+       false;
++  private static final String TIMEOUT_HANDLER = "timeout";
+ 
+   /* the maximum number of files a single GET request can
+    open simultaneously during shuffle
+@@ -239,8 +247,9 @@
+   public static final int DEFAULT_SHUFFLE_MAX_SESSION_OPEN_FILES = 3;
+ 
+   boolean connectionKeepAliveEnabled = false;
+-  int connectionKeepAliveTimeOut;
+-  int mapOutputMetaInfoCacheSize;
++  private int connectionKeepAliveTimeOut;
++  private int mapOutputMetaInfoCacheSize;
++  private Timer timer;
+ 
+   @Metrics(about="Shuffle output metrics", context="mapred")
+   static class ShuffleMetrics implements ChannelFutureListener {
+@@ -283,7 +292,15 @@ public void operationComplete(ChannelFuture future) throws Exception {
+       int waitCount = this.reduceContext.getMapsToWait().decrementAndGet();
+       if (waitCount == 0) {
+         metrics.operationComplete(future);
+-        future.getChannel().close();
++        // Let the idle timer handler close keep-alive connections
++        if (reduceContext.getKeepAlive()) {
++          ChannelPipeline pipeline = future.getChannel().getPipeline();
++          TimeoutHandler timeoutHandler =
++              (TimeoutHandler)pipeline.get(TIMEOUT_HANDLER);
++          timeoutHandler.setEnabledTimeout(true);
++        } else {
++          future.getChannel().close();
++        }
+       } else {
+         pipelineFact.getSHUFFLE().sendMap(reduceContext);
+       }
+@@ -304,11 +321,12 @@ public void operationComplete(ChannelFuture future) throws Exception {
+     private String user;
+     private Map<String, Shuffle.MapOutputInfo> infoMap;
+     private String outputBasePathStr;
++    private final boolean keepAlive;
+ 
+     public ReduceContext(List<String> mapIds, int rId,
+                          ChannelHandlerContext context, String usr,
+                          Map<String, Shuffle.MapOutputInfo> mapOutputInfoMap,
+-                         String outputBasePath) {
++                         String outputBasePath, boolean keepAlive) {
+ 
+       this.mapIds = mapIds;
+       this.reduceId = rId;
+@@ -329,6 +347,7 @@ public ReduceContext(List<String> mapIds, int rId,
+       this.user = usr;
+       this.infoMap = mapOutputInfoMap;
+       this.outputBasePathStr = outputBasePath;
++      this.keepAlive = keepAlive;
+     }
+ 
+     public int getReduceId() {
+@@ -362,6 +381,10 @@ public AtomicInteger getMapsToSend() {
+     public AtomicInteger getMapsToWait() {
+       return mapsToWait;
+     }
++
++    public boolean getKeepAlive() {
++      return keepAlive;
++    }
+   }
+ 
+   ShuffleHandler(MetricsSystem ms) {
+@@ -498,8 +521,10 @@ protected void serviceStart() throws Exception {
+     secretManager = new JobTokenSecretManager();
+     recoverState(conf);
+     ServerBootstrap bootstrap = new ServerBootstrap(selector);
++    // Timer is shared across entire factory and must be released separately
++    timer = new HashedWheelTimer();
+     try {
+-      pipelineFact = new HttpPipelineFactory(conf);
++      pipelineFact = new HttpPipelineFactory(conf, timer);
+     } catch (Exception ex) {
+       throw new RuntimeException(ex);
+     }
+@@ -539,6 +564,10 @@ protected void serviceStop() throws Exception {
+     if (pipelineFact != null) {
+       pipelineFact.destroy();
+     }
++    if (timer != null) {
++      // Release this shared timer resource
++      timer.stop();
++    }
+     if (stateDb != null) {
+       stateDb.close();
+     }
+@@ -745,12 +774,29 @@ public void log(String message) {
+     }
+   }
+ 
++  static class TimeoutHandler extends IdleStateAwareChannelHandler {
++
++    private boolean enabledTimeout;
++
++    void setEnabledTimeout(boolean enabledTimeout) {
++      this.enabledTimeout = enabledTimeout;
++    }
++
++    @Override
++    public void channelIdle(ChannelHandlerContext ctx, IdleStateEvent e) {
++      if (e.getState() == IdleState.WRITER_IDLE && enabledTimeout) {
++        e.getChannel().close();
++      }
++    }
++  }
++
+   class HttpPipelineFactory implements ChannelPipelineFactory {
+ 
+     final Shuffle SHUFFLE;
+     private SSLFactory sslFactory;
++    private final ChannelHandler idleStateHandler;
+ 
+-    public HttpPipelineFactory(Configuration conf) throws Exception {
++    public HttpPipelineFactory(Configuration conf, Timer timer) throws Exception {
+       SHUFFLE = getShuffle(conf);
+       if (conf.getBoolean(MRConfig.SHUFFLE_SSL_ENABLED_KEY,
+                           MRConfig.SHUFFLE_SSL_ENABLED_DEFAULT)) {
+@@ -758,6 +804,7 @@ public HttpPipelineFactory(Configuration conf) throws Exception {
+         sslFactory = new SSLFactory(SSLFactory.Mode.SERVER, conf);
+         sslFactory.init();
+       }
++      this.idleStateHandler = new IdleStateHandler(timer, 0, connectionKeepAliveTimeOut, 0);
+     }
+ 
+     public Shuffle getSHUFFLE() {
+@@ -781,6 +828,8 @@ public ChannelPipeline getPipeline() throws Exception {
+       pipeline.addLast("encoder", new HttpResponseEncoder());
+       pipeline.addLast("chunking", new ChunkedWriteHandler());
+       pipeline.addLast("shuffle", SHUFFLE);
++      pipeline.addLast("idle", idleStateHandler);
++      pipeline.addLast(TIMEOUT_HANDLER, new TimeoutHandler());
+       return pipeline;
+       // TODO factor security manager into pipeline
+       // TODO factor out encode/decode to permit binary shuffle
+@@ -919,6 +968,10 @@ public void messageReceived(ChannelHandlerContext ctx, MessageEvent evt)
+       Map<String, MapOutputInfo> mapOutputInfoMap =
+           new HashMap<String, MapOutputInfo>();
+       Channel ch = evt.getChannel();
++      ChannelPipeline pipeline = ch.getPipeline();
++      TimeoutHandler timeoutHandler =
++          (TimeoutHandler)pipeline.get(TIMEOUT_HANDLER);
++      timeoutHandler.setEnabledTimeout(false);
+       String user = userRsrc.get(jobId);
+ 
+       // $x/$user/appcache/$appId/output/$mapId
+@@ -938,8 +991,9 @@ public void messageReceived(ChannelHandlerContext ctx, MessageEvent evt)
+       }
+       ch.write(response);
+       //Initialize one ReduceContext object per messageReceived call
++      boolean keepAlive = keepAliveParam || connectionKeepAliveEnabled;
+       ReduceContext reduceContext = new ReduceContext(mapIds, reduceId, ctx,
+-          user, mapOutputInfoMap, outputBasePathStr);
++          user, mapOutputInfoMap, outputBasePathStr, keepAlive);
+       for (int i = 0; i < Math.min(maxSessionOpenFiles, mapIds.size()); i++) {
+         ChannelFuture nextMap = sendMap(reduceContext);
+         if(nextMap == null) {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
+index 0e6994b..c039070 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
+@@ -37,6 +37,7 @@
+ import java.io.IOException;
+ import java.net.HttpURLConnection;
+ import java.net.URL;
++import java.net.SocketAddress;
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -79,6 +80,7 @@
+ import org.jboss.netty.channel.Channel;
+ import org.jboss.netty.channel.ChannelFuture;
+ import org.jboss.netty.channel.ChannelHandlerContext;
++import org.jboss.netty.channel.ChannelPipeline;
+ import org.jboss.netty.channel.socket.SocketChannel;
+ import org.jboss.netty.channel.MessageEvent;
+ import org.jboss.netty.channel.AbstractChannel;
+@@ -308,6 +310,15 @@ protected void sendError(ChannelHandlerContext ctx, String message,
+     Assert.assertTrue("sendError called when client closed connection",
+         failures.size() == 0);
+   }
++  static class LastSocketAddress {
++    SocketAddress lastAddress;
++    void setAddress(SocketAddress lastAddress) {
++      this.lastAddress = lastAddress;
++    }
++    SocketAddress getSocketAddres() {
++      return lastAddress;
++    }
++  }
+ 
+   @Test(timeout = 10000)
+   public void testKeepAlive() throws Exception {
+@@ -317,6 +328,8 @@ public void testKeepAlive() throws Exception {
+     conf.setBoolean(ShuffleHandler.SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED, true);
+     // try setting to -ve keep alive timeout.
+     conf.setInt(ShuffleHandler.SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT, -100);
++    final LastSocketAddress lastSocketAddress = new LastSocketAddress();
++
+     ShuffleHandler shuffleHandler = new ShuffleHandler() {
+       @Override
+       protected Shuffle getShuffle(final Configuration conf) {
+@@ -362,6 +375,7 @@ protected void populateHeaders(List<String> mapIds, String jobId,
+           protected ChannelFuture sendMapOutput(ChannelHandlerContext ctx,
+               Channel ch, String user, String mapId, int reduce,
+               MapOutputInfo info) throws IOException {
++            lastSocketAddress.setAddress(ch.getRemoteAddress());
+             HttpResponse response = new DefaultHttpResponse(HTTP_1_1, OK);
+ 
+             // send a shuffle header and a lot of data down the channel
+@@ -421,6 +435,9 @@ protected void sendError(ChannelHandlerContext ctx, String message,
+     Assert.assertEquals(HttpURLConnection.HTTP_OK, conn.getResponseCode());
+     ShuffleHeader header = new ShuffleHeader();
+     header.readFields(input);
++    byte[] buffer = new byte[1024];
++    while (input.read(buffer) != -1) {}
++    SocketAddress firstAddress = lastSocketAddress.getSocketAddres();
+     input.close();
+ 
+     // For keepAlive via URL
+@@ -442,6 +459,14 @@ protected void sendError(ChannelHandlerContext ctx, String message,
+     header = new ShuffleHeader();
+     header.readFields(input);
+     input.close();
++    SocketAddress secondAddress = lastSocketAddress.getSocketAddres();
++    Assert.assertNotNull("Initial shuffle address should not be null",
++        firstAddress);
++    Assert.assertNotNull("Keep-Alive shuffle address should not be null",
++        secondAddress);
++    Assert.assertEquals("Initial shuffle address and keep-alive shuffle "
++        + "address should be the same", firstAddress, secondAddress);
++
+   }
+ 
+   @Test(timeout = 10000)
+@@ -1057,14 +1082,20 @@ public void testSendMapCount() throws Exception {
+         Mockito.mock(ChannelHandlerContext.class);
+     final MessageEvent mockEvt = Mockito.mock(MessageEvent.class);
+     final Channel mockCh = Mockito.mock(AbstractChannel.class);
++    final ChannelPipeline mockPipeline = Mockito.mock(ChannelPipeline.class);
+ 
+     // Mock HttpRequest and ChannelFuture
+     final HttpRequest mockHttpRequest = createMockHttpRequest();
+     final ChannelFuture mockFuture = createMockChannelFuture(mockCh,
+         listenerList);
++    final ShuffleHandler.TimeoutHandler timerHandler =
++        new ShuffleHandler.TimeoutHandler();
+ 
+     // Mock Netty Channel Context and Channel behavior
+     Mockito.doReturn(mockCh).when(mockCtx).getChannel();
++    Mockito.when(mockCh.getPipeline()).thenReturn(mockPipeline);
++    Mockito.when(mockPipeline.get(
++        Mockito.any(String.class))).thenReturn(timerHandler);
+     Mockito.when(mockCtx.getChannel()).thenReturn(mockCh);
+     Mockito.doReturn(mockFuture).when(mockCh).write(Mockito.any(Object.class));
+     Mockito.when(mockCh.write(Object.class)).thenReturn(mockFuture);
+-- 
+1.7.9.5
+

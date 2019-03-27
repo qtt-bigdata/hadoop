@@ -1,0 +1,403 @@
+From cbbd4196a1024fc1eb28fa2e9181ff8d9821aff3 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@cloudera.com>
+Date: Tue, 6 Feb 2018 11:58:54 -0800
+Subject: [PATCH 2738/2848] HDFS-12528. Add an option to not disable
+ short-circuit reads on failures. Contributed by
+ Xiao Chen.
+
+(cherry picked from commit 2e7331ca264dd366b975f3c8e610cf84eb8cc155)
+(cherry picked from commit 0c2c4c20cb631cc570410867d4c537127a8e7b69)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/HdfsClientConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/impl/BlockReaderFactory.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/impl/DfsClientConf.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client/impl/TestBlockReaderFactory.java
+
+Change-Id: I2fc9377cdfecebd4dc6ce5330d9203d9adf378d8
+---
+ .../org/apache/hadoop/hdfs/BlockReaderFactory.java |   11 +-
+ .../java/org/apache/hadoop/hdfs/ClientContext.java |    4 +-
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |   13 +++
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    2 +
+ .../hdfs/shortcircuit/DomainSocketFactory.java     |   15 ++-
+ .../hdfs/shortcircuit/ShortCircuitCache.java       |   16 ++-
+ .../src/main/resources/hdfs-default.xml            |   11 ++
+ .../apache/hadoop/hdfs/TestBlockReaderFactory.java |  121 +++++++++++++++++++-
+ 8 files changed, 181 insertions(+), 12 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
+index 95ec5fb..64ef842 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY;
+ import static org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ShortCircuitFdResponse.USE_RECEIPT_VERIFICATION;
+ 
+ import java.io.BufferedOutputStream;
+@@ -651,9 +652,17 @@ private ShortCircuitReplicaInfo requestFileDescriptors(DomainPeer peer,
+       }
+       return new ShortCircuitReplicaInfo(new InvalidToken(msg));
+     default:
++      final long expiration =
++          clientContext.getDomainSocketFactory().getPathExpireSeconds();
++      String disableMsg = "disabled temporarily for " + expiration + " seconds";
++      if (expiration == 0) {
++        disableMsg = "not disabled";
++      }
+       LOG.warn(this + ": unknown response code " + resp.getStatus() +
+           " while attempting to set up short-circuit access. " +
+-          resp.getMessage());
++          resp.getMessage() + ". Short-circuit read for DataNode " + datanode
++          + " is " + disableMsg + " based on "
++          + DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY);
+       clientContext.getDomainSocketFactory()
+           .disableShortCircuitForPath(pathInfo.getPath());
+       return null;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/ClientContext.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/ClientContext.java
+index af7c095..5807275 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/ClientContext.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/ClientContext.java
+@@ -146,7 +146,9 @@ public static String confAsString(Conf conf) {
+       append(", shortCircuitSharedMemoryWatcherInterruptCheckMs = ").
+       append(conf.shortCircuitSharedMemoryWatcherInterruptCheckMs).
+       append(", keyProviderCacheExpiryMs = ").
+-      append(conf.keyProviderCacheExpiryMs);
++      append(conf.keyProviderCacheExpiryMs).
++      append(", domainSocketDisableIntervalSeconds = ").
++      append(conf.domainSocketDisableIntervalSeconds);
+ 
+     return builder.toString();
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 0bddd1f..6724169 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -349,6 +349,7 @@
+     final long shortCircuitMmapCacheExpiryMs;
+     final long shortCircuitMmapCacheRetryTimeout;
+     final long shortCircuitCacheStaleThresholdMs;
++    final long domainSocketDisableIntervalSeconds;
+ 
+     final long keyProviderCacheExpiryMs;
+     public BlockReaderFactory.FailureInjector brfFailureInjector =
+@@ -519,6 +520,11 @@ public Conf(Configuration conf) {
+       shortCircuitSharedMemoryWatcherInterruptCheckMs = conf.getInt(
+           DFSConfigKeys.DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS,
+           DFSConfigKeys.DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS_DEFAULT);
++      domainSocketDisableIntervalSeconds = conf.getLong(
++          DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY,
++          DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_DEFAULT);
++      Preconditions.checkArgument(domainSocketDisableIntervalSeconds >= 0,
++          DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY + "can't be negative.");
+ 
+       datanodeRestartTimeout = conf.getLong(
+           DFS_CLIENT_DATANODE_RESTART_TIMEOUT_KEY,
+@@ -630,6 +636,13 @@ private DataChecksum createChecksum(ChecksumOpt userOpt) {
+     public boolean getDataTransferTcpNoDelay() {
+       return dataTransferTcpNoDelay;
+     }
++
++    /**
++     * @return the domainSocketDisableIntervalSeconds
++     */
++    public long getDomainSocketDisableIntervalSeconds() {
++      return domainSocketDisableIntervalSeconds;
++    }
+   }
+  
+   public Conf getConf() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index ca28966..ead420f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -709,6 +709,8 @@
+   public static final String  DFS_DATANODE_USER_NAME_KEY = DFS_DATANODE_KERBEROS_PRINCIPAL_KEY;
+   public static final String  DFS_DATANODE_SHARED_FILE_DESCRIPTOR_PATHS = "dfs.datanode.shared.file.descriptor.paths";
+   public static final String  DFS_DATANODE_SHARED_FILE_DESCRIPTOR_PATHS_DEFAULT = "/dev/shm,/tmp";
++  public static final String DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY = "dfs.domain.socket.disable.interval.seconds";
++  public static final long DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_DEFAULT = 600;
+   public static final String  DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS = "dfs.short.circuit.shared.memory.watcher.interrupt.check.ms";
+   public static final int     DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS_DEFAULT = 60000;
+   public static final String  DFS_NAMENODE_KEYTAB_FILE_KEY = "dfs.namenode.keytab.file";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+index 60adb02..891dbbb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+@@ -91,10 +91,9 @@ public String toString() {
+   /**
+    * Information about domain socket paths.
+    */
+-  final Cache<String, PathState> pathMap =
+-      CacheBuilder.newBuilder()
+-      .expireAfterWrite(10, TimeUnit.MINUTES)
+-      .build();
++  private final long pathExpireSeconds;
++  private final Cache<String, PathState> pathMap;
++
+ 
+   public DomainSocketFactory(Conf conf) {
+     final String feature;
+@@ -120,6 +119,10 @@ public DomainSocketFactory(Conf conf) {
+         LOG.debug(feature + " is enabled.");
+       }
+     }
++
++    pathExpireSeconds = conf.getDomainSocketDisableIntervalSeconds();
++    pathMap = CacheBuilder.newBuilder()
++        .expireAfterWrite(pathExpireSeconds, TimeUnit.SECONDS).build();
+   }
+ 
+   /**
+@@ -191,4 +194,8 @@ public void disableDomainSocketPath(String path) {
+   public void clearPathMap() {
+     pathMap.invalidateAll();
+   }
++
++  public long getPathExpireSeconds() {
++    return pathExpireSeconds;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+index 10afe58..e21e16e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+@@ -286,7 +286,7 @@ public void run() {
+    * Maximum total size of the cache, including both mmapped and
+    * no$-mmapped elements.
+    */
+-  private final int maxTotalSize;
++  private int maxTotalSize;
+ 
+   /**
+    * Non-mmaped elements older than this will be closed.
+@@ -388,6 +388,11 @@ public long getStaleThresholdMs() {
+     return staleThresholdMs;
+   }
+ 
++  @VisibleForTesting
++  public void setMaxTotalSize(int maxTotalSize) {
++    this.maxTotalSize = maxTotalSize;
++  }
++
+   /**
+    * Increment the reference count of a replica, and remove it from any free
+    * list it may be in.
+@@ -1048,4 +1053,13 @@ public void scheduleSlotReleaser(Slot slot) {
+   public DfsClientShmManager getDfsClientShmManager() {
+     return shmManager;
+   }
++
++  /**
++   * Can be used in testing to verify whether a read went through SCR, after
++   * the read is done and before the stream is closed.
++   */
++  @VisibleForTesting
++  public int getReplicaInfoMapSize() {
++    return replicaInfoMap.size();
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index c98c6d4..37cbb6d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2173,6 +2173,17 @@
+ </property>
+ 
+ <property>
++  <name>dfs.domain.socket.disable.interval.seconds</name>
++  <value>600</value>
++  <description>
++    The interval that a DataNode is disabled for future Short-Circuit Reads,
++    after an error happens during a Short-Circuit Read. Setting this to 0 will
++    not disable Short-Circuit Reads at all after errors happen. Negative values
++    are invalid.
++  </description>
++</property>
++
++<property>
+   <name>dfs.client.read.shortcircuit.skip.checksum</name>
+   <value>false</value>
+   <description>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+index 5c330cd..ffaa5ee 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+@@ -22,8 +22,11 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_DOMAIN_SOCKET_DATA_TRAFFIC;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_SHORT_CIRCUIT_SHARED_MEMORY_WATCHER_INTERRUPT_CHECK_MS;
++
+ import static org.hamcrest.CoreMatchers.equalTo;
+ 
+ import java.io.File;
+@@ -38,9 +41,8 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+@@ -49,18 +51,29 @@
+ import org.apache.hadoop.hdfs.shortcircuit.DfsClientShmManager.Visitor;
+ import org.apache.hadoop.hdfs.shortcircuit.ShortCircuitCache;
+ import org.apache.hadoop.hdfs.shortcircuit.ShortCircuitReplicaInfo;
++import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.net.unix.DomainSocket;
+ import org.apache.hadoop.net.unix.TemporarySocketDirectory;
++import org.apache.hadoop.test.GenericTestUtils;
++import org.hamcrest.CoreMatchers;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Assume;
+ import org.junit.Before;
++import org.junit.Rule;
+ import org.junit.Test;
+ 
+ import com.google.common.util.concurrent.Uninterruptibles;
++import org.junit.rules.Timeout;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ public class TestBlockReaderFactory {
+-  static final Log LOG = LogFactory.getLog(TestBlockReaderFactory.class);
++  static final Logger LOG =
++      LoggerFactory.getLogger(TestBlockReaderFactory.class);
++
++  @Rule
++  public final Timeout globalTimeout = new Timeout(180000);
+ 
+   @Before
+   public void init() {
+@@ -204,7 +217,7 @@ public void run() {
+    * occurs);  however, the failure result should not be cached.  We want 
+    * to be able to retry later and succeed.
+    */
+-  @Test(timeout=60000)
++  @Test
+   public void testShortCircuitCacheTemporaryFailure()
+       throws Exception {
+     BlockReaderTestUtil.enableBlockReaderFactoryTracing();
+@@ -297,7 +310,105 @@ public void run() {
+     Assert.assertFalse(testFailed.get());
+   }
+ 
+-   /**
++  /**
++   * Test that by default, reads after a failure does not go through SCR.
++   */
++  @Test
++  public void testShortCircuitCacheUnbufferDefault() throws Exception {
++    testShortCircuitCacheUnbufferWithDisableInterval(
++        DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_DEFAULT, true);
++  }
++  /**
++   * Test the case where if we disable the cache in
++   * {@link org.apache.hadoop.hdfs.shortcircuit.DomainSocketFactory}, reads
++   * after a failure still goes through SCR.
++   */
++  @Test
++  public void testShortCircuitCacheUnbufferDisabled() throws Exception {
++    testShortCircuitCacheUnbufferWithDisableInterval(0, false);
++  }
++
++  private void testShortCircuitCacheUnbufferWithDisableInterval(
++      final long interval, final boolean disabled) throws Exception {
++    final String testName = GenericTestUtils.getMethodName();
++    BlockReaderTestUtil.enableBlockReaderFactoryTracing();
++    try (TemporarySocketDirectory sockDir = new TemporarySocketDirectory()) {
++      Configuration conf = createShortCircuitConf(testName, sockDir);
++      conf.set(DFS_CLIENT_CONTEXT, testName + interval + disabled);
++      conf.setLong(DFS_DOMAIN_SOCKET_DISABLE_INTERVAL_SECOND_KEY, interval);
++      Configuration serverConf = new Configuration(conf);
++      MiniDFSCluster.Builder builder =
++          new MiniDFSCluster.Builder(serverConf).numDataNodes(1);
++      MiniDFSCluster cluster = null;
++      DistributedFileSystem dfs = null;
++      try {
++        cluster = builder.build();
++        dfs = (DistributedFileSystem) FileSystem.get(cluster.getURI(0), conf);
++        cluster.waitActive();
++        final Path testFile = new Path("/test_file");
++        final int testFileLen = 4000;
++        final int seed = 0xFADED;
++        DFSTestUtil.createFile(dfs, testFile, testFileLen, (short) 1, seed);
++        final byte[] expected = DFSTestUtil.
++            calculateFileContentsFromSeed(seed, testFileLen);
++
++        try (FSDataInputStream in = dfs.open(testFile)) {
++          Assert.assertEquals(0,
++              dfs.getClient().getClientContext().getShortCircuitCache()
++                  .getReplicaInfoMapSize());
++
++          final byte[] buf = new byte[testFileLen];
++          IOUtils.readFully(in, buf, 0, testFileLen);
++          validateReadResult(dfs, expected, buf, 1);
++
++          // Set cache size to 0 so the replica marked evictable by unbuffer
++          // will be purged immediately.
++          dfs.getClient().getClientContext().getShortCircuitCache()
++              .setMaxTotalSize(0);
++          LOG.info("Unbuffering");
++          in.unbuffer();
++          Assert.assertEquals(0,
++              dfs.getClient().getClientContext().getShortCircuitCache()
++                  .getReplicaInfoMapSize());
++
++          DFSTestUtil.appendFile(dfs, testFile, "append more data");
++
++          // This read will force a new replica read via TCP.
++          Arrays.fill(buf, (byte) 0);
++          in.seek(0);
++          IOUtils.readFully(in, buf, 0, testFileLen);
++          validateReadResult(dfs, expected, buf, 0);
++        }
++
++        LOG.info("Reading {} again.", testFile);
++        try (FSDataInputStream in = dfs.open(testFile)) {
++          final byte[] buf = new byte[testFileLen];
++          Arrays.fill(buf, (byte) 0);
++          IOUtils.readFully(in, buf, 0, testFileLen);
++          final int expectedMapSize = disabled ? 0 : 1;
++          validateReadResult(dfs, expected, buf, expectedMapSize);
++        }
++      } finally {
++        if (cluster != null) {
++          cluster.shutdown();
++        }
++        if (dfs != null) {
++          dfs.close();
++        }
++      }
++    }
++  }
++
++  private void validateReadResult(final DistributedFileSystem dfs,
++      final byte[] expected, final byte[] actual,
++      final int expectedScrRepMapSize) {
++    Assert.assertThat(expected, CoreMatchers.is(actual));
++    Assert.assertEquals(expectedScrRepMapSize,
++        dfs.getClient().getClientContext().getShortCircuitCache()
++            .getReplicaInfoMapSize());
++  }
++
++  /**
+    * Test that a client which supports short-circuit reads using
+    * shared memory can fall back to not using shared memory when
+    * the server doesn't support it.
+-- 
+1.7.9.5
+

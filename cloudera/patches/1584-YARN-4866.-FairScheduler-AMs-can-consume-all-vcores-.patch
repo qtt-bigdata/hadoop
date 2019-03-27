@@ -1,0 +1,179 @@
+From d25a68b1747c4968553d5da2cf445d8a12120905 Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Wed, 25 May 2016 22:13:27 -0700
+Subject: [PATCH 1584/2848] YARN-4866. FairScheduler: AMs can consume all
+ vcores leading to a livelock when using FAIR
+ policy. (Yufei Gu via kasha)
+
+(cherry picked from commit 4f513a4a8ed73beec89b7b28c0cd056ee5f4ed0d)
+(cherry picked from commit 999cdd91b751de76f0e8a8cbb63df41b985cec6c)
+
+Change-Id: I693ec68f8855888f991d40b30801af1fcdea2677
+---
+ .../scheduler/fair/FSLeafQueue.java                |   23 ++++++++--
+ .../resourcemanager/scheduler/fair/FSQueue.java    |   19 +++++++++
+ .../scheduler/fair/TestFairScheduler.java          |   44 +++++++++++++++++++-
+ 3 files changed, 81 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+index 842d3c3..49e5829 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+@@ -41,6 +41,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.DominantResourceFairnessPolicy;
+ import org.apache.hadoop.yarn.util.resource.Resources;
+ 
+ @Private
+@@ -481,8 +482,8 @@ public ActiveUsersManager getActiveUsersManager() {
+ 
+   /**
+    * Check whether this queue can run this application master under the
+-   * maxAMShare limit
+-   *
++   * maxAMShare limit. For FIFO and FAIR policies, check if the VCore usage
++   * takes up the entire cluster or maxResources for the queue.
+    * @param amResource
+    * @return true if this queue can run
+    */
+@@ -494,8 +495,22 @@ public boolean canRunAppAM(Resource amResource) {
+     }
+     Resource maxAMResource = Resources.multiply(getFairShare(), maxAMShare);
+     Resource ifRunAMResource = Resources.add(amResourceUsage, amResource);
+-    return !policy
+-        .checkIfAMResourceUsageOverLimit(ifRunAMResource, maxAMResource);
++
++    boolean overMaxAMShareLimit = policy
++            .checkIfAMResourceUsageOverLimit(ifRunAMResource, maxAMResource);
++
++    // For fair policy and fifo policy which doesn't check VCore usages,
++    // additionally check if the AM takes all available VCores or
++    // over maxResource to avoid deadlock.
++    if (!overMaxAMShareLimit && !policy.equals(
++        SchedulingPolicy.getInstance(DominantResourceFairnessPolicy.class))) {
++      overMaxAMShareLimit =
++         isVCoresOverMaxResource(ifRunAMResource.getVirtualCores()) ||
++         ifRunAMResource.getVirtualCores() >=
++         scheduler.getRootQueueMetrics().getAvailableVirtualCores();
++    }
++
++    return !overMaxAMShareLimit;
+   }
+ 
+   public void addAMResourceUsage(Resource amResource) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+index 84df808..ef6a52f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+@@ -311,6 +311,25 @@ protected boolean assignContainerPreCheck(FSSchedulerNode node) {
+   }
+ 
+   /**
++   * Helper method to check if requested VCores are over maxResource.
++   * @param requestedVCores the number of VCores requested
++   * @return true if the number of VCores requested is over the maxResource;
++   *         false otherwise
++   */
++  protected boolean isVCoresOverMaxResource(int requestedVCores) {
++    if (requestedVCores >= scheduler.getAllocationConfiguration().
++        getMaxResources(getName()).getVirtualCores()) {
++      return true;
++    }
++
++    if (getParent() == null) {
++      return false;
++    }
++
++    return getParent().isVCoresOverMaxResource(requestedVCores);
++  }
++
++  /**
+    * Returns true if queue has at least one app running.
+    */
+   public boolean isActive() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 408a768..970cd33 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -4491,6 +4491,7 @@ public void testQueueMaxAMShare() throws Exception {
+   @Test
+   public void testQueueMaxAMShareDefault() throws Exception {
+     conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
++    conf.setInt(YarnConfiguration.RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES, 6);
+ 
+     PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+     out.println("<?xml version=\"1.0\"?>");
+@@ -4501,11 +4502,14 @@ public void testQueueMaxAMShareDefault() throws Exception {
+     out.println("<maxAMShare>0.4</maxAMShare>");
+     out.println("</queue>");
+     out.println("<queue name=\"queue3\">");
++    out.println("<maxResources>10240 mb 4 vcores</maxResources>");
+     out.println("</queue>");
+     out.println("<queue name=\"queue4\">");
+     out.println("</queue>");
+     out.println("<queue name=\"queue5\">");
+     out.println("</queue>");
++    out.println(
++        "<defaultQueueSchedulingPolicy>fair</defaultQueueSchedulingPolicy>");
+     out.println("</allocations>");
+     out.close();
+ 
+@@ -4514,7 +4518,7 @@ public void testQueueMaxAMShareDefault() throws Exception {
+     scheduler.reinitialize(conf, resourceManager.getRMContext());
+ 
+     RMNode node =
+-        MockNodes.newNodeInfo(1, Resources.createResource(8192, 20),
++        MockNodes.newNodeInfo(1, Resources.createResource(8192, 10),
+             0, "127.0.0.1");
+     NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
+     NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node);
+@@ -4582,6 +4586,44 @@ public void testQueueMaxAMShareDefault() throws Exception {
+         0, app2.getLiveContainers().size());
+     assertEquals("Queue2's AM resource usage should be 0 MB memory",
+         0, queue2.getAmResourceUsage().getMemory());
++
++    // Remove the app2
++    AppAttemptRemovedSchedulerEvent appRemovedEvent2 =
++        new AppAttemptRemovedSchedulerEvent(attId2,
++                RMAppAttemptState.FINISHED, false);
++    scheduler.handle(appRemovedEvent2);
++    scheduler.update();
++
++    // AM3 can pass the fair share checking, but it takes all available VCore,
++    // So the AM3 is not accepted.
++    ApplicationAttemptId attId3 = createAppAttemptId(3, 1);
++    createApplicationWithAMResource(attId3, "queue3", "test1", amResource1);
++    createSchedulingRequestExistingApplication(1024, 6, amPriority, attId3);
++    FSAppAttempt app3 = scheduler.getSchedulerApp(attId3);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    assertEquals("Application3's AM resource shouldn't be updated",
++            0, app3.getAMResource().getMemory());
++    assertEquals("Application3's AM should not be running",
++            0, app3.getLiveContainers().size());
++    assertEquals("Queue3's AM resource usage should be 0 MB memory",
++            0, queue3.getAmResourceUsage().getMemory());
++
++    // AM4 can pass the fair share checking and it doesn't takes all
++    // available VCore, but it need 5 VCores which are more than
++    // maxResources(4 VCores). So the AM4 is not accepted.
++    ApplicationAttemptId attId4 = createAppAttemptId(4, 1);
++    createApplicationWithAMResource(attId4, "queue3", "test1", amResource1);
++    createSchedulingRequestExistingApplication(1024, 5, amPriority, attId4);
++    FSAppAttempt app4 = scheduler.getSchedulerApp(attId4);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    assertEquals("Application4's AM resource shouldn't be updated",
++            0, app4.getAMResource().getMemory());
++    assertEquals("Application4's AM should not be running",
++            0, app4.getLiveContainers().size());
++    assertEquals("Queue3's AM resource usage should be 0 MB memory",
++            0, queue3.getAmResourceUsage().getMemory());
+   }
+ 
+   /**
+-- 
+1.7.9.5
+

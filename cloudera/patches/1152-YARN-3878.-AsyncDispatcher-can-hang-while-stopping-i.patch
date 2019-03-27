@@ -1,0 +1,141 @@
+From 23dda8c630305251d862ec15b7e857a251b03e66 Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Tue, 21 Jul 2015 15:05:41 -0700
+Subject: [PATCH 1152/2848] YARN-3878. AsyncDispatcher can hang while stopping
+ if it is configured for draining events on stop.
+ Contributed by Varun Saxena (cherry picked from
+ commit 393fe71771e3ac6bc0efe59d9aaf19d3576411b3)
+
+(cherry picked from commit 11cb00f7a0341247a52ea8d4f3736693a9bdb649)
+
+Change-Id: Ic39ea7f83a19b616a26ff42a1d4762f8ef40c579
+---
+ .../apache/hadoop/yarn/event/AsyncDispatcher.java  |    8 +++
+ .../apache/hadoop/yarn/event/DrainDispatcher.java  |   11 +++-
+ .../hadoop/yarn/event/TestAsyncDispatcher.java     |   62 ++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/TestAsyncDispatcher.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
+index e5e6a15..c04583a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/event/AsyncDispatcher.java
+@@ -243,6 +243,9 @@ public void handle(Event event) {
+         if (!stopped) {
+           LOG.warn("AsyncDispatcher thread interrupted", e);
+         }
++        // Need to reset drained flag to true if event queue is empty,
++        // otherwise dispatcher will hang on stop.
++        drained = eventQueue.isEmpty();
+         throw new YarnRuntimeException(e);
+       }
+     };
+@@ -284,6 +287,11 @@ public void run() {
+   }
+ 
+   @VisibleForTesting
++  protected boolean isEventThreadWaiting() {
++    return eventHandlingThread.getState() == Thread.State.WAITING;
++  }
++
++  @VisibleForTesting
+   protected boolean isDrained() {
+     return this.drained;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/DrainDispatcher.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/DrainDispatcher.java
+index da5ae44..e4a5a82 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/DrainDispatcher.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/DrainDispatcher.java
+@@ -27,11 +27,20 @@ public DrainDispatcher() {
+     this(new LinkedBlockingQueue<Event>());
+   }
+ 
+-  private DrainDispatcher(BlockingQueue<Event> eventQueue) {
++  public DrainDispatcher(BlockingQueue<Event> eventQueue) {
+     super(eventQueue);
+   }
+ 
+   /**
++   *  Wait till event thread enters WAITING state (i.e. waiting for new events).
++   */
++  public void waitForEventThreadToWait() {
++    while (!isEventThreadWaiting()) {
++      Thread.yield();
++    }
++  }
++
++  /**
+    * Busy loop waiting for all queued events to drain.
+    */
+   public void await() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/TestAsyncDispatcher.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/TestAsyncDispatcher.java
+new file mode 100644
+index 0000000..b5fd923
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/event/TestAsyncDispatcher.java
+@@ -0,0 +1,62 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.event;
++
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.LinkedBlockingQueue;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class TestAsyncDispatcher {
++
++  /* This test checks whether dispatcher hangs on close if following two things
++   * happen :
++   * 1. A thread which was putting event to event queue is interrupted.
++   * 2. Event queue is empty on close.
++   */
++  @SuppressWarnings({ "unchecked", "rawtypes" })
++  @Test(timeout=10000)
++  public void testDispatcherOnCloseIfQueueEmpty() throws Exception {
++    BlockingQueue<Event> eventQueue = spy(new LinkedBlockingQueue<Event>());
++    Event event = mock(Event.class);
++    doThrow(new InterruptedException()).when(eventQueue).put(event);
++    DrainDispatcher disp = new DrainDispatcher(eventQueue);
++    disp.init(new Configuration());
++    disp.setDrainEventsOnStop();
++    disp.start();
++    // Wait for event handler thread to start and begin waiting for events.
++    disp.waitForEventThreadToWait();
++    try {
++      disp.getEventHandler().handle(event);
++    } catch (YarnRuntimeException e) {
++    }
++    // Queue should be empty and dispatcher should not hang on close
++    Assert.assertTrue("Event Queue should have been empty",
++        eventQueue.isEmpty());
++    disp.close();
++  }
++}
++
+-- 
+1.7.9.5
+

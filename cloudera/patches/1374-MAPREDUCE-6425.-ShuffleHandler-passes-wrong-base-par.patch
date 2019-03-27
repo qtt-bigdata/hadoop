@@ -1,0 +1,149 @@
+From dec9a7dbf98157f5a1db0b30879ef1b3d1bde8fc Mon Sep 17 00:00:00 2001
+From: Devaraj K <devaraj@apache.org>
+Date: Mon, 6 Jul 2015 13:46:37 +0530
+Subject: [PATCH 1374/2848] MAPREDUCE-6425. ShuffleHandler passes wrong "base"
+ parameter to getMapOutputInfo if mapId is not in
+ the cache. Contributed by zhihai xu.
+
+(cherry picked from commit bff67dfe2f811654ffb1bbcbd87509c185f452b6)
+
+Change-Id: I74853195454c9798b8bbef6879a2b9c8f9ae3f21
+---
+ .../org/apache/hadoop/mapred/ShuffleHandler.java   |    3 +-
+ .../apache/hadoop/mapred/TestShuffleHandler.java   |  101 ++++++++++++++++++++
+ 2 files changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
+index 33220c6..87b310e 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/main/java/org/apache/hadoop/mapred/ShuffleHandler.java
+@@ -806,7 +806,8 @@ public void messageReceived(ChannelHandlerContext ctx, MessageEvent evt)
+         try {
+           MapOutputInfo info = mapOutputInfoMap.get(mapId);
+           if (info == null) {
+-            info = getMapOutputInfo(outputBasePathStr, mapId, reduceId, user);
++            info = getMapOutputInfo(outputBasePathStr + mapId,
++                mapId, reduceId, user);
+           }
+           lastMap =
+               sendMapOutput(ctx, ch, user, mapId,
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
+index 1a0688f..35d9bdd 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-shuffle/src/test/java/org/apache/hadoop/mapred/TestShuffleHandler.java
+@@ -601,6 +601,7 @@ protected void verifyRequest(String appid, ChannelHandlerContext ctx,
+       Assert.assertTrue((new String(byteArr)).contains(message));
+     } finally {
+       shuffleHandler.stop();
++      FileUtil.fullyDelete(absLogDir);
+     }
+   }
+ 
+@@ -829,4 +830,104 @@ private static int getShuffleResponseCode(ShuffleHandler shuffle,
+     conn.disconnect();
+     return rc;
+   }
++
++  @Test(timeout = 100000)
++  public void testGetMapOutputInfo() throws Exception {
++    final ArrayList<Throwable> failures = new ArrayList<Throwable>(1);
++    Configuration conf = new Configuration();
++    conf.setInt(ShuffleHandler.SHUFFLE_PORT_CONFIG_KEY, 0);
++    conf.setInt(ShuffleHandler.MAX_SHUFFLE_CONNECTIONS, 3);
++    File absLogDir = new File("target", TestShuffleHandler.class.
++        getSimpleName() + "LocDir").getAbsoluteFile();
++    conf.set(YarnConfiguration.NM_LOCAL_DIRS, absLogDir.getAbsolutePath());
++    ApplicationId appId = ApplicationId.newInstance(12345, 1);
++    String appAttemptId = "attempt_12345_1_m_1_0";
++    String user = "randomUser";
++    String reducerId = "0";
++    List<File> fileMap = new ArrayList<File>();
++    createShuffleHandlerFiles(absLogDir, user, appId.toString(), appAttemptId,
++        conf, fileMap);
++    ShuffleHandler shuffleHandler = new ShuffleHandler() {
++      @Override
++      protected Shuffle getShuffle(Configuration conf) {
++        // replace the shuffle handler with one stubbed for testing
++        return new Shuffle(conf) {
++          @Override
++          protected void populateHeaders(List<String> mapIds,
++              String outputBaseStr, String user, int reduce,
++              HttpRequest request, HttpResponse response,
++              boolean keepAliveParam, Map<String, MapOutputInfo> infoMap)
++              throws IOException {
++            // Only set response headers and skip everything else
++            // send some dummy value for content-length
++            super.setResponseHeaders(response, keepAliveParam, 100);
++          }
++          @Override
++          protected void verifyRequest(String appid,
++              ChannelHandlerContext ctx, HttpRequest request,
++              HttpResponse response, URL requestUri) throws IOException {
++            // Do nothing.
++          }
++          @Override
++          protected void sendError(ChannelHandlerContext ctx, String message,
++              HttpResponseStatus status) {
++            if (failures.size() == 0) {
++              failures.add(new Error(message));
++              ctx.getChannel().close();
++            }
++          }
++          @Override
++          protected ChannelFuture sendMapOutput(ChannelHandlerContext ctx,
++              Channel ch, String user, String mapId, int reduce,
++              MapOutputInfo info) throws IOException {
++            // send a shuffle header
++            ShuffleHeader header =
++                new ShuffleHeader("attempt_12345_1_m_1_0", 5678, 5678, 1);
++            DataOutputBuffer dob = new DataOutputBuffer();
++            header.write(dob);
++            return ch.write(wrappedBuffer(dob.getData(), 0, dob.getLength()));
++          }
++        };
++      }
++    };
++    shuffleHandler.init(conf);
++    try {
++      shuffleHandler.start();
++      DataOutputBuffer outputBuffer = new DataOutputBuffer();
++      outputBuffer.reset();
++      Token<JobTokenIdentifier> jt =
++          new Token<JobTokenIdentifier>("identifier".getBytes(),
++          "password".getBytes(), new Text(user), new Text("shuffleService"));
++      jt.write(outputBuffer);
++      shuffleHandler
++          .initializeApplication(new ApplicationInitializationContext(user,
++          appId, ByteBuffer.wrap(outputBuffer.getData(), 0,
++          outputBuffer.getLength())));
++      URL url =
++          new URL(
++              "http://127.0.0.1:"
++                  + shuffleHandler.getConfig().get(
++                      ShuffleHandler.SHUFFLE_PORT_CONFIG_KEY)
++                  + "/mapOutput?job=job_12345_0001&reduce=" + reducerId
++                  + "&map=attempt_12345_1_m_1_0");
++      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
++      conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_NAME,
++          ShuffleHeader.DEFAULT_HTTP_HEADER_NAME);
++      conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_VERSION,
++          ShuffleHeader.DEFAULT_HTTP_HEADER_VERSION);
++      conn.connect();
++      try {
++        DataInputStream is = new DataInputStream(conn.getInputStream());
++        ShuffleHeader header = new ShuffleHeader();
++        header.readFields(is);
++        is.close();
++      } catch (EOFException e) {
++        // ignore
++      }
++      Assert.assertEquals(failures.size(), 0);
++    } finally {
++      shuffleHandler.stop();
++      FileUtil.fullyDelete(absLogDir);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

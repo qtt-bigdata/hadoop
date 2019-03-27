@@ -1,0 +1,292 @@
+From 801eda8cc1ff46a1f785457600768760789a6334 Mon Sep 17 00:00:00 2001
+From: Aaron Fabbri <fabbri@apache.org>
+Date: Tue, 27 Sep 2016 18:19:48 -0700
+Subject: [PATCH 2216/2848] HADOOP-13631 S3Guard: implement move() for
+ LocalMetadataStore, add unit tests
+
+Also, change DirListingMetadata#setAuthoritative() to take a boolean arg.
+Setting this to false is a way to trigger clients to re-consult the backing
+store if, for example, a user adds new files to a directory.
+
+(cherry picked from commit 958d4cdb45507e30b84b9582c42152f07a03b2ee)
+
+Change-Id: I99a1f92a3a93aab11e4cb93d48d9a083f22366cb
+---
+ .../hadoop/fs/s3a/s3guard/DirListingMetadata.java  |    5 +-
+ .../hadoop/fs/s3a/s3guard/LocalMetadataStore.java  |   44 +++++++++++--
+ .../hadoop/fs/s3a/s3guard/MetadataStore.java       |   26 ++++++--
+ .../fs/s3a/s3guard/MetadataStoreTestBase.java      |   69 ++++++++++++++++++--
+ .../fs/s3a/s3guard/TestDirListingMetadata.java     |    2 +-
+ 5 files changed, 127 insertions(+), 19 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+index 1838f42..5bfb6c0 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+@@ -97,9 +97,10 @@ public boolean isAuthoritative() {
+ 
+   /**
+    * Marks this directory listing as full and authoritative.
++   * @param authoritative see {@link #isAuthoritative()}.
+    */
+-  public void setAuthoritative() {
+-    isAuthoritative = true;
++  public void setAuthoritative(boolean authoritative) {
++    this.isAuthoritative = authoritative;
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+index d47d85e..9f69189 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+@@ -28,6 +28,7 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
++import java.util.Collection;
+ import java.util.Iterator;
+ import java.util.Map;
+ 
+@@ -94,7 +95,7 @@ private synchronized void doDelete(Path path, boolean recursive) {
+     // Remove target file/dir
+     fileHash.remove(path);
+ 
+-    // Update parent dir listing, if any
++    // Update this and parent dir listing, if any
+     dirHashDeleteFile(path);
+ 
+     if (recursive) {
+@@ -116,9 +117,39 @@ public synchronized DirListingMetadata listChildren(Path path) throws
+   }
+ 
+   @Override
+-  public void move(Path src, Path dst) throws IOException {
+-    // TODO implement me
+-    throw new IOException("LocalMetadataStore#move() not implemented yet");
++  public void move(Collection<Path> pathsToDelete,
++      Collection<PathMetadata> pathsToCreate) throws IOException {
++
++    Preconditions.checkNotNull(pathsToDelete, "pathsToDelete is null");
++    Preconditions.checkNotNull(pathsToCreate, "pathsToCreate is null");
++    Preconditions.checkArgument(pathsToDelete.size() == pathsToCreate.size(),
++        "Must supply same number of paths to delete/create.");
++
++    // I feel dirty for using reentrant lock. :-|
++    synchronized (this) {
++
++      // 1. Delete pathsToDelete
++      for (Path p : pathsToDelete) {
++        delete(p);
++      }
++
++      // 2. Create new destination path metadata
++      for (PathMetadata meta : pathsToCreate) {
++        put(meta);
++      }
++
++      // 3. We now know full contents of all dirs in destination subtree
++      for (PathMetadata meta : pathsToCreate) {
++        FileStatus status = meta.getFileStatus();
++        if (status == null || status.isDirectory()) {
++          continue;
++        }
++        DirListingMetadata dir = listChildren(status.getPath());
++        if (dir != null) {  // could be evicted already
++          dir.setAuthoritative(true);
++        }
++      }
++    }
+   }
+ 
+   @Override
+@@ -205,6 +236,11 @@ private static boolean isAncestorOf(Path ancestor, Path f) {
+    * Update dirHash to reflect deletion of file 'f'.  Call with lock held.
+    */
+   private void dirHashDeleteFile(Path path) {
++
++    /* If this path is a dir, remove its listing */
++    dirHash.remove(path);
++
++    /* Remove this path from parent's dir listing */
+     Path parent = path.getParent();
+     if (parent != null) {
+       DirListingMetadata dir = dirHash.get(parent);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+index a6d29da..68009e3 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+@@ -20,6 +20,7 @@
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.util.Collection;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+@@ -84,14 +85,29 @@
+   DirListingMetadata listChildren(Path path) throws IOException;
+ 
+   /**
+-   * Moves metadata from {@code src} to {@code dst}, including all descendants
+-   * recursively.
++   * Record the effects of a {@link FileSystem#rename(Path, Path)} in the
++   * MetadataStore.  Clients provide explicit enumeration of the affected
++   * paths (recursively), before and after the rename.
+    *
+-   * @param src the source path
+-   * @param dst the new path of the file/dir after the move
++   * On the need to provide an enumeration of directory trees instead of just
++   * source and destination paths:
++   * Since a MetadataStore does not have to track all metadata for the
++   * underlying storage system, and a new MetadataStore may be created on an
++   * existing underlying filesystem, this move() may be the first time the
++   * MetadataStore sees the affected paths.  Therefore, simply providing src
++   * and destination paths may not be enough to record the deletions (under
++   * src path) and creations (at destination) that are happening during the
++   * rename().
++   *
++   * @param pathsToDelete Collection of all paths that were removed from the
++   *                      source directory tree of the move.
++   * @param pathsToCreate Collection of all PathMetadata for the new paths
++   *                      that were created at the destination of the rename
++   *                      ().
+    * @throws IOException if there is an error
+    */
+-  void move(Path src, Path dst) throws IOException;
++  void move(Collection<Path> pathsToDelete, Collection<PathMetadata>
++      pathsToCreate) throws IOException;
+ 
+   /**
+    * Saves metadata for exactly one path.  For a deeply nested path, this method
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+index 701f355..462f8f9 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+@@ -24,7 +24,6 @@
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
+-import org.junit.Ignore;
+ import org.junit.Test;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -32,6 +31,7 @@
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.HashSet;
+ import java.util.Set;
+@@ -285,10 +285,54 @@ public void testInvalidListChildren() throws Exception {
+         ms.listChildren(new Path("/a1/b1x")));
+   }
+ 
+-  @Ignore
++  @Test
+   public void testMove() throws Exception {
+-    // TODO
+-    throw new RuntimeException("TODO: implement move and tests.");
++    // Create test dir structure
++    createNewDirs("/a1", "/a2", "/a3");
++    createNewDirs("/a1/b1", "/a1/b2");
++    putListStatusFiles("/a1/b1", false, "/a1/b1/file1", "/a1/b1/file2");
++
++    // Assert root listing as expected
++    DirListingMetadata dirMeta = ms.listChildren(new Path("/"));
++    assertNotNull("Listing root", dirMeta);
++    Collection<PathMetadata> entries = dirMeta.getListing();
++    assertListingsEqual(entries, "/a1", "/a2", "/a3");
++
++    // Assert src listing as expected
++    dirMeta = ms.listChildren(new Path("/a1/b1"));
++    assertNotNull("Listing /a1/b1", dirMeta);
++    entries = dirMeta.getListing();
++    assertListingsEqual(entries, "/a1/b1/file1", "/a1/b1/file2");
++
++    // Do the move(): rename(/a1/b1, /b1)
++    Collection<Path> srcPaths = Arrays.asList(new Path("/a1/b1"),
++        new Path("/a1/b1/file1"), new Path("/a1/b1/file2"));
++
++    ArrayList<PathMetadata> destMetas = new ArrayList<>();
++    destMetas.add(new PathMetadata(makeDirStatus("/b1")));
++    destMetas.add(new PathMetadata(makeFileStatus("/b1/file1", 100)));
++    destMetas.add(new PathMetadata(makeFileStatus("/b1/file2", 100)));
++    ms.move(srcPaths, destMetas);
++
++    // Assert src is no longer there
++    dirMeta = ms.listChildren(new Path("/a1"));
++    assertNotNull("Listing /a1", dirMeta);
++    entries = dirMeta.getListing();
++    assertListingsEqual(entries, "/a1/b2");
++
++    PathMetadata meta = ms.get(new Path("/a1/b1/file1"));
++    // TODO allow return of PathMetadata with isDeleted == true
++    assertNull("Src path deleted", meta);
++
++    // Assert dest looks right
++    meta = ms.get(new Path("/b1/file1"));
++    assertNotNull("dest file not null", meta);
++    verifyBasicFileStatus(meta);
++
++    dirMeta = ms.listChildren(new Path("/b1"));
++    assertNotNull("dest listing not null", dirMeta);
++    entries = dirMeta.getListing();
++    assertListingsEqual(entries, "/b1/file1", "/b1/file2");
+   }
+ 
+ 
+@@ -296,8 +340,18 @@ public void testMove() throws Exception {
+    * Helper functions.
+    */
+ 
++  /** Builds array of Path objects based on parent dir and filenames. */
++  private Path[] buildPaths(String parent, String... paths) {
++
++    Path[] output = new Path[paths.length];
++    for (int i = 0; i < paths.length; i++) {
++      output[i] = new Path(parent, paths[i]);
++    }
++    return output;
++  }
++
+   /** Modifies paths input array and returns it. */
+-  private String[] buildPaths(String parent, String ...paths) {
++  private String[] buildPathStrings(String parent, String... paths) {
+     for (int i = 0; i < paths.length; i++) {
+       Path p = new Path(parent, paths[i]);
+       paths[i] = p.toString();
+@@ -306,13 +360,14 @@ public void testMove() throws Exception {
+   }
+ 
+   private void commonTestPutListStatus(final String parent) throws IOException {
+-    putListStatusFiles(parent, true, buildPaths(parent, "file1", "file2",
++    putListStatusFiles(parent, true, buildPathStrings(parent, "file1", "file2",
+         "file3"));
+     DirListingMetadata dirMeta = ms.listChildren(new Path(parent));
+     assertNotNull("list after putListStatus", dirMeta);
+     Collection<PathMetadata> entries = dirMeta.getListing();
+     assertNotNull("listStatus has entries", entries);
+-    assertListingsEqual(entries, buildPaths(parent, "file1", "file2", "file3"));
++    assertListingsEqual(entries, buildPathStrings(parent, "file1", "file2",
++        "file3"));
+   }
+ 
+   private void setupListStatus() throws IOException {
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDirListingMetadata.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDirListingMetadata.java
+index c4361e1..1ca7f54 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDirListingMetadata.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDirListingMetadata.java
+@@ -123,7 +123,7 @@ public void testSetAuthoritative() {
+     assertNotNull(meta.getListing());
+     assertTrue(meta.getListing().isEmpty());
+     assertFalse(meta.isAuthoritative());
+-    meta.setAuthoritative();
++    meta.setAuthoritative(true);
+     assertTrue(meta.isAuthoritative());
+   }
+ 
+-- 
+1.7.9.5
+

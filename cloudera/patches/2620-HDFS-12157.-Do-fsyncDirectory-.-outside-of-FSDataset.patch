@@ -1,0 +1,148 @@
+From 48da4b5f7161edc95303ebe810f05e3539cc3aef Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Wed, 9 Aug 2017 09:36:08 -0500
+Subject: [PATCH 2620/2848] HDFS-12157. Do fsyncDirectory(..) outside of
+ FSDataset lock. Contributed by Vinayakumar B.
+
+(cherry picked from commit ae854076c743e674976e20c39bc8a9b9a75fa582)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+
+Change-Id: Ic1ea55f8232ed5f45f4b6a9f1ddc17358f7179d4
+---
+ .../datanode/fsdataset/impl/FsDatasetImpl.java     |   62 +++++++++++---------
+ 1 file changed, 33 insertions(+), 29 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+index bd054c7..a100c56 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+@@ -74,7 +74,6 @@
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.ReplicaState;
+ import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.datanode.BlockMetadataHeader;
+-import org.apache.hadoop.hdfs.server.datanode.BlockScanner;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DataStorage;
+ import org.apache.hadoop.hdfs.server.datanode.DatanodeUtil;
+@@ -846,7 +845,7 @@ static File moveBlockFiles(Block b, File srcfile, File destdir)
+     return dstfile;
+   }
+ 
+-  private void fsyncDirectory(FsVolumeSpi volume, File... dirs)
++  private void fsyncDirectory(File... dirs)
+       throws IOException {
+     for (File dir : dirs) {
+       try {
+@@ -966,8 +965,7 @@ private ReplicaInfo moveBlock(ExtendedBlock block, ReplicaInfo replicaInfo,
+         targetVolume, blockFiles[0].getParentFile(), 0);
+     newReplicaInfo.setNumBytes(blockFiles[1].length());
+     // Finalize the copied files
+-    newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo,
+-        false);
++    newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo);
+ 
+     removeOldReplica(replicaInfo, newReplicaInfo, oldBlockFile, oldMetaFile,
+         oldBlockFile.length(), oldMetaFile.length(), block.getBlockPoolId());
+@@ -1343,7 +1341,7 @@ public Replica recoverClose(ExtendedBlock b, long newGS,
+           bumpReplicaGS(replicaInfo, newGS);
+           // finalize the replica if RBW
+           if (replicaInfo.getState() == ReplicaState.RBW) {
+-            finalizeReplica(b.getBlockPoolId(), replicaInfo, false);
++            finalizeReplica(b.getBlockPoolId(), replicaInfo);
+           }
+           return replicaInfo;
+         }
+@@ -1670,23 +1668,38 @@ public void adjustCrcChannelPosition(ExtendedBlock b, ReplicaOutputStreams strea
+    * Complete the block write!
+    */
+   @Override // FsDatasetSpi
+-  public synchronized void finalizeBlock(ExtendedBlock b, boolean fsyncDir)
++  public void finalizeBlock(ExtendedBlock b, boolean fsyncDir)
+       throws IOException {
+-    if (Thread.interrupted()) {
+-      // Don't allow data modifications from interrupted threads
+-      throw new IOException("Cannot finalize block from Interrupted Thread");
++    ReplicaInfo replicaInfo = null;
++    ReplicaInfo finalizedReplicaInfo = null;
++    synchronized (this) {
++      if (Thread.interrupted()) {
++        // Don't allow data modifications from interrupted threads
++        throw new IOException("Cannot finalize block from Interrupted Thread");
++      }
++      replicaInfo = getReplicaInfo(b);
++      if (replicaInfo.getState() == ReplicaState.FINALIZED) {
++        // this is legal, when recovery happens on a file that has
++        // been opened for append but never modified
++        return;
++      }
++      finalizedReplicaInfo = finalizeReplica(b.getBlockPoolId(), replicaInfo);
+     }
+-    ReplicaInfo replicaInfo = getReplicaInfo(b);
+-    if (replicaInfo.getState() == ReplicaState.FINALIZED) {
+-      // this is legal, when recovery happens on a file that has
+-      // been opened for append but never modified
+-      return;
++    /*
++     * Sync the directory after rename from tmp/rbw to Finalized if
++     * configured. Though rename should be atomic operation, sync on both
++     * dest and src directories are done because IOUtils.fsync() calls
++     * directory's channel sync, not the journal itself.
++     */
++    if (fsyncDir) {
++      File f = replicaInfo.getBlockFile();
++      File dest = finalizedReplicaInfo.getBlockFile();
++      fsyncDirectory(dest.getParentFile(), f.getParentFile());
+     }
+-    finalizeReplica(b.getBlockPoolId(), replicaInfo, fsyncDir);
+   }
+-  
++
+   private synchronized FinalizedReplica finalizeReplica(String bpid,
+-      ReplicaInfo replicaInfo, boolean fsyncDir) throws IOException {
++      ReplicaInfo replicaInfo) throws IOException {
+     FinalizedReplica newReplicaInfo = null;
+     if (replicaInfo.getState() == ReplicaState.RUR &&
+        ((ReplicaUnderRecovery)replicaInfo).getOriginalReplica().getState() == 
+@@ -1697,22 +1710,13 @@ private synchronized FinalizedReplica finalizeReplica(String bpid,
+       FsVolumeImpl v = (FsVolumeImpl)replicaInfo.getVolume();
+       File f = replicaInfo.getBlockFile();
+       if (v == null) {
+-        throw new IOException("No volume for temporary file " + f + 
++        throw new IOException("No volume for temporary file " + f +
+             " for block " + replicaInfo);
+       }
+ 
+       File dest = v.addFinalizedBlock(
+           bpid, replicaInfo, f, replicaInfo.getBytesReserved());
+       newReplicaInfo = new FinalizedReplica(replicaInfo, v, dest.getParentFile());
+-      /*
+-       * Sync the directory after rename from tmp/rbw to Finalized if
+-       * configured. Though rename should be atomic operation, sync on both
+-       * dest and src directories are done because IOUtils.fsync() calls
+-       * directory's channel sync, not the journal itself.
+-       */
+-      if (fsyncDir) {
+-         fsyncDirectory(v, dest.getParentFile(), f.getParentFile());
+-      }
+       if (v.isTransientStorage()) {
+         ramDiskReplicaTracker.addReplica(bpid, replicaInfo.getBlockId(), v);
+         datanode.getMetrics().addRamDiskBytesWrite(replicaInfo.getNumBytes());
+@@ -2615,10 +2619,10 @@ private FinalizedReplica updateReplicaUnderRecovery(
+       truncateBlock(replicafile, rur.getMetaFile(), rur.getNumBytes(), newlength);
+       // update RUR with the new length
+       rur.setNumBytes(newlength);
+-   }
++    }
+ 
+     // finalize the block
+-    return finalizeReplica(bpid, rur, false);
++    return finalizeReplica(bpid, rur);
+   }
+ 
+   @Override // FsDatasetSpi
+-- 
+1.7.9.5
+

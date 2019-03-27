@@ -1,0 +1,326 @@
+From 71bf4676b85d363acd9c2722d8e403cce7980da0 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Tue, 24 Nov 2015 14:35:37 -0800
+Subject: [PATCH 1994/2848] YARN-4132. Separate configs for nodemanager to
+ resourcemanager connection timeout and retries.
+ Contributed by Chang Li (cherry picked from
+ commit 4ac6799d4a8b071e0d367c2d709e84d8ea06942d)
+
+(cherry picked from commit 9e54433)
+
+Change-Id: Ib556edb7b1991f32c3d96b0a62b6a1804733c306
+---
+ .../apache/hadoop/yarn/conf/YarnConfiguration.java |   38 ++++++---
+ .../org/apache/hadoop/yarn/client/RMProxy.java     |   39 ++++++++-
+ .../src/main/resources/yarn-default.xml            |   20 +++++
+ .../hadoop/yarn/server/api/ServerRMProxy.java      |   22 +++++-
+ .../server/nodemanager/TestNodeStatusUpdater.java  |   83 ++++++++++++++++++++
+ 5 files changed, 190 insertions(+), 12 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index aa284b7..b35820d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -380,17 +380,17 @@ private static void addDeprecatedKeys() {
+   public static final boolean DEFAULT_RM_AMLAUNCHER_LOG_COMMAND = false;
+ 
+   //Delegation token related keys
+-  public static final String  DELEGATION_KEY_UPDATE_INTERVAL_KEY = 
++  public static final String  DELEGATION_KEY_UPDATE_INTERVAL_KEY =
+     RM_PREFIX + "delegation.key.update-interval";
+-  public static final long    DELEGATION_KEY_UPDATE_INTERVAL_DEFAULT = 
++  public static final long    DELEGATION_KEY_UPDATE_INTERVAL_DEFAULT =
+     24*60*60*1000; // 1 day
+-  public static final String  DELEGATION_TOKEN_RENEW_INTERVAL_KEY = 
++  public static final String  DELEGATION_TOKEN_RENEW_INTERVAL_KEY =
+     RM_PREFIX + "delegation.token.renew-interval";
+-  public static final long    DELEGATION_TOKEN_RENEW_INTERVAL_DEFAULT = 
++  public static final long    DELEGATION_TOKEN_RENEW_INTERVAL_DEFAULT =
+     24*60*60*1000;  // 1 day
+-  public static final String  DELEGATION_TOKEN_MAX_LIFETIME_KEY = 
++  public static final String  DELEGATION_TOKEN_MAX_LIFETIME_KEY =
+      RM_PREFIX + "delegation.token.max-lifetime";
+-  public static final long    DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT = 
++  public static final long    DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT =
+     7*24*60*60*1000; // 7 days
+   
+   public static final String RECOVERY_ENABLED = RM_PREFIX + "recovery.enabled";
+@@ -932,7 +932,7 @@ private static void addDeprecatedKeys() {
+   public static final int DEFAULT_NM_WEBAPP_HTTPS_PORT = 8044;
+   public static final String DEFAULT_NM_WEBAPP_HTTPS_ADDRESS = "0.0.0.0:"
+       + DEFAULT_NM_WEBAPP_HTTPS_PORT; 
+-  
++
+   /** How often to monitor containers.*/
+   public final static String NM_CONTAINER_MON_INTERVAL_MS =
+     NM_PREFIX + "container-monitor.interval-ms";
+@@ -1635,7 +1635,27 @@ private static void addDeprecatedKeys() {
+   public static final String YARN_HTTP_POLICY_KEY = YARN_PREFIX + "http.policy";
+   public static final String YARN_HTTP_POLICY_DEFAULT = HttpConfig.Policy.HTTP_ONLY
+       .name();
+-  
++
++
++  /**
++   * Max time to wait for NM to connection to RM.
++   * When not set, proxy will fall back to use value of
++   * RESOURCEMANAGER_CONNECT_MAX_WAIT_MS.
++   */
++  public static final String NM_RESOURCEMANAGER_CONNECT_MAX_WAIT_MS =
++      YARN_PREFIX + "nodemanager.resourcemanager.connect.max-wait.ms";
++
++  /**
++   * Time interval between each NM attempt to connection to RM.
++   * When not set, proxy will fall back to use value of
++   * RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS.
++   */
++  public static final String NM_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS =
++      YARN_PREFIX + "nodemanager.resourcemanager.connect.retry-interval.ms";
++
++  /**
++   * Node-labels configurations
++   */
+   public static final String NODE_LABELS_PREFIX = YARN_PREFIX + "node-labels.";
+ 
+   /**
+@@ -1644,7 +1664,7 @@ private static void addDeprecatedKeys() {
+    */
+   public static final String RM_NODE_LABELS_MANAGER_CLASS = NODE_LABELS_PREFIX
+       + "manager-class";
+-  
++
+   /** URI for NodeLabelManager */
+   public static final String FS_NODE_LABELS_STORE_ROOT_DIR = NODE_LABELS_PREFIX
+       + "fs-store.root-dir";
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+index b6295ca..be7c823 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMProxy.java
+@@ -88,7 +88,32 @@ protected InetSocketAddress getRMAddress(
+     YarnConfiguration conf = (configuration instanceof YarnConfiguration)
+         ? (YarnConfiguration) configuration
+         : new YarnConfiguration(configuration);
+-    RetryPolicy retryPolicy = createRetryPolicy(conf);
++    RetryPolicy retryPolicy =
++        createRetryPolicy(conf);
++    return createRMProxy(conf, protocol, instance, retryPolicy);
++  }
++
++  /**
++   * Create a proxy for the specified protocol. For non-HA,
++   * this is a direct connection to the ResourceManager address. When HA is
++   * enabled, the proxy handles the failover between the ResourceManagers as
++   * well.
++   */
++  @Private
++  protected static <T> T createRMProxy(final Configuration configuration,
++      final Class<T> protocol, RMProxy instance, final long retryTime,
++      final long retryInterval) throws IOException {
++    YarnConfiguration conf = (configuration instanceof YarnConfiguration)
++        ? (YarnConfiguration) configuration
++        : new YarnConfiguration(configuration);
++    RetryPolicy retryPolicy =
++        createRetryPolicy(conf, retryTime, retryInterval);
++    return createRMProxy(conf, protocol, instance, retryPolicy);
++  }
++
++  private static <T> T createRMProxy(final YarnConfiguration conf,
++      final Class<T> protocol, RMProxy instance, RetryPolicy retryPolicy)
++          throws IOException{
+     if (HAUtil.isHAEnabled(conf)) {
+       RMFailoverProxyProvider<T> provider =
+           instance.createRMFailoverProxyProvider(conf, protocol);
+@@ -179,6 +204,18 @@ public static RetryPolicy createRetryPolicy(Configuration conf) {
+             YarnConfiguration.RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,
+             YarnConfiguration
+                 .DEFAULT_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS);
++    return createRetryPolicy(
++        conf, rmConnectWaitMS, rmConnectionRetryIntervalMS);
++  }
++
++  /**
++   * Fetch retry policy from Configuration and create the
++   * retry policy with specified retryTime and retry interval.
++   */
++  private static RetryPolicy createRetryPolicy(Configuration conf,
++      long retryTime, long retryInterval) {
++    long rmConnectWaitMS = retryTime;
++    long rmConnectionRetryIntervalMS = retryInterval;
+ 
+     boolean waitForEver = (rmConnectWaitMS == -1);
+     if (!waitForEver) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 589aa7f..b2bdc1d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -1192,6 +1192,26 @@
+ 
+   <property>
+     <description>
++      Max time to wait for NM to connect to RM.
++      When not set, proxy will fall back to use value of
++      yarn.resourcemanager.connect.max-wait.ms.
++    </description>
++    <name>yarn.nodemanager.resourcemanager.connect.max-wait.ms</name>
++    <value></value>
++  </property>
++
++  <property>
++    <description>
++      Time interval between each NM attempt to connect to RM.
++      When not set, proxy will fall back to use value of
++      yarn.resourcemanager.connect.retry-interval.ms.
++    </description>
++    <name>yarn.nodemanager.resourcemanager.connect.retry-interval.ms</name>
++    <value></value>
++  </property>
++
++  <property>
++    <description>
+       Maximum number of proxy connections to cache for node managers. If set
+       to a value greater than zero then the cache is enabled and the NMClient
+       and MRAppMaster will cache the specified number of node manager proxies.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/ServerRMProxy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/ServerRMProxy.java
+index 5d4fc46..2d4085f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/ServerRMProxy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/ServerRMProxy.java
+@@ -48,8 +48,26 @@ private ServerRMProxy() {
+    */
+   public static <T> T createRMProxy(final Configuration configuration,
+       final Class<T> protocol) throws IOException {
+-    return createRMProxy(configuration, protocol, INSTANCE);
+-}
++    long rmConnectWait =
++        configuration.getLong(
++            YarnConfiguration.RESOURCEMANAGER_CONNECT_MAX_WAIT_MS,
++            YarnConfiguration.DEFAULT_RESOURCEMANAGER_CONNECT_MAX_WAIT_MS);
++    long rmRetryInterval =
++        configuration.getLong(
++            YarnConfiguration.RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,
++            YarnConfiguration
++                .DEFAULT_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS);
++    long nmRmConnectWait =
++        configuration.getLong(
++            YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_MAX_WAIT_MS,
++                rmConnectWait);
++    long nmRmRetryInterval =
++        configuration.getLong(
++            YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,
++                rmRetryInterval);
++    return createRMProxy(configuration, protocol, INSTANCE,
++        nmRmConnectWait, nmRmRetryInterval);
++  }
+ 
+   @InterfaceAudience.Private
+   @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+index f4034f0..d4a571d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+@@ -90,6 +90,7 @@
+ import org.apache.hadoop.yarn.server.api.records.NodeAction;
+ import org.apache.hadoop.yarn.server.api.records.NodeStatus;
+ import org.apache.hadoop.yarn.server.api.records.impl.pb.MasterKeyPBImpl;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeManager.NMContext;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.ContainerManagerImpl;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.Application;
+@@ -437,6 +438,35 @@ protected void stopRMProxy() {
+     }
+   }
+ 
++  private class MyNodeStatusUpdater6 extends NodeStatusUpdaterImpl {
++
++    private final long rmStartIntervalMS;
++    private final boolean rmNeverStart;
++    public ResourceTracker resourceTracker;
++    public MyNodeStatusUpdater6(Context context, Dispatcher dispatcher,
++        NodeHealthCheckerService healthChecker, NodeManagerMetrics metrics,
++        long rmStartIntervalMS, boolean rmNeverStart) {
++      super(context, dispatcher, healthChecker, metrics);
++      this.rmStartIntervalMS = rmStartIntervalMS;
++      this.rmNeverStart = rmNeverStart;
++    }
++
++    @Override
++    protected void serviceStart() throws Exception {
++      //record the startup time
++      super.serviceStart();
++    }
++
++    private boolean isTriggered() {
++      return triggered;
++    }
++
++    @Override
++    protected void stopRMProxy() {
++      return;
++    }
++  }
++
+   private class MyNodeManager extends NodeManager {
+ 
+     private MyNodeStatusUpdater3 nodeStatusUpdater;
+@@ -1231,6 +1261,59 @@ protected NodeStatusUpdater createUpdater(Context context,
+         + "Message from ResourceManager: RM Shutting Down Node");
+   }
+ 
++  @Test (timeout = 100000)
++  public void testNMRMConnectionConf() throws Exception {
++    final long delta = 50000;
++    final long nmRmConnectionWaitMs = 100;
++    final long nmRmRetryInterval = 100;
++    final long connectionWaitMs = -1;
++    final long connectionRetryIntervalMs = 1000;
++    //Waiting for rmStartIntervalMS, RM will be started
++    final long rmStartIntervalMS = 2*1000;
++    conf.setLong(YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_MAX_WAIT_MS,
++        nmRmConnectionWaitMs);
++    conf.setLong(
++        YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,
++        nmRmRetryInterval);
++    conf.setLong(YarnConfiguration.RESOURCEMANAGER_CONNECT_MAX_WAIT_MS,
++        connectionWaitMs);
++    conf.setLong(YarnConfiguration.RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,
++        connectionRetryIntervalMs);
++    conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY,
++            1);
++    //Test NM try to connect to RM Several times, but finally fail
++    NodeManagerWithCustomNodeStatusUpdater nmWithUpdater;
++    nm = nmWithUpdater = new NodeManagerWithCustomNodeStatusUpdater() {
++      @Override
++      protected NodeStatusUpdater createUpdater(Context context,
++          Dispatcher dispatcher, NodeHealthCheckerService healthChecker) {
++        NodeStatusUpdater nodeStatusUpdater = new MyNodeStatusUpdater6(
++            context, dispatcher, healthChecker, metrics,
++            rmStartIntervalMS, true);
++        return nodeStatusUpdater;
++      }
++    };
++    nm.init(conf);
++    long waitStartTime = System.currentTimeMillis();
++    try {
++      nm.start();
++      Assert.fail("NM should have failed to start due to RM connect failure");
++    } catch(Exception e) {
++      long t = System.currentTimeMillis();
++      long duration = t - waitStartTime;
++      boolean waitTimeValid = (duration >= nmRmConnectionWaitMs) &&
++          (duration < (connectionWaitMs + delta));
++
++      if(!waitTimeValid) {
++        // throw exception if NM doesn't retry long enough
++        throw new Exception("NM should have tried re-connecting to RM during " +
++          "period of at least " + connectionWaitMs + " ms, but " +
++          "stopped retrying within " + (connectionWaitMs + delta) +
++          " ms: " + e, e);
++      }
++    }
++  }
++
+   @Test (timeout = 150000)
+   public void testNMConnectionToRM() throws Exception {
+     final long delta = 50000;
+-- 
+1.7.9.5
+

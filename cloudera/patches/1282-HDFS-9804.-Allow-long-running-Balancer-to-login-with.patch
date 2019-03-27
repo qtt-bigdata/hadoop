@@ -1,0 +1,333 @@
+From 5e4df51fc4f0a6891334b1169e7b22a4adab650a Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Thu, 25 Feb 2016 09:24:32 -0800
+Subject: [PATCH 1282/2848] HDFS-9804. Allow long-running Balancer to login
+ with keytab. Contributed by Xiao Chen.
+
+(cherry picked from commit ccff6035f50769eb69701128ae61efc69e82609d)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+
+Change-Id: Id19dcbefb2906fa0c62d2857bd066266f8e5bc12
+---
+ .../hadoop/security/UserGroupInformation.java      |    2 +-
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    6 ++
+ .../hadoop/hdfs/server/balancer/Balancer.java      |   22 +++-
+ .../src/main/resources/hdfs-default.xml            |   40 ++++++++
+ .../hadoop/hdfs/server/balancer/TestBalancer.java  |  106 +++++++++++++++++++-
+ 5 files changed, 170 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+index c7c52e8..2aa7de4 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+@@ -1191,7 +1191,7 @@ private boolean hasSufficientTimeElapsed(long now) {
+     if (now - user.getLastLogin() < MIN_TIME_BEFORE_RELOGIN ) {
+       LOG.warn("Not attempting to re-login since the last re-login was " +
+           "attempted less than " + (MIN_TIME_BEFORE_RELOGIN/1000) + " seconds"+
+-          " before.");
++          " seconds before. Last Login=" + user.getLastLogin());
+       return false;
+     }
+     return true;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 48d744e..186739fa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -433,6 +433,12 @@
+   public static final int     DFS_BALANCER_MOVERTHREADS_DEFAULT = 1000;
+   public static final String  DFS_BALANCER_DISPATCHERTHREADS_KEY = "dfs.balancer.dispatcherThreads";
+   public static final int     DFS_BALANCER_DISPATCHERTHREADS_DEFAULT = 200;
++  public static final String  DFS_BALANCER_KEYTAB_ENABLED_KEY = "dfs.balancer.keytab.enabled";
++  public static final boolean DFS_BALANCER_KEYTAB_ENABLED_DEFAULT = false;
++  public static final String  DFS_BALANCER_ADDRESS_KEY = "dfs.balancer.address";
++  public static final String  DFS_BALANCER_ADDRESS_DEFAULT= "0.0.0.0:0";
++  public static final String  DFS_BALANCER_KEYTAB_FILE_KEY = "dfs.balancer.keytab.file";
++  public static final String  DFS_BALANCER_KERBEROS_PRINCIPAL_KEY = "dfs.balancer.kerberos.principal";
+ 
+   public static final String  DFS_MOVER_MOVEDWINWIDTH_KEY = "dfs.mover.movedWinWidth";
+   public static final long    DFS_MOVER_MOVEDWINWIDTH_DEFAULT = 5400*1000L;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+index b208b15..d86b56c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+@@ -21,6 +21,7 @@
+ 
+ import java.io.IOException;
+ import java.io.PrintStream;
++import java.net.InetSocketAddress;
+ import java.net.URI;
+ import java.text.DateFormat;
+ import java.util.Arrays;
+@@ -53,6 +54,9 @@
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
+ import org.apache.hadoop.hdfs.server.protocol.StorageReport;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.util.Tool;
+@@ -587,7 +591,7 @@ static int run(Collection<URI> namenodes, final Parameters p,
+             DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_DEFAULT) * 1000;
+     LOG.info("namenodes  = " + namenodes);
+     LOG.info("parameters = " + p);
+-    
++    checkKeytabAndInit(conf);
+     System.out.println("Time Stamp               Iteration#  Bytes Already Moved  Bytes Left To Move  Bytes Being Moved");
+     
+     List<NameNodeConnector> connectors = Collections.emptyList();
+@@ -626,6 +630,22 @@ static int run(Collection<URI> namenodes, final Parameters p,
+     return ExitStatus.SUCCESS.getExitCode();
+   }
+ 
++  private static void checkKeytabAndInit(Configuration conf)
++      throws IOException {
++    if (conf.getBoolean(DFSConfigKeys.DFS_BALANCER_KEYTAB_ENABLED_KEY,
++        DFSConfigKeys.DFS_BALANCER_KEYTAB_ENABLED_DEFAULT)) {
++      LOG.info("Keytab is configured, will login using keytab.");
++      UserGroupInformation.setConfiguration(conf);
++      String addr = conf.get(DFSConfigKeys.DFS_BALANCER_ADDRESS_KEY,
++          DFSConfigKeys.DFS_BALANCER_ADDRESS_DEFAULT);
++      InetSocketAddress socAddr = NetUtils.createSocketAddr(addr, 0,
++          DFSConfigKeys.DFS_BALANCER_ADDRESS_KEY);
++      SecurityUtil.login(conf, DFSConfigKeys.DFS_BALANCER_KEYTAB_FILE_KEY,
++          DFSConfigKeys.DFS_BALANCER_KERBEROS_PRINCIPAL_KEY,
++          socAddr.getHostName());
++    }
++  }
++
+   /* Given elaspedTime in ms, return a printable string */
+   private static String time2Str(long elapsedTime) {
+     String unit;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 4e7ef6a..49d8c40 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2373,4 +2373,44 @@
+     reduces initial request failures after datanode restart.
+   </description>
+ </property>
++
++<property>
++  <name>dfs.balancer.keytab.enabled</name>
++  <value>false</value>
++  <description>
++    Set to true to enable login using a keytab for Kerberized Hadoop.
++  </description>
++</property>
++
++<property>
++  <name>dfs.balancer.address</name>
++  <value>0.0.0.0:0</value>
++  <description>
++    The hostname used for a keytab based Kerberos login. Keytab based login
++    can be enabled with dfs.balancer.keytab.enabled.
++  </description>
++</property>
++
++<property>
++  <name>dfs.balancer.keytab.file</name>
++  <value></value>
++  <description>
++    The keytab file used by the Balancer to login as its
++    service principal. The principal name is configured with
++    dfs.balancer.kerberos.principal. Keytab based login can be
++    enabled with dfs.balancer.keytab.enabled.
++  </description>
++</property>
++
++<property>
++  <name>dfs.balancer.kerberos.principal</name>
++  <value></value>
++  <description>
++    The Balancer principal. This is typically set to
++    balancer/_HOST@REALM.TLD. The Balancer will substitute _HOST with its
++    own fully qualified hostname at startup. The _HOST placeholder
++    allows using the same configuration setting on different servers.
++    Keytab based login can be enabled with dfs.balancer.keytab.enabled.
++  </description>
++</property>
+ </configuration>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+index 2090741..57774e6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+@@ -30,12 +30,14 @@
+ import java.net.InetAddress;
+ import java.net.URI;
+ import java.net.InetSocketAddress;
++import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Properties;
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.concurrent.TimeoutException;
+@@ -47,6 +49,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSClient;
+@@ -65,7 +68,12 @@
+ import org.apache.hadoop.hdfs.server.balancer.Balancer.Result;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.minikdc.MiniKdc;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.ssl.KeyStoreTestUtil;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.util.Tool;
+@@ -88,6 +96,11 @@
+   final static String RACK2 = "/rack2";
+   final private static String fileName = "/tmp.txt";
+   final static Path filePath = new Path(fileName);
++  final static private String username = "balancer";
++  private static String principal;
++  private static File baseDir;
++  private static MiniKdc kdc;
++  private static File keytabFile;
+   private MiniDFSCluster cluster;
+ 
+   ClientProtocol client;
+@@ -128,6 +141,59 @@ static void initConfWithRamDisk(Configuration conf) {
+     conf.setInt(DFS_DATANODE_RAM_DISK_LOW_WATERMARK_BYTES, DEFAULT_RAM_DISK_BLOCK_SIZE);
+   }
+ 
++  static void initSecureConf(Configuration conf) throws Exception {
++    baseDir = new File(System.getProperty("test.build.dir", "target/test-dir"),
++        TestBalancer.class.getSimpleName());
++    FileUtil.fullyDelete(baseDir);
++    assertTrue(baseDir.mkdirs());
++
++    Properties kdcConf = MiniKdc.createConf();
++    kdc = new MiniKdc(kdcConf, baseDir);
++    kdc.start();
++
++    SecurityUtil.setAuthenticationMethod(
++        UserGroupInformation.AuthenticationMethod.KERBEROS, conf);
++    UserGroupInformation.setConfiguration(conf);
++    assertTrue("Expected configuration to enable security",
++        UserGroupInformation.isSecurityEnabled());
++
++    keytabFile = new File(baseDir, username + ".keytab");
++    String keytab = keytabFile.getAbsolutePath();
++    // Windows will not reverse name lookup "127.0.0.1" to "localhost".
++    String krbInstance = Path.WINDOWS ? "127.0.0.1" : "localhost";
++    principal = username + "/" + krbInstance + "@" + kdc.getRealm();
++    String spnegoPrincipal = "HTTP/" + krbInstance + "@" + kdc.getRealm();
++    kdc.createPrincipal(keytabFile, username, username + "/" + krbInstance,
++        "HTTP/" + krbInstance);
++
++    conf.set(DFS_NAMENODE_KERBEROS_PRINCIPAL_KEY, principal);
++    conf.set(DFS_NAMENODE_KEYTAB_FILE_KEY, keytab);
++    conf.set(DFS_DATANODE_KERBEROS_PRINCIPAL_KEY, principal);
++    conf.set(DFS_DATANODE_KEYTAB_FILE_KEY, keytab);
++    conf.set(DFS_WEB_AUTHENTICATION_KERBEROS_PRINCIPAL_KEY, spnegoPrincipal);
++    conf.setBoolean(DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY, true);
++    conf.set(DFS_DATA_TRANSFER_PROTECTION_KEY, "authentication");
++    conf.set(DFS_HTTP_POLICY_KEY, HttpConfig.Policy.HTTPS_ONLY.name());
++    conf.set(DFS_NAMENODE_HTTPS_ADDRESS_KEY, "localhost:0");
++    conf.set(DFS_DATANODE_HTTPS_ADDRESS_KEY, "localhost:0");
++    conf.setInt(IPC_CLIENT_CONNECT_MAX_RETRIES_ON_SASL_KEY, 10);
++
++    conf.setBoolean(DFS_BALANCER_KEYTAB_ENABLED_KEY, true);
++    conf.set(DFS_BALANCER_ADDRESS_KEY, "localhost:0");
++    conf.set(DFS_BALANCER_KEYTAB_FILE_KEY, keytab);
++    conf.set(DFS_BALANCER_KERBEROS_PRINCIPAL_KEY, principal);
++
++    String keystoresDir = baseDir.getAbsolutePath();
++    String sslConfDir = KeyStoreTestUtil.getClasspathDir(TestBalancer.class);
++    KeyStoreTestUtil.setupSSLConfig(keystoresDir, sslConfDir, conf, false);
++
++    conf.set(DFS_CLIENT_HTTPS_KEYSTORE_RESOURCE_KEY,
++        KeyStoreTestUtil.getClientSSLConfigFileName());
++    conf.set(DFS_SERVER_HTTPS_KEYSTORE_RESOURCE_KEY,
++        KeyStoreTestUtil.getServerSSLConfigFileName());
++    initConf(conf);
++  }
++
+   /* create a file with a length of <code>fileLen</code> */
+   static void createFile(MiniDFSCluster cluster, Path filePath, long fileLen,
+       short replicationFactor, int nnIndex)
+@@ -801,6 +867,13 @@ public void integrationTest(Configuration conf) throws Exception {
+     initConf(conf);
+     oneNodeTest(conf, false);
+   }
++
++  @Test(timeout = 100000)
++  public void testUnknownDatanodeSimple() throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    initConf(conf);
++    testUnknownDatanode(conf);
++  }
+   
+   /* we first start a cluster and fill the cluster up to a certain size.
+    * then redistribute blocks according the required distribution.
+@@ -809,10 +882,8 @@ public void integrationTest(Configuration conf) throws Exception {
+    * A partially filled datanode is excluded during balancing.
+    * This triggers a situation where one of the block's location is unknown.
+    */
+-  @Test(timeout=100000)
+-  public void testUnknownDatanode() throws Exception {
+-    Configuration conf = new HdfsConfiguration();
+-    initConf(conf);
++  private void testUnknownDatanode(Configuration conf)
++      throws IOException, InterruptedException, TimeoutException {
+     long distribution[] = new long[] {50*CAPACITY/100, 70*CAPACITY/100, 0*CAPACITY/100};
+     long capacities[] = new long[]{CAPACITY, CAPACITY, CAPACITY};
+     String racks[] = new String[] {RACK0, RACK1, RACK1};
+@@ -1513,6 +1584,33 @@ public void testManyBalancerSimultaneously() throws Exception {
+   }
+ 
+   /**
++   * Test Balancer runs fine when logging in with a keytab in kerberized env.
++   * Reusing testUnknownDatanode here for basic functionality testing.
++   */
++  @Test(timeout = 300000)
++  public void testBalancerWithKeytabs() throws Exception {
++    final Configuration conf = new HdfsConfiguration();
++    initSecureConf(conf);
++    final UserGroupInformation ugi = UserGroupInformation.loginUserFromKeytabAndReturnUGI(
++        principal, keytabFile.getAbsolutePath());
++    try {
++      ugi.doAs(new PrivilegedExceptionAction<Void>() {
++        @Override
++        public Void run() throws Exception {
++          // verify that balancer runs Ok.
++          testUnknownDatanode(conf);
++          // verify that UGI was logged in using keytab.
++          assertTrue(UserGroupInformation.isLoginKeytabBased());
++          return null;
++        }
++      });
++    } finally {
++      // Reset UGI so that other tests are not affected.
++      UserGroupInformation.setConfiguration(new Configuration());
++    }
++  }
++
++  /**
+    * @param args
+    */
+   public static void main(String[] args) throws Exception {
+-- 
+1.7.9.5
+

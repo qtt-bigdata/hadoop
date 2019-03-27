@@ -1,0 +1,272 @@
+From 31cbac54add54e7507e02d72d9d692f5d5caf0df Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Fri, 11 Aug 2017 23:05:22 -0700
+Subject: [PATCH 2583/2848] HDFS-10468. HDFS read ends up ignoring an
+ interrupt. Contributed by Jing Zhao
+
+(cherry picked from commit be34e85e682880f46eee0310bf00ecc7d39cd5bd)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRead.java
+
+Change-Id: I0a96b4d5ea4eec10f72f0307b3468a235ac22d7b
+---
+ .../org/apache/hadoop/hdfs/DFSInputStream.java     |   38 +++++++--
+ .../test/java/org/apache/hadoop/hdfs/TestRead.java |   87 ++++++++++++++++++++
+ .../hdfs/server/datanode/SimulatedFSDataset.java   |    4 +-
+ 3 files changed, 119 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+index cb30adb..4430239 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+@@ -19,8 +19,10 @@
+ 
+ import java.io.EOFException;
+ import java.io.IOException;
++import java.io.InterruptedIOException;
+ import java.net.InetSocketAddress;
+ import java.nio.ByteBuffer;
++import java.nio.channels.ClosedByInterruptException;
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -296,7 +298,7 @@ private void waitFor(int waitTime) throws IOException {
+     try {
+       Thread.sleep(waitTime);
+     } catch (InterruptedException e) {
+-      throw new IOException(
++      throw new InterruptedIOException(
+           "Interrupted while getting the last block length.");
+     }
+   }
+@@ -368,6 +370,7 @@ private long readBlockLength(LocatedBlock locatedblock) throws IOException {
+           return n;
+         }
+       } catch (IOException ioe) {
++        checkInterrupted(ioe);
+         if (ioe instanceof RemoteException) {
+           if (((RemoteException) ioe).unwrapRemoteException() instanceof
+               ReplicaNotFoundException) {
+@@ -406,7 +409,8 @@ private long readBlockLength(LocatedBlock locatedblock) throws IOException {
+         try {
+           Thread.sleep(500); // delay between retries.
+         } catch (InterruptedException e) {
+-          throw new IOException("Interrupted while getting the length.");
++          throw new InterruptedIOException(
++              "Interrupted while getting the length.");
+         }
+       }
+ 
+@@ -676,6 +680,7 @@ private synchronized DatanodeInfo blockSeekTo(long target) throws IOException {
+         }
+         return chosenNode;
+       } catch (IOException ex) {
++        checkInterrupted(ex);
+         if (ex instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
+           DFSClient.LOG.info("Will fetch a new encryption key and retry, " 
+               + "encryption key was invalid when connecting to " + targetAddr
+@@ -697,6 +702,15 @@ private synchronized DatanodeInfo blockSeekTo(long target) throws IOException {
+     }
+   }
+ 
++  private void checkInterrupted(IOException e) throws IOException {
++    if (Thread.currentThread().isInterrupted() &&
++        (e instanceof ClosedByInterruptException ||
++            e instanceof InterruptedIOException)) {
++      DFSClient.LOG.debug("The reading thread has been interrupted.", e);
++      throw e;
++    }
++  }
++
+   /**
+    * Close it down!
+    */
+@@ -902,6 +916,7 @@ private synchronized int readWithStrategy(ReaderStrategy strategy, int off, int
+         } catch (ChecksumException ce) {
+           throw ce;            
+         } catch (IOException e) {
++          checkInterrupted(e);
+           if (retries == 1) {
+             DFSClient.LOG.warn("DFS Read", e);
+           }
+@@ -1019,9 +1034,12 @@ private DNAddrPair chooseDataNode(LocatedBlock block,
+           final int timeWindow = dfsClient.getConf().timeWindow;
+           double waitTime = timeWindow * failures +       // grace period for the last round of attempt
+             timeWindow * (failures + 1) * DFSUtil.getRandom().nextDouble(); // expanding time window for each failure
+-          DFSClient.LOG.warn("DFS chooseDataNode: got # " + (failures + 1) + " IOException, will wait for " + waitTime + " msec.");
++          DFSClient.LOG.warn("DFS chooseDataNode: got # " + (failures + 1) +
++              " IOException, will wait for " + waitTime + " msec.");
+           Thread.sleep((long)waitTime);
+-        } catch (InterruptedException iex) {
++        } catch (InterruptedException e) {
++          throw new InterruptedIOException(
++              "Interrupted while choosing DataNode for read.");
+         }
+         deadNodes.clear(); //2nd option is to remove only nodes[blockId]
+         openInfo();
+@@ -1110,7 +1128,8 @@ private void fetchBlockByteRange(LocatedBlock block, long start, long end,
+             corruptedBlockMap);
+         return;
+       } catch (IOException e) {
+-        // Ignore. Already processed inside the function.
++        checkInterrupted(e); // check if the read has been interrupted
++        // Ignore other IOException. Already processed inside the function.
+         // Loop through to try the next node.
+       }
+     }
+@@ -1202,6 +1221,7 @@ private void actualGetFromOneDataNode(final DNAddrPair datanode,
+         addToDeadNodes(chosenNode);
+         throw new IOException(msg);
+       } catch (IOException e) {
++        checkInterrupted(e);
+         if (e instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
+           DFSClient.LOG.info("Will fetch a new encryption key and retry, " 
+               + "encryption key was invalid when connecting to " + targetAddr
+@@ -1288,10 +1308,11 @@ private void hedgedFetchBlockByteRange(LocatedBlock block, long start,
+           ignored.add(chosenNode.info);
+           dfsClient.getHedgedReadMetrics().incHedgedReadOps();
+           continue; // no need to refresh block locations
+-        } catch (InterruptedException e) {
+-          // Ignore
+         } catch (ExecutionException e) {
+-          // Ignore already logged in the call.
++          // Ignore
++        } catch (InterruptedException e) {
++          throw new InterruptedIOException(
++              "Interrupted while waiting for reading task");
+         }
+       } else {
+         // We are starting up a 'hedged' read. We have a read already
+@@ -1582,6 +1603,7 @@ public synchronized void seek(long targetPos) throws IOException {
+                 + " from " + getCurrentBlock() + " of " + src + " from "
+                 + currentNode, e);
+           }
++          checkInterrupted(e);
+         }
+       }
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRead.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRead.java
+index 378d8bb..2548630 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRead.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRead.java
+@@ -19,8 +19,18 @@
+ 
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.io.InputStream;
++import java.io.InterruptedIOException;
+ import java.nio.ByteBuffer;
++import java.nio.channels.ClosedByInterruptException;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.server.datanode.DataNode;
++import org.apache.hadoop.hdfs.server.datanode.DataStorage;
++import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
++import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
++import org.apache.hadoop.io.IOUtils;
+ import org.junit.Assert;
+ 
+ import org.apache.hadoop.conf.Configuration;
+@@ -102,4 +112,81 @@ public void testReadReservedPath() throws Exception {
+       cluster.shutdown();
+     }
+   }
++
++  @Test(timeout=60000)
++  public void testInterruptReader() throws Exception {
++    final Configuration conf = new HdfsConfiguration();
++    conf.set(DFSConfigKeys.DFS_DATANODE_FSDATASET_FACTORY_KEY,
++        DelayedSimulatedFSDataset.Factory.class.getName());
++
++    final MiniDFSCluster cluster = new MiniDFSCluster
++        .Builder(conf).numDataNodes(1).build();
++    final DistributedFileSystem fs = cluster.getFileSystem();
++    try {
++      cluster.waitActive();
++      final Path file = new Path("/foo");
++      DFSTestUtil.createFile(fs, file, 1024, (short) 1, 0L);
++
++      final FSDataInputStream in = fs.open(file);
++      final AtomicBoolean readInterrupted = new AtomicBoolean(false);
++      final Thread reader = new Thread(new Runnable() {
++        @Override
++        public void run() {
++          try {
++            in.read(new byte[1024], 0, 1024);
++          } catch (IOException e) {
++            if (e instanceof ClosedByInterruptException ||
++                e instanceof InterruptedIOException) {
++              readInterrupted.set(true);
++            }
++          }
++        }
++      });
++
++      reader.start();
++      Thread.sleep(1000);
++      reader.interrupt();
++      reader.join();
++
++      Assert.assertTrue(readInterrupted.get());
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
++  private static class DelayedSimulatedFSDataset extends SimulatedFSDataset {
++    private volatile boolean isDelayed = true;
++
++    DelayedSimulatedFSDataset(DataNode datanode, DataStorage storage,
++                              Configuration conf) {
++      super(datanode, storage, conf);
++    }
++
++    @Override
++    public synchronized InputStream getBlockInputStream(ExtendedBlock b,
++        long seekOffset) throws IOException {
++      while (isDelayed) {
++        try {
++          this.wait();
++        } catch (InterruptedException ignored) {
++        }
++      }
++      InputStream result = super.getBlockInputStream(b);
++      IOUtils.skipFully(result, seekOffset);
++      return result;
++    }
++
++    static class Factory extends FsDatasetSpi.Factory<DelayedSimulatedFSDataset> {
++      @Override
++      public DelayedSimulatedFSDataset newInstance(DataNode datanode,
++          DataStorage storage, Configuration conf) throws IOException {
++        return new DelayedSimulatedFSDataset(datanode, storage, conf);
++      }
++
++      @Override
++      public boolean isSimulated() {
++        return true;
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+index bec5b0e..d3d158d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+@@ -940,8 +940,8 @@ public synchronized ReplicaHandler createTemporary(
+     return new ReplicaHandler(binfo, null);
+   }
+ 
+-  synchronized InputStream getBlockInputStream(ExtendedBlock b
+-      ) throws IOException {
++  protected synchronized InputStream getBlockInputStream(ExtendedBlock b)
++      throws IOException {
+     final Map<Block, BInfo> map = getMap(b.getBlockPoolId());
+     BInfo binfo = map.get(b.getLocalBlock());
+     if (binfo == null) {
+-- 
+1.7.9.5
+

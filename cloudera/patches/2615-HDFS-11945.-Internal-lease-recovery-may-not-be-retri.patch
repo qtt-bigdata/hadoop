@@ -1,0 +1,164 @@
+From b2470d075215b774d15063f99da90fd10d585264 Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Thu, 8 Jun 2017 14:46:31 -0700
+Subject: [PATCH 2615/2848] HDFS-11945. Internal lease recovery may not be
+ retried for a long time. Contributed by Kihwal
+ Lee
+
+(cherry picked from commit facb6812d9004ae509b2564150bbe28317a293f1)
+(cherry picked from commit 72d895a11f04a0cbad463ac46e002e30b8835bc3)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+
+Change-Id: If340a536334a0d73eec68c706acfe4c391f7206b
+---
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   27 ++++++++++++++++++--
+ .../org/apache/hadoop/hdfs/TestLeaseRecovery2.java |   12 +++++----
+ .../hdfs/server/namenode/TestLeaseManager.java     |   16 +++++++++++-
+ 3 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 41dc947..47e582d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -48,6 +48,7 @@
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.util.Daemon;
++import org.apache.hadoop.util.Time;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+@@ -83,6 +84,8 @@
+   private long hardLimit = HdfsConstants.LEASE_HARDLIMIT_PERIOD;
+   static final int INODE_FILTER_WORKER_COUNT_MAX = 4;
+   static final int INODE_FILTER_WORKER_TASK_MIN = 512;
++  private long lastHolderUpdateTime;
++  private String internalLeaseHolder;
+ 
+   // Used for handling lock-leases
+   // Mapping: leaseHolder -> Lease
+@@ -105,7 +108,26 @@ public int compare(Lease o1, Lease o2) {
+   private Daemon lmthread;
+   private volatile boolean shouldRunMonitor;
+ 
+-  LeaseManager(FSNamesystem fsnamesystem) {this.fsnamesystem = fsnamesystem;}
++  LeaseManager(FSNamesystem fsnamesystem) {
++    this.fsnamesystem = fsnamesystem;
++    updateInternalLeaseHolder();
++  }
++
++  // Update the internal lease holder with the current time stamp.
++  private void updateInternalLeaseHolder() {
++    this.lastHolderUpdateTime = Time.monotonicNow();
++    this.internalLeaseHolder = HdfsServerConstants.NAMENODE_LEASE_HOLDER +
++        "-" + Time.formatTime(Time.now());
++  }
++
++  // Get the current internal lease holder name.
++  String getInternalLeaseHolder() {
++    long elapsed = Time.monotonicNow() - lastHolderUpdateTime;
++    if (elapsed > hardLimit) {
++      updateInternalLeaseHolder();
++    }
++    return internalLeaseHolder;
++  }
+ 
+   Lease getLease(String holder) {
+     return leases.get(holder);
+@@ -535,6 +557,7 @@ synchronized boolean checkLeases() {
+       Long[] leaseINodeIds = files.toArray(new Long[files.size()]);
+       FSDirectory fsd = fsnamesystem.getFSDirectory();
+       String p = null;
++      String newHolder = getInternalLeaseHolder();
+       for(Long id : leaseINodeIds) {
+         try {
+           INodesInPath iip = INodesInPath.fromINode(fsd.getInode(id));
+@@ -544,7 +567,7 @@ synchronized boolean checkLeases() {
+             throw new IOException("Invalid path in the lease " + p);
+           }
+           boolean completed = fsnamesystem.internalReleaseLease(
+-              leaseToCheck, p, iip, HdfsServerConstants.NAMENODE_LEASE_HOLDER);
++              leaseToCheck, p, iip, newHolder);
+           if (LOG.isDebugEnabled()) {
+             if (completed) {
+               LOG.debug("Lease recovery for inode " + id + " is complete. " +
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
+index 9f21ec5..81b16a2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
+@@ -466,7 +466,8 @@ public void hardLeaseRecoveryRestartHelper(boolean doRename, int size)
+         cluster.getNameNode(), fileStr);
+     
+     assertFalse("original lease holder should not be the NN",
+-        originalLeaseHolder.equals(HdfsServerConstants.NAMENODE_LEASE_HOLDER));
++        originalLeaseHolder.startsWith(
++        HdfsServerConstants.NAMENODE_LEASE_HOLDER));
+ 
+     // hflush file
+     AppendTestUtil.LOG.info("hflush");
+@@ -502,8 +503,9 @@ public void hardLeaseRecoveryRestartHelper(boolean doRename, int size)
+     GenericTestUtils.waitFor(new Supplier<Boolean>() {
+       @Override
+       public Boolean get() {
+-        return HdfsServerConstants.NAMENODE_LEASE_HOLDER.equals(
+-            NameNodeAdapter.getLeaseHolderForPath(cluster.getNameNode(), path));
++        String holder =
++            NameNodeAdapter.getLeaseHolderForPath(cluster.getNameNode(), path);
++        return holder.startsWith(HdfsServerConstants.NAMENODE_LEASE_HOLDER);
+       }
+     }, (int)SHORT_LEASE_PERIOD, (int)SHORT_LEASE_PERIOD * 10);
+ 
+@@ -564,8 +566,8 @@ static void checkLease(String f, int size) {
+     if (size == 0) {
+       assertEquals("lease holder should null, file is closed", null, holder);
+     } else {
+-      assertEquals("lease holder should now be the NN",
+-          HdfsServerConstants.NAMENODE_LEASE_HOLDER, holder);
++      assertTrue("lease holder should now be the NN",
++          holder.startsWith(HdfsServerConstants.NAMENODE_LEASE_HOLDER));
+     }
+     
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+index ce78553..45baf3e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+@@ -19,9 +19,10 @@
+ 
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.assertNotEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertThat;
+-import static org.junit.Assert.assertTrue;
+ 
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.Path;
+@@ -102,6 +103,19 @@ public void testCheckLease() throws InterruptedException {
+     assertTrue(lm.countLease() < numLease);
+   }
+ 
++  /**
++   * Test whether the internal lease holder name is updated properly.
++   */
++  @Test
++  public void testInternalLeaseHolder() throws Exception {
++    LeaseManager lm = new LeaseManager(makeMockFsNameSystem());
++    // Set the hard lease limit to 500ms.
++    lm.setLeasePeriod(100L, 500L);
++    String holder = lm.getInternalLeaseHolder();
++    Thread.sleep(1000);
++    assertNotEquals(holder, lm.getInternalLeaseHolder());
++  }
++
+   @Test
+   public void testCountPath() {
+     LeaseManager lm = new LeaseManager(makeMockFsNameSystem());
+-- 
+1.7.9.5
+

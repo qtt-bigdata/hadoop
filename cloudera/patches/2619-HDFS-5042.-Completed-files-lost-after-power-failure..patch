@@ -1,0 +1,347 @@
+From a9fd6379b721f223cf133b69705eb84edb1ca683 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Thu, 1 Jun 2017 12:25:27 -0500
+Subject: [PATCH 2619/2848] HDFS-5042. Completed files lost after power
+ failure. Contributed by Vinayakumar B.
+
+(cherry picked from commit 89d59c292fb149d245c18d1f188cc113e849c087)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+
+Change-Id: I8b2ce1f3054825521da07e4551ee3b615a987112
+---
+ .../main/java/org/apache/hadoop/io/IOUtils.java    |   54 ++++++++++++++++++++
+ .../hadoop/hdfs/server/datanode/BlockReceiver.java |    9 +++-
+ .../server/datanode/fsdataset/FsDatasetSpi.java    |    4 +-
+ .../datanode/fsdataset/impl/FsDatasetImpl.java     |   35 ++++++++++---
+ .../hdfs/server/datanode/SimulatedFSDataset.java   |    3 +-
+ .../datanode/TestDataNodeHotSwapVolumes.java       |    6 ++-
+ .../server/datanode/TestSimulatedFSDataset.java    |    4 +-
+ .../datanode/extdataset/ExternalDatasetImpl.java   |    3 +-
+ .../datanode/fsdataset/impl/TestFsDatasetImpl.java |    2 +-
+ 9 files changed, 103 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+index d8e8dd9..fabb0a4 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+@@ -27,6 +27,7 @@
+ import java.nio.file.DirectoryIteratorException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -35,6 +36,7 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.util.Shell;
+ import org.slf4j.Logger;
+ 
+ /**
+@@ -368,4 +370,56 @@ public static void writeFully(FileChannel fc, ByteBuffer buf,
+     }
+     return list;
+   }
++
++  /**
++   * Ensure that any writes to the given file is written to the storage device
++   * that contains it. This method opens channel on given File and closes it
++   * once the sync is done.<br>
++   * Borrowed from Uwe Schindler in LUCENE-5588
++   * @param fileToSync the file to fsync
++   */
++  public static void fsync(File fileToSync) throws IOException {
++    if (!fileToSync.exists()) {
++      throw new FileNotFoundException(
++          "File/Directory " + fileToSync.getAbsolutePath() + " does not exist");
++    }
++    boolean isDir = fileToSync.isDirectory();
++    // If the file is a directory we have to open read-only, for regular files
++    // we must open r/w for the fsync to have an effect. See
++    // http://blog.httrack.com/blog/2013/11/15/
++    // everything-you-always-wanted-to-know-about-fsync/
++    try(FileChannel channel = FileChannel.open(fileToSync.toPath(),
++        isDir ? StandardOpenOption.READ : StandardOpenOption.WRITE)){
++      fsync(channel, isDir);
++    }
++  }
++
++  /**
++   * Ensure that any writes to the given file is written to the storage device
++   * that contains it. This method opens channel on given File and closes it
++   * once the sync is done.
++   * Borrowed from Uwe Schindler in LUCENE-5588
++   * @param channel Channel to sync
++   * @param isDir if true, the given file is a directory (Channel should be
++   *          opened for read and ignore IOExceptions, because not all file
++   *          systems and operating systems allow to fsync on a directory)
++   * @throws IOException
++   */
++  public static void fsync(FileChannel channel, boolean isDir)
++      throws IOException {
++    try {
++      channel.force(true);
++    } catch (IOException ioe) {
++      if (isDir) {
++        assert !(Shell.LINUX
++            || Shell.MAC) : "On Linux and MacOSX fsyncing a directory"
++                + " should not throw IOException, we just don't want to rely"
++                + " on that in production (undocumented)" + ". Got: " + ioe;
++        // Ignore exception if it is a directory
++        return;
++      }
++      // Throw original exception
++      throw ioe;
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+index c29866d..146fd30 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+@@ -121,6 +121,7 @@
+   private final boolean isTransfer;
+ 
+   private boolean syncOnClose;
++  private volatile boolean dirSyncOnFinalize;
+   private long restartBudget;
+   /** the reference of the volume where the block receiver writes to */
+   private ReplicaHandler replicaHandler;
+@@ -527,6 +528,9 @@ private int receivePacket() throws IOException {
+     // avoid double sync'ing on close
+     if (syncBlock && lastPacketInBlock) {
+       this.syncOnClose = false;
++      // sync directory for finalize irrespective of syncOnClose config since
++      // sync is requested.
++      this.dirSyncOnFinalize = true;
+     }
+ 
+     // update received bytes
+@@ -878,6 +882,7 @@ void receiveBlock(
+       boolean isReplaceBlock) throws IOException {
+ 
+       syncOnClose = datanode.getDnConf().syncOnClose;
++      dirSyncOnFinalize = syncOnClose;
+       boolean responderClosed = false;
+       mirrorOut = mirrOut;
+       mirrorAddr = mirrAddr;
+@@ -919,7 +924,7 @@ void receiveBlock(
+           } else {
+             // for isDatnode or TRANSFER_FINALIZED
+             // Finalize the block.
+-            datanode.data.finalizeBlock(block);
++            datanode.data.finalizeBlock(block, dirSyncOnFinalize);
+           }
+         }
+         datanode.metrics.incrBlocksWritten();
+@@ -1419,7 +1424,7 @@ private void finalizeBlock(long startTime) throws IOException {
+         BlockReceiver.this.close();
+         endTime = ClientTraceLog.isInfoEnabled() ? System.nanoTime() : 0;
+         block.setNumBytes(replicaInfo.getNumBytes());
+-        datanode.data.finalizeBlock(block);
++        datanode.data.finalizeBlock(block, dirSyncOnFinalize);
+       }
+ 
+       if (pinning) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+index 110f7db..602a03e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+@@ -381,12 +381,14 @@ Replica recoverClose(ExtendedBlock b, long newGS, long expectedBlockLen
+    * Finalizes the block previously opened for writing using writeToBlock.
+    * The block size is what is in the parameter b and it must match the amount
+    *  of data written
++   * @param block Block to be finalized
++   * @param fsyncDir whether to sync the directory changes to durable device.
+    * @throws IOException
+    * @throws ReplicaNotFoundException if the replica can not be found when the
+    * block is been finalized. For instance, the block resides on an HDFS volume
+    * that has been removed.
+    */
+-  public void finalizeBlock(ExtendedBlock b) throws IOException;
++  void finalizeBlock(ExtendedBlock b, boolean fsyncDir) throws IOException;
+ 
+   /**
+    * Unfinalizes the block previously opened for writing using writeToBlock.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+index 838a34e..bd054c7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+@@ -846,6 +846,17 @@ static File moveBlockFiles(Block b, File srcfile, File destdir)
+     return dstfile;
+   }
+ 
++  private void fsyncDirectory(FsVolumeSpi volume, File... dirs)
++      throws IOException {
++    for (File dir : dirs) {
++      try {
++        IOUtils.fsync(dir);
++      } catch (IOException e) {
++        throw new IOException("Failed to sync " + dir, e);
++      }
++    }
++  }
++
+   /**
+    * Copy the block and meta files for the given block to the given destination.
+    * @return the new meta and block files.
+@@ -955,7 +966,8 @@ private ReplicaInfo moveBlock(ExtendedBlock block, ReplicaInfo replicaInfo,
+         targetVolume, blockFiles[0].getParentFile(), 0);
+     newReplicaInfo.setNumBytes(blockFiles[1].length());
+     // Finalize the copied files
+-    newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo);
++    newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo,
++        false);
+ 
+     removeOldReplica(replicaInfo, newReplicaInfo, oldBlockFile, oldMetaFile,
+         oldBlockFile.length(), oldMetaFile.length(), block.getBlockPoolId());
+@@ -1331,7 +1343,7 @@ public Replica recoverClose(ExtendedBlock b, long newGS,
+           bumpReplicaGS(replicaInfo, newGS);
+           // finalize the replica if RBW
+           if (replicaInfo.getState() == ReplicaState.RBW) {
+-            finalizeReplica(b.getBlockPoolId(), replicaInfo);
++            finalizeReplica(b.getBlockPoolId(), replicaInfo, false);
+           }
+           return replicaInfo;
+         }
+@@ -1658,7 +1670,8 @@ public void adjustCrcChannelPosition(ExtendedBlock b, ReplicaOutputStreams strea
+    * Complete the block write!
+    */
+   @Override // FsDatasetSpi
+-  public synchronized void finalizeBlock(ExtendedBlock b) throws IOException {
++  public synchronized void finalizeBlock(ExtendedBlock b, boolean fsyncDir)
++      throws IOException {
+     if (Thread.interrupted()) {
+       // Don't allow data modifications from interrupted threads
+       throw new IOException("Cannot finalize block from Interrupted Thread");
+@@ -1669,11 +1682,11 @@ public synchronized void finalizeBlock(ExtendedBlock b) throws IOException {
+       // been opened for append but never modified
+       return;
+     }
+-    finalizeReplica(b.getBlockPoolId(), replicaInfo);
++    finalizeReplica(b.getBlockPoolId(), replicaInfo, fsyncDir);
+   }
+   
+   private synchronized FinalizedReplica finalizeReplica(String bpid,
+-      ReplicaInfo replicaInfo) throws IOException {
++      ReplicaInfo replicaInfo, boolean fsyncDir) throws IOException {
+     FinalizedReplica newReplicaInfo = null;
+     if (replicaInfo.getState() == ReplicaState.RUR &&
+        ((ReplicaUnderRecovery)replicaInfo).getOriginalReplica().getState() == 
+@@ -1691,7 +1704,15 @@ private synchronized FinalizedReplica finalizeReplica(String bpid,
+       File dest = v.addFinalizedBlock(
+           bpid, replicaInfo, f, replicaInfo.getBytesReserved());
+       newReplicaInfo = new FinalizedReplica(replicaInfo, v, dest.getParentFile());
+-
++      /*
++       * Sync the directory after rename from tmp/rbw to Finalized if
++       * configured. Though rename should be atomic operation, sync on both
++       * dest and src directories are done because IOUtils.fsync() calls
++       * directory's channel sync, not the journal itself.
++       */
++      if (fsyncDir) {
++         fsyncDirectory(v, dest.getParentFile(), f.getParentFile());
++      }
+       if (v.isTransientStorage()) {
+         ramDiskReplicaTracker.addReplica(bpid, replicaInfo.getBlockId(), v);
+         datanode.getMetrics().addRamDiskBytesWrite(replicaInfo.getNumBytes());
+@@ -2597,7 +2618,7 @@ private FinalizedReplica updateReplicaUnderRecovery(
+    }
+ 
+     // finalize the block
+-    return finalizeReplica(bpid, rur);
++    return finalizeReplica(bpid, rur, false);
+   }
+ 
+   @Override // FsDatasetSpi
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+index d3d158d..c390637 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+@@ -583,7 +583,8 @@ public synchronized void injectBlocks(String bpid,
+   }
+ 
+   @Override // FsDatasetSpi
+-  public synchronized void finalizeBlock(ExtendedBlock b) throws IOException {
++  public synchronized void finalizeBlock(ExtendedBlock b, boolean fsyncDir)
++      throws IOException {
+     final Map<Block, BInfo> map = getMap(b.getBlockPoolId());
+     BInfo binfo = map.get(b.getLocalBlock());
+     if (binfo == null) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+index 0943772..d0cfe24 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+@@ -656,10 +656,12 @@ public Object answer(InvocationOnMock invocation)
+             // Bypass the argument to FsDatasetImpl#finalizeBlock to verify that
+             // the block is not removed, since the volume reference should not
+             // be released at this point.
+-            data.finalizeBlock((ExtendedBlock) invocation.getArguments()[0]);
++            data.finalizeBlock((ExtendedBlock) invocation.getArguments()[0],
++              (boolean) invocation.getArguments()[1]);
+             return null;
+           }
+-        }).when(dn.data).finalizeBlock(any(ExtendedBlock.class));
++        }).when(dn.data).finalizeBlock(any(ExtendedBlock.class),
++            Mockito.anyBoolean());
+ 
+     final CyclicBarrier barrier = new CyclicBarrier(2);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+index d645410..1692f4c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+@@ -84,7 +84,7 @@ int addSomeBlocks(SimulatedFSDataset fsdataset, int startingBlockId)
+         out.close();
+       }
+       b.setNumBytes(blockIdToLen(i));
+-      fsdataset.finalizeBlock(b);
++      fsdataset.finalizeBlock(b, false);
+       assertEquals(blockIdToLen(i), fsdataset.getLength(b));
+     }
+     return bytesAdded;  
+@@ -274,7 +274,7 @@ public void checkInvalidBlock(ExtendedBlock b) {
+     }
+     
+     try {
+-      fsdataset.finalizeBlock(b);
++      fsdataset.finalizeBlock(b, false);
+       assertTrue("Expected an IO exception", false);
+     } catch (IOException e) {
+       // ok - as expected
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+index 37c1369..f5d25d6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+@@ -183,7 +183,8 @@ public Replica recoverClose(ExtendedBlock b, long newGS, long expectedBlkLen)
+   }
+ 
+   @Override
+-  public void finalizeBlock(ExtendedBlock b) throws IOException {
++  public void finalizeBlock(ExtendedBlock b, boolean fsyncDir)
++      throws IOException {
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+index dcb83b8..3e74dea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+@@ -527,7 +527,7 @@ public void run() {
+           // Lets wait for the other thread finish getting block report
+           blockReportReceivedLatch.await();
+ 
+-          dataset.finalizeBlock(eb);
++          dataset.finalizeBlock(eb, false);
+           LOG.info("FinalizeBlock finished");
+         } catch (Exception e) {
+           LOG.warn("Exception caught. This should not affect the test", e);
+-- 
+1.7.9.5
+

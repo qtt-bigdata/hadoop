@@ -1,0 +1,333 @@
+From 157b4f44a270fadcf8c424950c373f106a732b5d Mon Sep 17 00:00:00 2001
+From: Akira Ajisaka <aajisaka@apache.org>
+Date: Sat, 3 Dec 2016 11:11:50 +0900
+Subject: [PATCH 2208/2848] HDFS-11180. Intermittent deadlock in NameNode when
+ failover happens.
+
+(cherry picked from commit 6d8df4e81ebff861be114c19e1b3c9d0d69e842b)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+Change-Id: Ib6377a40ce95986217df49e13ac8cf4d087faade
+---
+ .../dev-support/findbugsExcludeFile.xml            |   27 ++++++++++
+ .../hadoop/hdfs/server/namenode/FSEditLog.java     |   57 +++++++++++++++++---
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   13 ++++-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   16 +++---
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |    2 +-
+ .../server/namenode/ha/StandbyCheckpointer.java    |    4 +-
+ .../server/namenode/TestFSNamesystemMBean.java     |   24 +++++++++
+ 7 files changed, 124 insertions(+), 19 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml b/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+index fa511fb..4c94d4d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+@@ -126,6 +126,33 @@
+         <Field name="journalSet" />
+         <Bug pattern="IS2_INCONSISTENT_SYNC" />
+     </Match>
++    <!--
++      FSEditLog#getTotalSyncCount is not synchronized because this method is
++      used by metrics. NullPointerException can happen and it is ignored.
++    -->
++    <Match>
++      <Class name="org.apache.hadoop.hdfs.server.namenode.FSEditLog" />
++      <Field name="editLogStream" />
++      <Bug pattern="IS2_INCONSISTENT_SYNC" />
++    </Match>
++    <!--
++      FSEditLog#isOpenForWriteWithoutLock and FSEditLog#isSegmentOpenWithoutLock
++      are not synchronized because these methods are used by metrics.
++    -->
++    <Match>
++      <Class name="org.apache.hadoop.hdfs.server.namenode.FSEditLog" />
++      <Field name="state" />
++      <Bug pattern="IS2_INCONSISTENT_SYNC" />
++    </Match>
++    <!--
++      All of the threads which update/increment txid are synchronized,
++      so make txid volatile instead of AtomicLong.
++    -->
++    <Match>
++      <Class name="org.apache.hadoop.hdfs.server.namenode.FSEditLog" />
++      <Field name="txid" />
++      <Bug pattern="VO_VOLATILE_INCREMENT" />
++    </Match>
+      <!--
+       This method isn't performance-critical and is much clearer to write as it's written.
+       -->
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+index 6235801..2ef58d5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+@@ -149,14 +149,16 @@
+   private EditLogOutputStream editLogStream = null;
+ 
+   // a monotonically increasing counter that represents transactionIds.
+-  private long txid = 0;
++  // All of the threads which update/increment txid are synchronized,
++  // so make txid volatile instead of AtomicLong.
++  private volatile long txid = 0;
+ 
+   // stores the last synced transactionId.
+   private long synctxid = 0;
+ 
+   // the first txid of the log that's currently open for writing.
+   // If this value is N, we are currently writing to edits_inprogress_N
+-  private long curSegmentTxId = HdfsConstants.INVALID_TXID;
++  private volatile long curSegmentTxId = HdfsConstants.INVALID_TXID;
+ 
+   // the time of printing the statistics to the log file.
+   private long lastPrintTime;
+@@ -332,7 +334,18 @@ synchronized boolean isOpenForWrite() {
+     return state == State.IN_SEGMENT ||
+       state == State.BETWEEN_LOG_SEGMENTS;
+   }
+-  
++
++  /**
++   * Return true if the log is currently open in write mode.
++   * This method is not synchronized and must be used only for metrics.
++   * @return true if the log is currently open in write mode, regardless
++   * of whether it actually has an open segment.
++   */
++  boolean isOpenForWriteWithoutLock() {
++    return state == State.IN_SEGMENT ||
++        state == State.BETWEEN_LOG_SEGMENTS;
++  }
++
+   /**
+    * @return true if the log is open in write mode and has a segment open
+    * ready to take edits.
+@@ -342,6 +355,16 @@ synchronized boolean isSegmentOpen() {
+   }
+ 
+   /**
++   * Return true the state is IN_SEGMENT.
++   * This method is not synchronized and must be used only for metrics.
++   * @return true if the log is open in write mode and has a segment open
++   * ready to take edits.
++   */
++  boolean isSegmentOpenWithoutLock() {
++    return state == State.IN_SEGMENT;
++  }
++
++  /**
+    * @return true if the log is open in read mode.
+    */
+   public synchronized boolean isOpenForRead() {
+@@ -516,7 +539,16 @@ private void endTransaction(long start) {
+   public synchronized long getLastWrittenTxId() {
+     return txid;
+   }
+-  
++
++  /**
++   * Return the transaction ID of the last transaction written to the log.
++   * This method is not synchronized and must be used only for metrics.
++   * @return The transaction ID of the last transaction written to the log
++   */
++  long getLastWrittenTxIdWithoutLock() {
++    return txid;
++  }
++
+   /**
+    * @return the first transaction ID in the current log segment
+    */
+@@ -525,7 +557,16 @@ synchronized long getCurSegmentTxId() {
+         "Bad state: %s", state);
+     return curSegmentTxId;
+   }
+-  
++
++  /**
++   * Return the first transaction ID in the current log segment.
++   * This method is not synchronized and must be used only for metrics.
++   * @return The first transaction ID in the current log segment
++   */
++  long getCurSegmentTxIdWithoutLock() {
++    return curSegmentTxId;
++  }
++
+   /**
+    * Set the transaction ID to use for the next transaction written.
+    */
+@@ -1149,7 +1190,9 @@ void logRemoveXAttrs(String src, List<XAttr> xAttrs, boolean toLogRpcIds) {
+   /**
+    * Get all the journals this edit log is currently operating on.
+    */
+-  synchronized List<JournalAndStream> getJournals() {
++  List<JournalAndStream> getJournals() {
++    // The list implementation is CopyOnWriteArrayList,
++    // so we don't need to synchronize this method.
+     return journalSet.getAllJournalStreams();
+   }
+   
+@@ -1157,7 +1200,7 @@ void logRemoveXAttrs(String src, List<XAttr> xAttrs, boolean toLogRpcIds) {
+    * Used only by tests.
+    */
+   @VisibleForTesting
+-  synchronized public JournalSet getJournalSet() {
++  public JournalSet getJournalSet() {
+     return journalSet;
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 894629d..df93137 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -988,7 +988,7 @@ public void saveLegacyOIVImage(FSNamesystem source, String targetDir,
+       Canceler canceler) throws IOException {
+     FSImageCompression compression =
+         FSImageCompression.createCompression(conf);
+-    long txid = getLastAppliedOrWrittenTxId();
++    long txid = getCorrectLastAppliedOrWrittenTxId();
+     SaveNamespaceContext ctx = new SaveNamespaceContext(source, txid,
+         canceler);
+     FSImageFormat.Saver saver = new FSImageFormat.Saver(ctx);
+@@ -1086,7 +1086,7 @@ public synchronized void saveNamespace(FSNamesystem source, NameNodeFile nnf,
+     if (editLogWasOpen) {
+       editLog.endCurrentLogSegment(true);
+     }
+-    long imageTxId = getLastAppliedOrWrittenTxId();
++    long imageTxId = getCorrectLastAppliedOrWrittenTxId();
+     if (!addToCheckpointing(imageTxId)) {
+       throw new IOException(
+           "FS image is being downloaded from another NN at txid " + imageTxId);
+@@ -1450,6 +1450,15 @@ public synchronized long getLastAppliedTxId() {
+ 
+   public long getLastAppliedOrWrittenTxId() {
+     return Math.max(lastAppliedTxId,
++        editLog != null ? editLog.getLastWrittenTxIdWithoutLock() : 0);
++  }
++
++  /**
++   * This method holds a lock of FSEditLog to get the correct value.
++   * This method must not be used for metrics.
++   */
++  public long getCorrectLastAppliedOrWrittenTxId() {
++    return Math.max(lastAppliedTxId,
+         editLog != null ? editLog.getLastWrittenTxId() : 0);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 99acb02..31e4d63 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -5189,7 +5189,7 @@ HeartbeatResponse handleHeartbeat(DatanodeRegistration nodeReg,
+       //create ha status
+       final NNHAStatusHeartbeat haState = new NNHAStatusHeartbeat(
+           haContext.getState().getServiceState(),
+-          getFSImage().getLastAppliedOrWrittenTxId());
++          getFSImage().getCorrectLastAppliedOrWrittenTxId());
+ 
+       return new HeartbeatResponse(cmds, haState, rollingUpgradeInfo,
+           blockReportLeaseId);
+@@ -5480,17 +5480,17 @@ public long getTransactionsSinceLastCheckpoint() {
+   @Metric({"TransactionsSinceLastLogRoll",
+       "Number of transactions since last edit log roll"})
+   public long getTransactionsSinceLastLogRoll() {
+-    if (isInStandbyState() || !getEditLog().isSegmentOpen()) {
++    if (isInStandbyState() || !getEditLog().isSegmentOpenWithoutLock()) {
+       return 0;
+     } else {
+-      return getEditLog().getLastWrittenTxId() -
+-        getEditLog().getCurSegmentTxId() + 1;
++      return getEditLog().getLastWrittenTxIdWithoutLock() -
++          getEditLog().getCurSegmentTxIdWithoutLock() + 1;
+     }
+   }
+-  
++
+   @Metric({"LastWrittenTransactionId", "Transaction ID written to the edit log"})
+   public long getLastWrittenTransactionId() {
+-    return getEditLog().getLastWrittenTxId();
++    return getEditLog().getLastWrittenTxIdWithoutLock();
+   }
+   
+   @Metric({"LastCheckpointTime",
+@@ -8034,7 +8034,9 @@ public String getNameJournalStatus() {
+     List<Map<String, String>> jasList = new ArrayList<Map<String, String>>();
+     FSEditLog log = getFSImage().getEditLog();
+     if (log != null) {
+-      boolean openForWrite = log.isOpenForWrite();
++      // This flag can be false because we cannot hold a lock of FSEditLog
++      // for metrics.
++      boolean openForWrite = log.isOpenForWriteWithoutLock();
+       for (JournalAndStream jas : log.getJournals()) {
+         final Map<String, String> jasMap = new HashMap<String, String>();
+         String manager = jas.getManager().toString();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index d158727..0202e21 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -991,7 +991,7 @@ public long getTransactionID() throws IOException {
+     checkNNStartup();
+     namesystem.checkOperation(OperationCategory.UNCHECKED);
+     namesystem.checkSuperuserPrivilege();
+-    return namesystem.getFSImage().getLastAppliedOrWrittenTxId();
++    return namesystem.getFSImage().getCorrectLastAppliedOrWrittenTxId();
+   }
+   
+   @Override // NamenodeProtocol
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+index 1e40368..31fa5a2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+@@ -165,7 +165,7 @@ private void doCheckpoint() throws InterruptedException, IOException {
+       FSImage img = namesystem.getFSImage();
+       
+       long prevCheckpointTxId = img.getStorage().getMostRecentCheckpointTxId();
+-      long thisCheckpointTxId = img.getLastAppliedOrWrittenTxId();
++      long thisCheckpointTxId = img.getCorrectLastAppliedOrWrittenTxId();
+       assert thisCheckpointTxId >= prevCheckpointTxId;
+       if (thisCheckpointTxId == prevCheckpointTxId) {
+         LOG.info("A checkpoint was triggered but the Standby Node has not " +
+@@ -253,7 +253,7 @@ static int getCanceledCount() {
+ 
+   private long countUncheckpointedTxns() {
+     FSImage img = namesystem.getFSImage();
+-    return img.getLastAppliedOrWrittenTxId() -
++    return img.getCorrectLastAppliedOrWrittenTxId() -
+       img.getStorage().getMostRecentCheckpointTxId();
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystemMBean.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystemMBean.java
+index fb3179a..764c627 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystemMBean.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystemMBean.java
+@@ -159,4 +159,28 @@ public void testWithFSNamesystemWriteLock() throws Exception {
+       }
+     }
+   }
++
++  // The test makes sure JMX request can be processed even if FSEditLog
++  // is synchronized.
++  @Test
++  public void testWithFSEditLogLock() throws Exception {
++    Configuration conf = new Configuration();
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).build();
++      cluster.waitActive();
++      synchronized (cluster.getNameNode().getFSImage().getEditLog()) {
++        MBeanClient client = new MBeanClient();
++        client.start();
++        client.join(20000);
++        assertTrue("JMX calls are blocked when FSEditLog" +
++            " is synchronized by another thread", client.succeeded);
++        client.interrupt();
++      }
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+\ No newline at end of file
+-- 
+1.7.9.5
+

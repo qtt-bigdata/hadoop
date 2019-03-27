@@ -1,0 +1,494 @@
+From e38350bf8ca1719adbd93f3a180d94a90a26fe00 Mon Sep 17 00:00:00 2001
+From: Benoy Antony <benoy@apache.org>
+Date: Thu, 8 Jan 2015 10:06:48 -0800
+Subject: [PATCH 1215/2848] HADOOP-10651. Add ability to restrict service
+ access using IP addresses and hostnames. (Benoy
+ Antony)
+
+(cherry picked from commit 20625c8f048701c9516da159b24c0b33983e4bb7)
+(cherry picked from commit 832ae27f83856dfec1eb8f898fb1f9cfd04a1877)
+
+Change-Id: I73af7474e465a73228922f369c8fab197f278d04
+---
+ .../authorize/ServiceAuthorizationManager.java     |   58 +++++-
+ .../java/org/apache/hadoop/util/MachineList.java   |    3 +-
+ .../src/site/apt/ServiceLevelAuth.apt.vm           |   25 +++
+ .../authorize/TestServiceAuthorization.java        |  189 ++++++++++++++++++--
+ 4 files changed, 259 insertions(+), 16 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/ServiceAuthorizationManager.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/ServiceAuthorizationManager.java
+index 272538a..5d29516 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/ServiceAuthorizationManager.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/authorize/ServiceAuthorizationManager.java
+@@ -33,6 +33,7 @@
+ import org.apache.hadoop.security.KerberosInfo;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.MachineList;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -44,6 +45,7 @@
+ @InterfaceStability.Evolving
+ public class ServiceAuthorizationManager {
+   static final String BLOCKED = ".blocked";
++  static final String HOSTS = ".hosts";
+ 
+   private static final String HADOOP_POLICY_FILE = "hadoop-policy.xml";
+ 
+@@ -51,6 +53,10 @@
+   // and second ACL specifies blocked entries.
+   private volatile Map<Class<?>, AccessControlList[]> protocolToAcls =
+     new IdentityHashMap<Class<?>, AccessControlList[]>();
++  // For each class, first MachineList in the array specifies the allowed entries
++  // and second MachineList specifies blocked entries.
++  private volatile Map<Class<?>, MachineList[]> protocolToMachineLists =
++    new IdentityHashMap<Class<?>, MachineList[]>();
+   
+   /**
+    * Configuration key for controlling service-level authorization for Hadoop.
+@@ -85,7 +91,8 @@ public void authorize(UserGroupInformation user,
+                                InetAddress addr
+                                ) throws AuthorizationException {
+     AccessControlList[] acls = protocolToAcls.get(protocol);
+-    if (acls == null) {
++    MachineList[] hosts = protocolToMachineLists.get(protocol);
++    if (acls == null || hosts == null) {
+       throw new AuthorizationException("Protocol " + protocol + 
+                                        " is not known.");
+     }
+@@ -115,6 +122,16 @@ public void authorize(UserGroupInformation user,
+           " is not authorized for protocol " + protocol + 
+           ", expected client Kerberos principal is " + clientPrincipal);
+     }
++    if (addr != null) {
++      String hostAddress = addr.getHostAddress();
++      if (hosts.length != 2 || !hosts[0].includes(hostAddress) ||
++          hosts[1].includes(hostAddress)) {
++        AUDITLOG.warn(AUTHZ_FAILED_FOR + " for protocol=" + protocol
++            + " from host = " +  hostAddress);
++        throw new AuthorizationException("Host " + hostAddress +
++            " is not authorized for protocol " + protocol) ;
++      }
++    }
+     AUDITLOG.info(AUTHZ_SUCCESSFUL_FOR + user + " for protocol="+protocol);
+   }
+ 
+@@ -135,6 +152,8 @@ public void refreshWithLoadedConfiguration(Configuration conf,
+       PolicyProvider provider) {
+     final Map<Class<?>, AccessControlList[]> newAcls =
+       new IdentityHashMap<Class<?>, AccessControlList[]>();
++    final Map<Class<?>, MachineList[]> newMachineLists =
++      new IdentityHashMap<Class<?>, MachineList[]>();
+     
+     String defaultAcl = conf.get(
+         CommonConfigurationKeys.HADOOP_SECURITY_SERVICE_AUTHORIZATION_DEFAULT_ACL,
+@@ -143,6 +162,13 @@ public void refreshWithLoadedConfiguration(Configuration conf,
+     String defaultBlockedAcl = conf.get(
+       CommonConfigurationKeys.HADOOP_SECURITY_SERVICE_AUTHORIZATION_DEFAULT_BLOCKED_ACL, "");
+ 
++    String defaultServiceHostsKey = getHostKey(
++      CommonConfigurationKeys.HADOOP_SECURITY_SERVICE_AUTHORIZATION_DEFAULT_ACL);
++    String defaultMachineList = conf.get(defaultServiceHostsKey,
++      MachineList.WILDCARD_VALUE);
++    String defaultBlockedMachineList= conf.get(
++     defaultServiceHostsKey+ BLOCKED, "");
++
+     // Parse the config file
+     Service[] services = provider.getServices();
+     if (services != null) {
+@@ -157,11 +183,26 @@ public void refreshWithLoadedConfiguration(Configuration conf,
+            conf.get(service.getServiceKey() + BLOCKED,
+            defaultBlockedAcl));
+         newAcls.put(service.getProtocol(), new AccessControlList[] {acl, blockedAcl});
++        String serviceHostsKey = getHostKey(service.getServiceKey());
++        MachineList machineList = new MachineList (conf.get(serviceHostsKey, defaultMachineList));
++        MachineList blockedMachineList = new MachineList(
++          conf.get(serviceHostsKey + BLOCKED, defaultBlockedMachineList));
++        newMachineLists.put(service.getProtocol(),
++            new MachineList[] {machineList, blockedMachineList});
+       }
+     }
+ 
+     // Flip to the newly parsed permissions
+     protocolToAcls = newAcls;
++    protocolToMachineLists = newMachineLists;
++  }
++
++  private String getHostKey(String serviceKey) {
++    int endIndex = serviceKey.lastIndexOf(".");
++    if (endIndex != -1) {
++      return serviceKey.substring(0, endIndex)+ HOSTS;
++    }
++    return serviceKey;
+   }
+ 
+   @VisibleForTesting
+@@ -178,4 +219,19 @@ public AccessControlList getProtocolsAcls(Class<?> className) {
+   public AccessControlList getProtocolsBlockedAcls(Class<?> className) {
+     return protocolToAcls.get(className)[1];
+   }
++
++  @VisibleForTesting
++  public Set<Class<?>> getProtocolsWithMachineLists() {
++    return protocolToMachineLists.keySet();
++  }
++
++  @VisibleForTesting
++  public MachineList getProtocolsMachineList(Class<?> className) {
++    return protocolToMachineLists.get(className)[0];
++  }
++
++  @VisibleForTesting
++  public MachineList getProtocolsBlockedMachineList(Class<?> className) {
++    return protocolToMachineLists.get(className)[1];
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/MachineList.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/MachineList.java
+index 1df5d71..2e6c079 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/MachineList.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/MachineList.java
+@@ -44,6 +44,7 @@
+ public class MachineList {
+   
+   public static final Log LOG = LogFactory.getLog(MachineList.class);
++  public static final String WILDCARD_VALUE = "*";
+ 
+   /**
+    * InetAddressFactory is used to obtain InetAddress from host.
+@@ -90,7 +91,7 @@ public MachineList(Collection<String> hostEntries) {
+   public MachineList(Collection<String> hostEntries, InetAddressFactory addressFactory) {
+     this.addressFactory = addressFactory;
+     if (hostEntries != null) {
+-      if ((hostEntries.size() == 1) && (hostEntries.contains("*"))) {
++      if ((hostEntries.size() == 1) && (hostEntries.contains(WILDCARD_VALUE))) {
+         all = true; 
+         ipAddresses = null; 
+         hostNames = null; 
+diff --git a/hadoop-common-project/hadoop-common/src/site/apt/ServiceLevelAuth.apt.vm b/hadoop-common-project/hadoop-common/src/site/apt/ServiceLevelAuth.apt.vm
+index 6f71454..86fb3d6 100644
+--- a/hadoop-common-project/hadoop-common/src/site/apt/ServiceLevelAuth.apt.vm
++++ b/hadoop-common-project/hadoop-common/src/site/apt/ServiceLevelAuth.apt.vm
+@@ -159,6 +159,31 @@ security.ha.service.protocol.acl      | ACL for HAService protocol used by HAAdm
+    the ability to refresh the service-level authorization configuration to
+    certain users/groups.
+ 
++  ** Access Control using list of ip addresses, host names and ip ranges
++
++   Access to a service can be controlled based on the ip address of the client accessing
++   the service. It is possible to restrict access to a service from a set of machines by
++   specifying a list of ip addresses, host names and ip ranges. The property name for each service
++   is derived from the corresponding acl's property name. If the property name of acl is
++   security.client.protocol.acl, property name for the hosts list will be
++   security.client.protocol.hosts.
++
++   If hosts list is not defined for a service, the value of
++   <<<security.service.authorization.default.hosts>>> is applied. If
++   <<<security.service.authorization.default.hosts>>> is not defined, <<<*>>>  is applied.
++
++   It is possible to specify a blocked list of hosts. Only those machines which are in the
++   hosts list, but not in the blocked hosts list will be granted access to the service. The property
++   name is derived by suffixing with ".blocked".
++
++   Example: The property name of blocked hosts list for <<<security.client.protocol.hosts>>
++   will be <<<security.client.protocol.hosts.blocked>>>
++
++   If blocked hosts list is not defined for a service, the value of
++   <<<security.service.authorization.default.hosts.blocked>>> is applied. If
++   <<<security.service.authorization.default.hosts.blocked>>> is not defined,
++   empty blocked hosts list is applied.
++
+ ** Examples
+ 
+    Allow only users <<<alice>>>, <<<bob>>> and users in the <<<mapreduce>>> group to submit
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/authorize/TestServiceAuthorization.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/authorize/TestServiceAuthorization.java
+index 9ef9d7a..c473c50 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/authorize/TestServiceAuthorization.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/authorize/TestServiceAuthorization.java
+@@ -34,6 +34,11 @@
+   private static final String ACL_CONFIG = "test.protocol.acl";
+   private static final String ACL_CONFIG1 = "test.protocol1.acl";
+   private static final String ADDRESS =  "0.0.0.0";
++  private static final String HOST_CONFIG = "test.protocol.hosts";
++  private static final String BLOCKED_HOST_CONFIG = "test.protocol.hosts.blocked";
++  private static final String AUTHORIZED_IP = "1.2.3.4";
++  private static final String UNAUTHORIZED_IP = "1.2.3.5";
++  private static final String IP_RANGE = "10.222.0.0/16,10.113.221.221";
+ 
+   public interface TestProtocol1 extends TestProtocol {};
+ 
+@@ -52,7 +57,7 @@ public void testDefaultAcl() {
+     ServiceAuthorizationManager serviceAuthorizationManager = 
+         new ServiceAuthorizationManager();
+     Configuration conf = new Configuration ();
+-    //test without setting a default acl
++    // test without setting a default acl
+     conf.set(ACL_CONFIG, "user1 group1");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     AccessControlList acl = serviceAuthorizationManager.getProtocolsAcls(TestProtocol.class);
+@@ -60,7 +65,7 @@ public void testDefaultAcl() {
+     acl = serviceAuthorizationManager.getProtocolsAcls(TestProtocol1.class);
+     assertEquals(AccessControlList.WILDCARD_ACL_VALUE, acl.getAclString());
+ 
+-    //test with a default acl
++    // test with a default acl
+     conf.set(
+         CommonConfigurationKeys.HADOOP_SECURITY_SERVICE_AUTHORIZATION_DEFAULT_ACL, 
+         "user2 group2");
+@@ -81,7 +86,7 @@ public void testBlockedAcl() throws UnknownHostException {
+         new ServiceAuthorizationManager();
+     Configuration conf = new Configuration ();
+ 
+-    //test without setting a blocked acl
++    // test without setting a blocked acl
+     conf.set(ACL_CONFIG, "user1 group1");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -90,7 +95,7 @@ public void testBlockedAcl() throws UnknownHostException {
+     } catch (AuthorizationException e) {
+       fail();
+     }
+-    //now set a blocked acl with another user and another group
++    // now set a blocked acl with another user and another group
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "drwho2 group3");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -99,7 +104,7 @@ public void testBlockedAcl() throws UnknownHostException {
+     } catch (AuthorizationException e) {
+       fail();
+     }
+-    //now set a blocked acl with the user and another group
++    // now set a blocked acl with the user and another group
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "drwho group3");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -109,7 +114,7 @@ public void testBlockedAcl() throws UnknownHostException {
+     } catch (AuthorizationException e) {
+ 
+     }
+-    //now set a blocked acl with another user and another group
++    // now set a blocked acl with another user and another group
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "drwho2 group3");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -118,7 +123,7 @@ public void testBlockedAcl() throws UnknownHostException {
+     } catch (AuthorizationException e) {
+       fail();
+     }
+-    //now set a blocked acl with another user and group that the user belongs to
++    // now set a blocked acl with another user and group that the user belongs to
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "drwho2 group2");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -126,9 +131,9 @@ public void testBlockedAcl() throws UnknownHostException {
+           InetAddress.getByName(ADDRESS));
+       fail();
+     } catch (AuthorizationException e) {
+-      //expects Exception
++      // expects Exception
+     }
+-    //reset blocked acl so that there is no blocked ACL
++    // reset blocked acl so that there is no blocked ACL
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+@@ -149,7 +154,7 @@ public void testDefaultBlockedAcl() throws UnknownHostException {
+         new ServiceAuthorizationManager();
+     Configuration conf = new Configuration ();
+ 
+-    //test without setting a default blocked acl
++    // test without setting a default blocked acl
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+     try {
+       serviceAuthorizationManager.authorize(drwho, TestProtocol1.class, conf,
+@@ -158,27 +163,183 @@ public void testDefaultBlockedAcl() throws UnknownHostException {
+       fail();
+     }
+ 
+-    //set a restrictive default blocked acl and an non-restricting blocked acl for TestProtocol
++    // set a restrictive default blocked acl and an non-restricting blocked acl for TestProtocol
+     conf.set(
+         CommonConfigurationKeys.HADOOP_SECURITY_SERVICE_AUTHORIZATION_DEFAULT_BLOCKED_ACL,
+         "user2 group2");
+     conf.set(ACL_CONFIG + ServiceAuthorizationManager.BLOCKED, "user2");
+     serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
+-    //drwho is authorized to access TestProtocol
++    // drwho is authorized to access TestProtocol
+     try {
+       serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
+           InetAddress.getByName(ADDRESS));
+     } catch (AuthorizationException e) {
+       fail();
+     }
+-    //drwho is not authorized to access TestProtocol1 because it uses the default blocked acl.
++    // drwho is not authorized to access TestProtocol1 because it uses the default blocked acl.
+     try {
+       serviceAuthorizationManager.authorize(drwho, TestProtocol1.class, conf,
+           InetAddress.getByName(ADDRESS));
+       fail();
+     } catch (AuthorizationException e) {
+-      //expects Exception
++      // expects Exception
++    }
++  }
++
++  @Test
++  public void testMachineList() throws UnknownHostException {
++    UserGroupInformation drwho =
++        UserGroupInformation.createUserForTesting("drwho@EXAMPLE.COM",
++            new String[] { "group1", "group2" });
++    ServiceAuthorizationManager serviceAuthorizationManager =
++        new ServiceAuthorizationManager();
++    Configuration conf = new Configuration ();
++    conf.set(HOST_CONFIG, "1.2.3.4");
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
++          InetAddress.getByName(AUTHORIZED_IP));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    try {
++      serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
++          InetAddress.getByName(UNAUTHORIZED_IP));
++      fail();
++    } catch (AuthorizationException e) {
++    // expects Exception
++    }
++  }
++
++  @Test
++  public void testDefaultMachineList() throws UnknownHostException {
++    UserGroupInformation drwho =
++        UserGroupInformation.createUserForTesting("drwho@EXAMPLE.COM",
++            new String[] { "group1", "group2" });
++    ServiceAuthorizationManager serviceAuthorizationManager =
++        new ServiceAuthorizationManager();
++    Configuration conf = new Configuration ();
++    // test without setting a default MachineList
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
++          InetAddress.getByName(UNAUTHORIZED_IP));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    // test with a default MachineList
++    conf.set(
++        "security.service.authorization.default.hosts",
++        IP_RANGE);
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
++          InetAddress.getByName(UNAUTHORIZED_IP));
++      fail();
++    } catch (AuthorizationException e) {
++    // expects Exception
++    }
++    try {
++      serviceAuthorizationManager.authorize(drwho, TestProtocol.class, conf,
++          InetAddress.getByName("10.222.0.0"));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++  }
++
++  @Test
++  public void testBlockedMachineList() throws UnknownHostException {
++    UserGroupInformation drwho =
++        UserGroupInformation.createUserForTesting("drwho@EXAMPLE.COM",
++            new String[] { "group1", "group2" });
++
++    ServiceAuthorizationManager serviceAuthorizationManager =
++        new ServiceAuthorizationManager();
++    Configuration conf = new Configuration ();
++
++    // test without setting a blocked MachineList
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol.class, conf, InetAddress.getByName("10.222.0.0"));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    // now set a blocked MachineList
++    conf.set(BLOCKED_HOST_CONFIG, IP_RANGE);
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol.class, conf, InetAddress.getByName("10.222.0.0"));
++      fail();
++    } catch (AuthorizationException e) {
++    // expects Exception
++    }
++    // reset blocked MachineList
++    conf.set(BLOCKED_HOST_CONFIG, "");
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol.class, conf, InetAddress.getByName("10.222.0.0"));
++    } catch (AuthorizationException e) {
++      fail();
+     }
+   }
+ 
++  @Test
++  public void testDefaultBlockedMachineList() throws UnknownHostException {
++    UserGroupInformation drwho =
++        UserGroupInformation.createUserForTesting("drwho@EXAMPLE.COM",
++            new String[] { "group1", "group2" });
++
++    ServiceAuthorizationManager serviceAuthorizationManager =
++        new ServiceAuthorizationManager();
++    Configuration conf = new Configuration ();
++
++    // test without setting a default blocked MachineList
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol1.class, conf, InetAddress.getByName("10.222.0.0"));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    // set a  default blocked MachineList and a blocked MachineList for TestProtocol
++    conf.set(
++        "security.service.authorization.default.hosts.blocked",
++        IP_RANGE);
++    conf.set(BLOCKED_HOST_CONFIG, "1.2.3.4");
++    serviceAuthorizationManager.refresh(conf, new TestPolicyProvider());
++    // TestProtocol can be accessed from "10.222.0.0" because it blocks only "1.2.3.4"
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol.class, conf, InetAddress.getByName("10.222.0.0"));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    // TestProtocol cannot be accessed from  "1.2.3.4"
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++          TestProtocol.class, conf, InetAddress.getByName("1.2.3.4"));
++      fail();
++    } catch (AuthorizationException e) {
++      //expects Exception
++    }
++    // TestProtocol1 can be accessed from "1.2.3.4" because it uses default block list
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++         TestProtocol1.class, conf, InetAddress.getByName("1.2.3.4"));
++    } catch (AuthorizationException e) {
++      fail();
++    }
++    // TestProtocol1 cannot be accessed from "10.222.0.0", 
++    // because "10.222.0.0" is in default block list
++    try {
++      serviceAuthorizationManager.authorize(drwho,
++         TestProtocol1.class, conf, InetAddress.getByName("10.222.0.0"));
++      fail();
++    } catch (AuthorizationException e) {
++      //expects Exception
++    }
++  }
+ }
+-- 
+1.7.9.5
+

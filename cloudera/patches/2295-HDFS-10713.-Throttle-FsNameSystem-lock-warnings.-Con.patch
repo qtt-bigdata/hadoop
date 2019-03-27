@@ -1,0 +1,464 @@
+From 2016afe1e31b63f8e41e203a1b21b27326f8dfa4 Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Tue, 27 Sep 2016 09:00:39 -0700
+Subject: [PATCH 2295/2848] HDFS-10713. Throttle FsNameSystem lock warnings.
+ Contributed by Hanisha Koneru.
+
+(cherry-picked from a349c54603c5cb7327d3bbb22285bd8e686c4790)
+
+(cherry picked from commit c08346ea2d174a484b754b3ae41e2100bc932efd)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+
+Change-Id: Id87defb8f819ae3a0b97c2854f6b37aaf4c04df1
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    6 ++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |  101 +++++++++++++++++---
+ .../src/main/resources/hdfs-default.xml            |    7 ++
+ .../hdfs/server/namenode/TestFSNamesystem.java     |   87 +++++++++++++----
+ 4 files changed, 166 insertions(+), 35 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index e4caf22..a0d7ca3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -421,6 +421,12 @@
+       "dfs.namenode.read-lock-reporting-threshold-ms";
+   public static final long    DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT = 5000L;
+ 
++  // Threshold for how long the lock warnings must be suppressed
++  public static final String DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY =
++      "dfs.lock.suppress.warning.interval";
++  public static final long DFS_LOCK_SUPPRESS_WARNING_INTERVAL_DEFAULT =
++      10000; //ms
++
+   //Following keys have no defaults
+   public static final String  DFS_DATANODE_DATA_DIR_KEY = "dfs.datanode.data.dir";
+   public static final String  DFS_NAMENODE_HTTPS_PORT_KEY = "dfs.https.port";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 2de451f..260a328 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -75,6 +75,8 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_EXPIRYTIME_MILLIS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_EXPIRYTIME_MILLIS_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RETRY_CACHE_HEAP_PERCENT_DEFAULT;
+@@ -133,6 +135,8 @@
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.locks.Condition;
+ import java.util.concurrent.locks.ReentrantLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+@@ -305,6 +309,7 @@
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
++import org.apache.hadoop.util.Timer;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.apache.log4j.Appender;
+ import org.apache.log4j.AsyncAppender;
+@@ -832,6 +837,7 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+     fsLock = new FSNamesystemLock(fair);
+     cond = fsLock.writeLock().newCondition();
+     cpLock = new ReentrantLock();
++    setTimer(new Timer());
+ 
+     this.fsImage = fsImage;
+     try {
+@@ -944,6 +950,10 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+           DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,
+           DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT);
+ 
++      this.lockSuppressWarningInterval = conf.getTimeDuration(
++          DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY,
++          DFS_LOCK_SUPPRESS_WARNING_INTERVAL_DEFAULT, TimeUnit.MILLISECONDS);
++
+       // For testing purposes, allow the DT secret manager to be started regardless
+       // of whether security is enabled.
+       alwaysUseDelegationTokensForTests = conf.getBoolean(
+@@ -1616,12 +1626,20 @@ private boolean shouldRetrySafeMode(SafeModeInfo safeMode) {
+     return Util.stringCollectionAsURIs(dirNames);
+   }
+ 
++  private final long lockSuppressWarningInterval;
+   /** Threshold (ms) for long holding write lock report. */
+-  private long writeLockReportingThreshold;
++  private final long writeLockReportingThreshold;
++  private int numWriteLockWarningsSuppressed = 0;
++  private long timeStampOfLastWriteLockReport = 0;
++  private long longestWriteLockHeldInterval = 0;
+   /** Last time stamp for write lock. Keep the longest one for multi-entrance.*/
+   private long writeLockHeldTimeStamp;
+   /** Threshold (ms) for long holding read lock report. */
+   private long readLockReportingThreshold;
++  private AtomicInteger numReadLockWarningsSuppressed = new AtomicInteger(0);
++  private AtomicLong timeStampOfLastReadLockReport = new AtomicLong(0);
++  private AtomicLong longestReadLockHeldInterval = new AtomicLong(0);
++  private Timer timer;
+   /**
+    * Last time stamp for read lock. Keep the longest one for
+    * multi-entrance. This is ThreadLocal since there could be
+@@ -1639,48 +1657,99 @@ public Long initialValue() {
+   public void readLock() {
+     this.fsLock.readLock().lock();
+     if (this.fsLock.getReadHoldCount() == 1) {
+-      readLockHeldTimeStamp.set(monotonicNow());
++      readLockHeldTimeStamp.set(timer.monotonicNow());
+     }
+   }
+   @Override
+   public void readUnlock() {
+     final boolean needReport = this.fsLock.getReadHoldCount() == 1;
+-    final long readLockInterval = monotonicNow() - readLockHeldTimeStamp.get();
+-    this.fsLock.readLock().unlock();
+-
++    final long readLockInterval = timer.monotonicNow() -
++        readLockHeldTimeStamp.get();
+     if (needReport) {
+       readLockHeldTimeStamp.remove();
+-      if (readLockInterval > this.readLockReportingThreshold) {
+-        LOG.info("FSNamesystem read lock held for " + readLockInterval +
+-            " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()));
+-      }
++    }
++
++    this.fsLock.readLock().unlock();
++
++    if (needReport && readLockInterval >= this.readLockReportingThreshold) {
++      long localLongestReadLock;
++      do {
++        localLongestReadLock = longestReadLockHeldInterval.get();
++      } while (localLongestReadLock - readLockInterval < 0
++          && !longestReadLockHeldInterval.compareAndSet(localLongestReadLock,
++                                                        readLockInterval));
++
++      long localTimeStampOfLastReadLockReport;
++      long now;
++      do {
++        now = timer.monotonicNow();
++        localTimeStampOfLastReadLockReport = timeStampOfLastReadLockReport
++            .get();
++        if (now - localTimeStampOfLastReadLockReport <
++            lockSuppressWarningInterval) {
++          numReadLockWarningsSuppressed.incrementAndGet();
++          return;
++        }
++      } while (!timeStampOfLastReadLockReport.compareAndSet(
++          localTimeStampOfLastReadLockReport, now));
++      int numSuppressedWarnings = numReadLockWarningsSuppressed.getAndSet(0);
++      long longestLockHeldInterval = longestReadLockHeldInterval.getAndSet(0);
++      LOG.info("FSNamesystem read lock held for " + readLockInterval +
++          " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()) +
++          "\tNumber of suppressed read-lock reports: " +
++          numSuppressedWarnings + "\n\tLongest read-lock held interval: " +
++          longestLockHeldInterval);
+     }
+   }
+   @Override
+   public void writeLock() {
+     this.fsLock.writeLock().lock();
+     if (fsLock.getWriteHoldCount() == 1) {
+-      writeLockHeldTimeStamp = monotonicNow();
++      writeLockHeldTimeStamp = timer.monotonicNow();
+     }
+   }
+   @Override
+   public void writeLockInterruptibly() throws InterruptedException {
+     this.fsLock.writeLock().lockInterruptibly();
+     if (fsLock.getWriteHoldCount() == 1) {
+-      writeLockHeldTimeStamp = monotonicNow();
++      writeLockHeldTimeStamp = timer.monotonicNow();
+     }
+   }
+   @Override
+   public void writeUnlock() {
+     final boolean needReport = fsLock.getWriteHoldCount() == 1 &&
+         fsLock.isWriteLockedByCurrentThread();
+-    final long writeLockInterval = monotonicNow() - writeLockHeldTimeStamp;
++    final long currentTime = timer.monotonicNow();
++    final long writeLockInterval = currentTime - writeLockHeldTimeStamp;
++
++    boolean logReport = false;
++    int numSuppressedWarnings = 0;
++    long longestLockHeldInterval = 0;
++    if (needReport && writeLockInterval >= this.writeLockReportingThreshold) {
++      if (writeLockInterval > longestWriteLockHeldInterval) {
++        longestWriteLockHeldInterval = writeLockInterval;
++      }
++      if (currentTime - timeStampOfLastWriteLockReport > this
++          .lockSuppressWarningInterval) {
++        logReport = true;
++        numSuppressedWarnings = numWriteLockWarningsSuppressed;
++        numWriteLockWarningsSuppressed = 0;
++        longestLockHeldInterval = longestWriteLockHeldInterval;
++        longestWriteLockHeldInterval = 0;
++        timeStampOfLastWriteLockReport = currentTime;
++      } else {
++        numWriteLockWarningsSuppressed++;
++      }
++    }
+ 
+     this.fsLock.writeLock().unlock();
+ 
+-    if (needReport && writeLockInterval >= this.writeLockReportingThreshold) {
++    if (logReport) {
+       LOG.info("FSNamesystem write lock held for " + writeLockInterval +
+-          " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()));
++          " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()) +
++          "\tNumber of suppressed write-lock reports: " +
++          numSuppressedWarnings + "\n\tLongest write-lock held interval: " +
++              longestLockHeldInterval);
+     }
+   }
+   @Override
+@@ -9864,5 +9933,9 @@ public int getNumEnteringMaintenanceDataNodes() {
+         .size();
+   }
+ 
++  @VisibleForTesting
++  void setTimer(Timer newTimer) {
++    this.timer = newTimer;
++  }
+ }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 50ebf30..1bc3cad 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2650,4 +2650,11 @@
+      refreshes the configuration files used by the class.
+    </description>
+  </property>
++
++  <property>
++    <name>dfs.lock.suppress.warning.interval</name>
++    <value>10s</value>
++    <description>Instrumentation reporting long critical sections will suppress
++      consecutive warnings within this interval.</description>
++  </property>
+ </configuration>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+index 7dd0f72..6ea2b6e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+@@ -20,12 +20,14 @@
+ 
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY;
++import org.apache.hadoop.util.FakeTimer;
++import static org.hamcrest.CoreMatchers.either;
++import static org.hamcrest.CoreMatchers.instanceOf;
+ import static org.junit.Assert.*;
+ 
+ import java.io.File;
+ import java.io.IOException;
+ import java.net.URI;
+-import java.util.ArrayList;
+ import java.util.Collection;
+ 
+ import com.google.common.base.Supplier;
+@@ -53,6 +55,8 @@
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.regex.Matcher;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ import java.util.regex.Pattern;
+ 
+ public class TestFSNamesystem {
+@@ -258,45 +262,54 @@ public void run() {
+   @Test(timeout=45000)
+   public void testFSWriteLockLongHoldingReport() throws Exception {
+     final long writeLockReportingThreshold = 100L;
++    final long writeLockSuppressWarningInterval = 10000L;
+     Configuration conf = new Configuration();
+     conf.setLong(DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY,
+         writeLockReportingThreshold);
++    conf.setTimeDuration(DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY,
++        writeLockSuppressWarningInterval, TimeUnit.MILLISECONDS);
+     FSImage fsImage = Mockito.mock(FSImage.class);
+     FSEditLog fsEditLog = Mockito.mock(FSEditLog.class);
+     Mockito.when(fsImage.getEditLog()).thenReturn(fsEditLog);
+     final FSNamesystem fsn = new FSNamesystem(conf, fsImage);
+ 
++    FakeTimer timer = new FakeTimer();
++    fsn.setTimer(timer);
++    timer.advance(writeLockSuppressWarningInterval);
++
+     LogCapturer logs = LogCapturer.captureLogs(FSNamesystem.LOG);
+     GenericTestUtils.setLogLevel(FSNamesystem.LOG, Level.INFO);
+ 
+     // Don't report if the write lock is held for a short time
+     fsn.writeLock();
+-    Thread.sleep(writeLockReportingThreshold / 2);
+     fsn.writeUnlock();
+     assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+ 
+-
+-    // Report if the write lock is held for a long time
++    // Report the first write lock warning if it is held for a long time
+     fsn.writeLock();
+-    Thread.sleep(writeLockReportingThreshold + 10);
++    timer.advance(writeLockReportingThreshold + 10);
+     logs.clearOutput();
+     fsn.writeUnlock();
+     assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+ 
+-    // Report if the write lock is held (interruptibly) for a long time
++    // Track but do not Report if the write lock is held (interruptibly) for
++    // a long time but time since last report does not exceed the suppress
++    // warning interval
+     fsn.writeLockInterruptibly();
+-    Thread.sleep(writeLockReportingThreshold + 10);
++    timer.advance(writeLockReportingThreshold + 10);
+     logs.clearOutput();
+     fsn.writeUnlock();
+-    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+ 
+-    // Report if it's held for a long time when re-entering write lock
++    // Track but do not Report if it's held for a long time when re-entering
++    // write lock but time since last report does not exceed the suppress
++    // warning interval
+     fsn.writeLock();
+-    Thread.sleep(writeLockReportingThreshold/ 2 + 1);
++    timer.advance(writeLockReportingThreshold/ 2 + 1);
+     fsn.writeLockInterruptibly();
+-    Thread.sleep(writeLockReportingThreshold / 2 + 1);
++    timer.advance(writeLockReportingThreshold/ 2 + 1);
+     fsn.writeLock();
+-    Thread.sleep(writeLockReportingThreshold / 2);
++    timer.advance(writeLockReportingThreshold/ 2);
+     logs.clearOutput();
+     fsn.writeUnlock();
+     assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+@@ -305,7 +318,18 @@ public void testFSWriteLockLongHoldingReport() throws Exception {
+     assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
+     logs.clearOutput();
+     fsn.writeUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++
++    // Report if it's held for a long time and time since last report exceeds
++    // the supress warning interval
++    timer.advance(writeLockSuppressWarningInterval);
++    fsn.writeLock();
++    timer.advance(writeLockReportingThreshold + 100);
++    logs.clearOutput();
++    fsn.writeUnlock();
+     assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++    assertTrue(logs.getOutput().contains("Number of suppressed write-lock " +
++        "reports: 2"));
+   }
+ 
+   /**
+@@ -315,52 +339,71 @@ public void testFSWriteLockLongHoldingReport() throws Exception {
+   @Test(timeout=45000)
+   public void testFSReadLockLongHoldingReport() throws Exception {
+     final long readLockReportingThreshold = 100L;
++    final long readLockSuppressWarningInterval = 10000L;
+     final String readLockLogStmt = "FSNamesystem read lock held for ";
+     Configuration conf = new Configuration();
+     conf.setLong(
+         DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,
+         readLockReportingThreshold);
++    conf.setTimeDuration(DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY,
++        readLockSuppressWarningInterval, TimeUnit.MILLISECONDS);
+     FSImage fsImage = Mockito.mock(FSImage.class);
+     FSEditLog fsEditLog = Mockito.mock(FSEditLog.class);
+     Mockito.when(fsImage.getEditLog()).thenReturn(fsEditLog);
+     final FSNamesystem fsn = new FSNamesystem(conf, fsImage);
+ 
++    final FakeTimer timer = new FakeTimer();
++    fsn.setTimer(timer);
++    timer.advance(readLockSuppressWarningInterval);
++
+     LogCapturer logs = LogCapturer.captureLogs(FSNamesystem.LOG);
+     GenericTestUtils.setLogLevel(FSNamesystem.LOG, Level.INFO);
+ 
+     // Don't report if the read lock is held for a short time
+     fsn.readLock();
+-    Thread.sleep(readLockReportingThreshold / 2);
+     fsn.readUnlock();
+     assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) &&
+         logs.getOutput().contains(readLockLogStmt));
+ 
+-    // Report if the read lock is held for a long time
++    // Report the first read lock warning if it is held for a long time
+     fsn.readLock();
+-    Thread.sleep(readLockReportingThreshold + 10);
++    timer.advance(readLockReportingThreshold + 10);
+     logs.clearOutput();
+     fsn.readUnlock();
+     assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName())
+         && logs.getOutput().contains(readLockLogStmt));
+ 
+-    // Report if it's held for a long time when re-entering read lock
++    // Track but do not Report if the write lock is held for a long time but
++    // time since last report does not exceed the suppress warning interval
++    fsn.readLock();
++    timer.advance(readLockReportingThreshold + 10);
++    logs.clearOutput();
++    fsn.readUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName())
++        && logs.getOutput().contains(readLockLogStmt));
++
++    // Track but do not Report if it's held for a long time when re-entering
++    // read lock but time since last report does not exceed the suppress
++    // warning interval
+     fsn.readLock();
+-    Thread.sleep(readLockReportingThreshold / 2 + 1);
++    timer.advance(readLockReportingThreshold / 2 + 1);
+     fsn.readLock();
+-    Thread.sleep(readLockReportingThreshold / 2 + 1);
++    timer.advance(readLockReportingThreshold / 2 + 1);
+     logs.clearOutput();
+     fsn.readUnlock();
+     assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) ||
+         logs.getOutput().contains(readLockLogStmt));
+     logs.clearOutput();
+     fsn.readUnlock();
+-    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()) &&
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) &&
+         logs.getOutput().contains(readLockLogStmt));
+ 
+-    // Report if it's held for a long time while another thread also has the
++    // Report if it's held for a long time (and time since last report
++    // exceeds the suppress warning interval) while another thread also has the
+     // read lock. Let one thread hold the lock long enough to activate an
+     // alert, then have another thread grab the read lock to ensure that this
+     // doesn't reset the timing.
++    timer.advance(readLockSuppressWarningInterval);
+     logs.clearOutput();
+     final CountDownLatch barrier = new CountDownLatch(1);
+     final CountDownLatch barrier2 = new CountDownLatch(1);
+@@ -369,7 +412,7 @@ public void testFSReadLockLongHoldingReport() throws Exception {
+       public void run() {
+         try {
+           fsn.readLock();
+-          Thread.sleep(readLockReportingThreshold + 1);
++          timer.advance(readLockReportingThreshold + 1);
+           barrier.countDown(); // Allow for t2 to acquire the read lock
+           barrier2.await(); // Wait until t2 has the read lock
+           fsn.readUnlock();
+@@ -404,5 +447,7 @@ public void run() {
+     Pattern t2Pattern = Pattern.compile(
+         String.format(stackTracePatternString, t2.getClass().getName()));
+     assertFalse(t2Pattern.matcher(logs.getOutput()).find());
++    assertTrue(logs.getOutput().contains("Number of suppressed read-lock " +
++        "reports: 2"));
+   }
+ }
+-- 
+1.7.9.5
+

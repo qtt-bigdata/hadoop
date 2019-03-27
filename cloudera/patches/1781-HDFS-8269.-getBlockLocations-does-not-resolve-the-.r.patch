@@ -1,0 +1,362 @@
+From 968185a15a029554751f5b3aea84afa6941049e9 Mon Sep 17 00:00:00 2001
+From: Haohui Mai <wheat9@apache.org>
+Date: Wed, 29 Apr 2015 11:12:45 -0700
+Subject: [PATCH 1781/2848] HDFS-8269. getBlockLocations() does not resolve
+ the .reserved path and generates incorrect edit
+ logs when updating the atime. Contributed by
+ Haohui Mai.
+
+(cherry picked from commit 460127e6f2dc172240fbcf1271ddc1691f1910f0)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+
+Change-Id: Ia6271cac32b1188992d0973c6e1a7d39ede1be98
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    3 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   65 +++++++---
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |    4 +-
+ .../hadoop/hdfs/server/namenode/TestFsck.java      |    8 +-
+ .../server/namenode/TestGetBlockLocations.java     |  128 ++++++++++++++++++++
+ 5 files changed, 183 insertions(+), 25 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetBlockLocations.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 11d22b2..58d2d1d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -1924,7 +1924,8 @@ void unprotectedMkdir(long inodeId, INodesInPath inodesInPath,
+    * @param src The full path name of the child node.
+    * @throws QuotaExceededException is thrown if it violates quota limit
+    */
+-  private boolean addINode(String src, INode child
++  @VisibleForTesting
++  boolean addINode(String src, INode child
+       ) throws QuotaExceededException, UnresolvedLinkException {
+     byte[][] components = INode.getPathComponents(src);
+     child.setLocalName(components[components.length-1]);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 8c8c84a..043c196 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1847,13 +1847,14 @@ private void setOwnerInt(final String srcArg, String username, String group)
+   }
+ 
+   static class GetBlockLocationsResult {
+-    final INodesInPath iip;
++    final boolean updateAccessTime;
+     final LocatedBlocks blocks;
+     boolean updateAccessTime() {
+-      return iip != null;
++      return updateAccessTime;
+     }
+-    private GetBlockLocationsResult(INodesInPath iip, LocatedBlocks blocks) {
+-      this.iip = iip;
++    private GetBlockLocationsResult(
++        boolean updateAccessTime, LocatedBlocks blocks) {
++      this.updateAccessTime = updateAccessTime;
+       this.blocks = blocks;
+     }
+   }
+@@ -1862,34 +1863,58 @@ private GetBlockLocationsResult(INodesInPath iip, LocatedBlocks blocks) {
+    * Get block locations within the specified range.
+    * @see ClientProtocol#getBlockLocations(String, long, long)
+    */
+-  LocatedBlocks getBlockLocations(String clientMachine, String src,
++  LocatedBlocks getBlockLocations(String clientMachine, String srcArg,
+       long offset, long length) throws IOException {
+     checkOperation(OperationCategory.READ);
+     GetBlockLocationsResult res = null;
++    FSPermissionChecker pc = getPermissionChecker();
+     readLock();
+     try {
+       checkOperation(OperationCategory.READ);
+-      res = getBlockLocations(src, offset, length, true, true);
++      res = getBlockLocations(pc, srcArg, offset, length, true, true);
+     } catch (AccessControlException e) {
+-      logAuditEvent(false, "open", src);
++      logAuditEvent(false, "open", srcArg);
+       throw e;
+     } finally {
+       readUnlock();
+     }
+ 
+-    logAuditEvent(true, "open", src);
++    logAuditEvent(true, "open", srcArg);
+ 
+     if (res.updateAccessTime()) {
++      byte[][] pathComponents = FSDirectory.getPathComponentsForReservedPath(
++          srcArg);
++      String src = srcArg;
+       writeLock();
+       final long now = now();
+       try {
+         checkOperation(OperationCategory.WRITE);
+-        INode inode = res.iip.getLastINode();
+-        boolean updateAccessTime = now > inode.getAccessTime() +
+-            getAccessTimePrecision();
++        /**
++         * Resolve the path again and update the atime only when the file
++         * exists.
++         *
++         * XXX: Races can still occur even after resolving the path again.
++         * For example:
++         *
++         * <ul>
++         *   <li>Get the block location for "/a/b"</li>
++         *   <li>Rename "/a/b" to "/c/b"</li>
++         *   <li>The second resolution still points to "/a/b", which is
++         *   wrong.</li>
++         * </ul>
++         *
++         * The behavior is incorrect but consistent with the one before
++         * HDFS-7463. A better fix is to change the edit log of SetTime to
++         * use inode id instead of a path.
++         */
++        src = resolvePath(srcArg, pathComponents);
++        final INodesInPath iip = dir.getINodesInPath(src, true);
++        INode inode = iip.getLastINode();
++        boolean updateAccessTime = inode != null &&
++            now > inode.getAccessTime() + getAccessTimePrecision();
+         if (!isInSafeMode() && updateAccessTime) {
+           boolean changed = dir.setTimes(
+-              inode, -1, now, false, res.iip.getLatestSnapshotId());
++              inode, -1, now, false, iip.getLatestSnapshotId());
+           if (changed) {
+             getEditLog().logTimes(src, -1, now);
+           }
+@@ -1923,8 +1948,8 @@ LocatedBlocks getBlockLocations(String clientMachine, String src,
+    * @throws IOException
+    */
+   GetBlockLocationsResult getBlockLocations(
+-      String src, long offset, long length, boolean needBlockToken,
+-      boolean checkSafeMode) throws IOException {
++      FSPermissionChecker pc, String src, long offset, long length,
++      boolean needBlockToken, boolean checkSafeMode) throws IOException {
+     if (offset < 0) {
+       throw new HadoopIllegalArgumentException(
+           "Negative offset is not supported. File: " + src);
+@@ -1934,7 +1959,7 @@ GetBlockLocationsResult getBlockLocations(
+           "Negative length is not supported. File: " + src);
+     }
+     final GetBlockLocationsResult ret = getBlockLocationsInt(
+-        src, offset, length, needBlockToken);
++        pc, src, offset, length, needBlockToken);
+ 
+     if (checkSafeMode && isInSafeMode()) {
+       for (LocatedBlock b : ret.blocks.getLocatedBlocks()) {
+@@ -1955,12 +1980,12 @@ GetBlockLocationsResult getBlockLocations(
+   }
+ 
+   private GetBlockLocationsResult getBlockLocationsInt(
+-      final String srcArg, long offset, long length, boolean needBlockToken)
++      FSPermissionChecker pc, final String srcArg, long offset, long length,
++      boolean needBlockToken)
+       throws IOException {
+     String src = srcArg;
+-    FSPermissionChecker pc = getPermissionChecker();
+     byte[][] pathComponents = FSDirectory.getPathComponentsForReservedPath(src);
+-    src = resolvePath(src, pathComponents);
++    src = resolvePath(srcArg, pathComponents);
+     final INodesInPath iip = dir.getINodesInPath(src, true);
+     final INode[] inodes = iip.getINodes();
+     final INodeFile inode = INodeFile.valueOf(inodes[inodes.length - 1], src);
+@@ -1997,7 +2022,7 @@ private GetBlockLocationsResult getBlockLocationsInt(
+     boolean updateAccessTime = isAccessTimeSupported() && !isInSafeMode()
+         && !iip.isSnapshot()
+         && now > inode.getAccessTime() + getAccessTimePrecision();
+-    return new GetBlockLocationsResult(updateAccessTime ? iip : null, blocks);
++    return new GetBlockLocationsResult(updateAccessTime, blocks);
+   }
+ 
+   /**
+@@ -4029,7 +4054,7 @@ private boolean deleteInt(String src, boolean recursive, boolean logRetryCache)
+     return status;
+   }
+     
+-  private FSPermissionChecker getPermissionChecker()
++  FSPermissionChecker getPermissionChecker()
+       throws AccessControlException {
+     try {
+       return new FSPermissionChecker(fsOwnerShortUserName, supergroup, getRemoteUser());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 0bdac52..32b66bf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -454,7 +454,9 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+     FSNamesystem fsn = namenode.getNamesystem();
+     fsn.readLock();
+     try {
+-      blocks = fsn.getBlockLocations(path, 0, fileLen, false, false).blocks;
++      blocks = fsn.getBlockLocations(
++          fsn.getPermissionChecker(), path, 0, fileLen, false, false)
++          .blocks;
+     } catch (FileNotFoundException fnfe) {
+       blocks = null;
+     } finally {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index 6b866ff..e3dee54 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -97,6 +97,7 @@
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
++import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.anyBoolean;
+ import static org.mockito.Matchers.anyLong;
+ import static org.mockito.Matchers.anyString;
+@@ -1022,10 +1023,11 @@ public void testFsckFileNotFound() throws Exception {
+     FSNamesystem fsName = mock(FSNamesystem.class);
+     BlockManager blockManager = mock(BlockManager.class);
+     DatanodeManager dnManager = mock(DatanodeManager.class);
+-    
++
+     when(namenode.getNamesystem()).thenReturn(fsName);
+-    when(fsName.getBlockLocations(
+-        anyString(), anyLong(), anyLong(), anyBoolean(), anyBoolean()))
++    when(fsName.getBlockLocations(any(FSPermissionChecker.class), anyString(),
++                                  anyLong(), anyLong(),
++                                  anyBoolean(), anyBoolean()))
+         .thenThrow(new FileNotFoundException());
+     when(fsName.getBlockManager()).thenReturn(blockManager);
+     when(blockManager.getDatanodeManager()).thenReturn(dnManager);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetBlockLocations.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetBlockLocations.java
+new file mode 100644
+index 0000000..b396ba5
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetBlockLocations.java
+@@ -0,0 +1,128 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import org.apache.commons.io.Charsets;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.fs.permission.PermissionStatus;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
++import org.junit.Test;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++
++import java.io.IOException;
++import java.util.ArrayList;
++
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY;
++import static org.apache.hadoop.util.Time.now;
++import static org.mockito.Mockito.anyLong;
++import static org.mockito.Mockito.anyString;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++public class TestGetBlockLocations {
++  private static final String FILE_NAME = "foo";
++  private static final String FILE_PATH = "/" + FILE_NAME;
++  private static final long MOCK_INODE_ID = 16386;
++  private static final String RESERVED_PATH =
++      "/.reserved/.inodes/" + MOCK_INODE_ID;
++
++  @Test(timeout = 30000)
++  public void testResolveReservedPath() throws IOException {
++    FSNamesystem fsn = setupFileSystem();
++    FSEditLog editlog = fsn.getEditLog();
++    fsn.getBlockLocations("dummy", RESERVED_PATH, 0, 1024);
++    verify(editlog).logTimes(eq(FILE_PATH), anyLong(), anyLong());
++    fsn.close();
++  }
++
++  @Test(timeout = 30000)
++  public void testGetBlockLocationsRacingWithDelete() throws IOException {
++    final FSNamesystem fsn = spy(setupFileSystem());
++    final FSDirectory fsd = fsn.getFSDirectory();
++    FSEditLog editlog = fsn.getEditLog();
++
++    doAnswer(new Answer<Void>() {
++
++      @Override
++      public Void answer(InvocationOnMock invocation) throws Throwable {
++        fsd.delete(FILE_PATH, new INode.BlocksMapUpdateInfo(),
++            new ArrayList<INode>(), now());
++        invocation.callRealMethod();
++        return null;
++      }
++    }).when(fsn).writeLock();
++    fsn.getBlockLocations("dummy", RESERVED_PATH, 0, 1024);
++
++    verify(editlog, never()).logTimes(anyString(), anyLong(), anyLong());
++    fsn.close();
++  }
++
++  @Test(timeout = 30000)
++  public void testGetBlockLocationsRacingWithRename() throws IOException {
++    final FSNamesystem fsn = spy(setupFileSystem());
++    final FSDirectory fsd = fsn.getFSDirectory();
++    FSEditLog editlog = fsn.getEditLog();
++    final String DST_PATH = "/bar";
++    final boolean[] renamed = new boolean[1];
++
++    doAnswer(new Answer<Void>() {
++
++      @Override
++      public Void answer(InvocationOnMock invocation) throws Throwable {
++        invocation.callRealMethod();
++        if (!renamed[0]) {
++          fsd.renameTo(FILE_PATH, DST_PATH, now());
++          renamed[0] = true;
++        }
++        return null;
++      }
++    }).when(fsn).writeLock();
++    fsn.getBlockLocations("dummy", RESERVED_PATH, 0, 1024);
++
++    verify(editlog).logTimes(eq(DST_PATH), anyLong(), anyLong());
++    fsn.close();
++  }
++
++  private static FSNamesystem setupFileSystem() throws IOException {
++    Configuration conf = new Configuration();
++    conf.setLong(DFS_NAMENODE_ACCESSTIME_PRECISION_KEY, 1L);
++    FSEditLog editlog = mock(FSEditLog.class);
++    FSImage image = mock(FSImage.class);
++    when(image.getEditLog()).thenReturn(editlog);
++    final FSNamesystem fsn = new FSNamesystem(conf, image, true);
++
++    PermissionStatus perm = new PermissionStatus(
++        "hdfs", "supergroup",
++        FsPermission.createImmutable((short) 0x1ff));
++    final INodeFile file = new INodeFile(
++        MOCK_INODE_ID, FILE_NAME.getBytes(Charsets.UTF_8),
++        perm, 1, 1, new BlockInfo[] {}, (short) 1,
++        DFS_BLOCK_SIZE_DEFAULT);
++    fsn.getFSDirectory().addINode(FILE_PATH, file);
++    return fsn;
++  }
++
++}
+-- 
+1.7.9.5
+

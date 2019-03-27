@@ -1,0 +1,718 @@
+From 18fac68b0bcdc43d03862049e098a73bfe077a39 Mon Sep 17 00:00:00 2001
+From: Junping Du <junping_du@apache.org>
+Date: Tue, 23 Feb 2016 03:29:46 -0800
+Subject: [PATCH 2101/2848] YARN-3223. Resource update during NM graceful
+ decommission. Contributed by Brook Zhou. (cherry
+ picked from commit
+ 9ed17f181d96b8719a0ef54a129081948781d57e)
+
+(cherry picked from commit e3ce0ffdc31c533e9ae1d74a14bcf57485968104)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmnode/RMNodeImpl.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+
+Conflict Details:
+	RMNodeImpl
+		- Method ordering
+	CapacityScheduler
+		- imports
+		- Missing unrelated code
+	TestCapacityScheduler
+		- imports
+	TestFairScheduler
+		- imports
+		- Resolving an out-of-order backport of YARN-5890 added a constant, GB, that was originally added by this commit
+		- Missing methods
+	TestFifoScheduler
+		- Missing methods
+	TestRMNodeTransitions
+		- Missing constant (OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT) added by YARN-313 so hardcoded
+
+Change-Id: Ieaaeed1cf8e78f1a5f767c86344f58c1d5320453
+---
+ .../server/resourcemanager/rmnode/RMNodeImpl.java  |   30 +++++-
+ .../scheduler/capacity/CapacityScheduler.java      |   17 +++
+ .../scheduler/fair/FairScheduler.java              |   15 +++
+ .../scheduler/fifo/FifoScheduler.java              |   16 +++
+ .../resourcemanager/TestRMNodeTransitions.java     |   34 ++++++
+ .../scheduler/capacity/TestCapacityScheduler.java  |   87 ++++++++++++++++
+ .../scheduler/fair/TestFairScheduler.java          |   90 ++++++++++++++++
+ .../scheduler/fifo/TestFifoScheduler.java          |  108 +++++++++++++++++++-
+ 8 files changed, 392 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmnode/RMNodeImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmnode/RMNodeImpl.java
+index c52875d..077c747 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmnode/RMNodeImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmnode/RMNodeImpl.java
+@@ -72,6 +72,7 @@
+ import org.apache.hadoop.yarn.state.SingleArcTransition;
+ import org.apache.hadoop.yarn.state.StateMachine;
+ import org.apache.hadoop.yarn.state.StateMachineFactory;
++import org.apache.hadoop.yarn.util.resource.Resources;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -103,6 +104,8 @@
+   private int httpPort;
+   private final String nodeAddress; // The containerManager address
+   private String httpAddress;
++  /* Snapshot of total resources before receiving decommissioning command */
++  private volatile Resource originalTotalCapability;
+   private volatile Resource totalCapability;
+   private final Node node;
+ 
+@@ -205,6 +208,9 @@
+       .addTransition(NodeState.DECOMMISSIONING, NodeState.RUNNING,
+           RMNodeEventType.RECOMMISSION,
+           new RecommissionNodeTransition(NodeState.RUNNING))
++      .addTransition(NodeState.DECOMMISSIONING, NodeState.DECOMMISSIONING,
++          RMNodeEventType.RESOURCE_UPDATE,
++          new UpdateNodeResourceWhenRunningTransition())
+       .addTransition(NodeState.DECOMMISSIONING,
+           EnumSet.of(NodeState.DECOMMISSIONING, NodeState.DECOMMISSIONED),
+           RMNodeEventType.STATUS_UPDATE,
+@@ -926,7 +932,12 @@ public void transition(RMNodeImpl rmNode, RMNodeEvent event) {
+       LOG.info("Put Node " + rmNode.nodeId + " in DECOMMISSIONING.");
+       // Update NM metrics during graceful decommissioning.
+       rmNode.updateMetricsForGracefulDecommission(initState, finalState);
+-      // TODO (in YARN-3223) Keep NM's available resource to be 0
++      if (rmNode.originalTotalCapability == null){
++        rmNode.originalTotalCapability =
++            Resources.clone(rmNode.totalCapability);
++        LOG.info("Preserve original total capability: "
++            + rmNode.originalTotalCapability);
++      }
+     }
+   }
+ 
+@@ -940,11 +951,22 @@ public RecommissionNodeTransition(NodeState finalState) {
+ 
+     @Override
+     public void transition(RMNodeImpl rmNode, RMNodeEvent event) {
++      // Restore the original total capability
++      if (rmNode.originalTotalCapability != null) {
++        rmNode.totalCapability = rmNode.originalTotalCapability;
++        rmNode.originalTotalCapability = null;
++      }
+       LOG.info("Node " + rmNode.nodeId + " in DECOMMISSIONING is " +
+           "recommissioned back to RUNNING.");
+       rmNode
+           .updateMetricsForGracefulDecommission(rmNode.getState(), finalState);
+-      // TODO handle NM resource resume in YARN-3223.
++      //update the scheduler with the restored original total capability
++      rmNode.context
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++              new NodeResourceUpdateSchedulerEvent(rmNode, ResourceOption
++                  .newInstance(rmNode.totalCapability, 0)));
+     }
+   }
+ 
+@@ -1183,5 +1205,9 @@ private void handleLogAggregationStatus(
+       }
+     }
+     return lostContainers;
++   }
++
++  public Resource getOriginalTotalCapability() {
++    return this.originalTotalCapability;
+   }
+  }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+index 1afad66..5ee7840 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+@@ -50,6 +50,8 @@
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
++import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+@@ -75,6 +77,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
+@@ -976,6 +979,20 @@ private synchronized void nodeUpdate(RMNode nm) {
+           completedContainer, RMContainerEventType.FINISHED);
+     }
+ 
++    // If the node is decommissioning, send an update to have the total
++    // resource equal to the used resource, so no available resource to
++    // schedule.
++    // TODO: Fix possible race-condition when request comes in before
++    // update is propagated
++    if (nm.getState() == NodeState.DECOMMISSIONING) {
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++              new RMNodeResourceUpdateEvent(nm.getNodeID(), ResourceOption
++                  .newInstance(getSchedulerNode(nm.getNodeID())
++                      .getUsedResource(), 0)));
++    }
+     // Now node data structures are upto date and ready for scheduling.
+     if(LOG.isDebugEnabled()) {
+       LOG.debug("Node being looked for scheduling " + nm
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 745e918..0566e23 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -43,6 +43,7 @@
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+@@ -69,6 +70,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+@@ -1057,6 +1059,19 @@ private synchronized void nodeUpdate(RMNode nm) {
+           completedContainer, RMContainerEventType.FINISHED);
+     }
+ 
++    // If the node is decommissioning, send an update to have the total
++    // resource equal to the used resource, so no available resource to
++    // schedule.
++    if (nm.getState() == NodeState.DECOMMISSIONING) {
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++              new RMNodeResourceUpdateEvent(nm.getNodeID(), ResourceOption
++                  .newInstance(getSchedulerNode(nm.getNodeID())
++                      .getUsedResource(), 0)));
++    }
++
+     if (continuousSchedulingEnabled) {
+       if (!completedContainers.isEmpty()) {
+         attemptScheduling(node);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+index 80cd2e9..f766f25 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+@@ -42,12 +42,14 @@
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.QueueState;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.api.records.ResourceOption;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+@@ -65,6 +67,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+@@ -727,6 +730,19 @@ private synchronized void nodeUpdate(RMNode rmNode) {
+     }
+ 
+ 
++    // If the node is decommissioning, send an update to have the total
++    // resource equal to the used resource, so no available resource to
++    // schedule.
++    if (rmNode.getState() == NodeState.DECOMMISSIONING) {
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++              new RMNodeResourceUpdateEvent(rmNode.getNodeID(), ResourceOption
++                  .newInstance(getSchedulerNode(rmNode.getNodeID())
++                      .getUsedResource(), 0)));
++    }
++
+     if (rmContext.isWorkPreservingRecoveryEnabled()
+         && !rmContext.isSchedulerReadyForAllocatingContainers()) {
+       return;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
+index 61f7c68..07ada4c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
+@@ -990,4 +990,38 @@ public void testDisappearingContainer() {
+     Assert.assertTrue("second container not running",
+         node.getLaunchedContainers().contains(cid2));
+   }
++
++  @Test
++  public void testResourceUpdateOnDecommissioningNode() {
++    RMNodeImpl node = getDecommissioningNode();
++    Resource oldCapacity = node.getTotalCapability();
++    assertEquals("Memory resource is not match.", oldCapacity.getMemory(), 4096);
++    assertEquals("CPU resource is not match.", oldCapacity.getVirtualCores(), 4);
++    node.handle(new RMNodeResourceUpdateEvent(node.getNodeID(),
++        ResourceOption.newInstance(Resource.newInstance(2048, 2),
++            -1)));
++    Resource originalCapacity = node.getOriginalTotalCapability();
++    assertEquals("Memory resource is not match.", originalCapacity.getMemory(), oldCapacity.getMemory());
++    assertEquals("CPU resource is not match.", originalCapacity.getVirtualCores(), oldCapacity.getVirtualCores());
++    Resource newCapacity = node.getTotalCapability();
++    assertEquals("Memory resource is not match.", newCapacity.getMemory(), 2048);
++    assertEquals("CPU resource is not match.", newCapacity.getVirtualCores(), 2);
++
++    Assert.assertEquals(NodeState.DECOMMISSIONING, node.getState());
++    Assert.assertNotNull(nodesListManagerEvent);
++    Assert.assertEquals(NodesListManagerEventType.NODE_USABLE,
++        nodesListManagerEvent.getType());
++  }
++
++  @Test
++  public void testResourceUpdateOnRecommissioningNode() {
++    RMNodeImpl node = getDecommissioningNode();
++    Resource oldCapacity = node.getTotalCapability();
++    assertEquals("Memory resource is not match.", oldCapacity.getMemory(), 4096);
++    assertEquals("CPU resource is not match.", oldCapacity.getVirtualCores(), 4);
++    node.handle(new RMNodeEvent(node.getNodeID(),
++        RMNodeEventType.RECOMMISSION));
++    Resource originalCapacity = node.getOriginalTotalCapability();
++    assertEquals("Original total capability not null after recommission", null, originalCapacity);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+index 76d4ffb..72bf7e2 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+@@ -60,6 +60,7 @@
+ import org.apache.hadoop.yarn.api.records.ContainerState;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.QueueState;
+@@ -71,6 +72,7 @@
+ import org.apache.hadoop.yarn.event.AsyncDispatcher;
+ import org.apache.hadoop.yarn.event.Dispatcher;
+ import org.apache.hadoop.yarn.event.DrainDispatcher;
++import org.apache.hadoop.yarn.event.Event;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+@@ -109,6 +111,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplication;
+@@ -2231,4 +2234,88 @@ public void testNodemanagerReconnect() throws Exception {
+         resourceManager.getResourceScheduler().getClusterResource());
+     privateResourceTrackerService.stop();
+   }
++
++  @Test
++  public void testResourceUpdateDecommissioningNode() throws Exception {
++    // Mock the RMNodeResourceUpdate event handler to update SchedulerNode
++    // to have 0 available resource
++    RMContext spyContext = Mockito.spy(resourceManager.getRMContext());
++    Dispatcher mockDispatcher = mock(AsyncDispatcher.class);
++    when(mockDispatcher.getEventHandler()).thenReturn(new EventHandler() {
++      @Override
++      public void handle(Event event) {
++        if (event instanceof RMNodeResourceUpdateEvent) {
++          RMNodeResourceUpdateEvent resourceEvent =
++              (RMNodeResourceUpdateEvent) event;
++          resourceManager
++              .getResourceScheduler()
++              .getSchedulerNode(resourceEvent.getNodeId())
++              .setTotalResource(resourceEvent.getResourceOption().getResource());
++        }
++      }
++    });
++    Mockito.doReturn(mockDispatcher).when(spyContext).getDispatcher();
++    ((CapacityScheduler) resourceManager.getResourceScheduler())
++        .setRMContext(spyContext);
++    ((AsyncDispatcher) mockDispatcher).start();
++    // Register node
++    String host_0 = "host_0";
++    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm_0 =
++        registerNode(host_0, 1234, 2345, NetworkTopology.DEFAULT_RACK,
++            Resources.createResource(8 * GB, 4));
++    // ResourceRequest priorities
++    Priority priority_0 =
++        org.apache.hadoop.yarn.server.resourcemanager.resource.Priority
++            .create(0);
++
++    // Submit an application
++    Application application_0 =
++        new Application("user_0", "a1", resourceManager);
++    application_0.submit();
++
++    application_0.addNodeManager(host_0, 1234, nm_0);
++
++    Resource capability_0_0 = Resources.createResource(1 * GB, 1);
++    application_0.addResourceRequestSpec(priority_0, capability_0_0);
++
++    Task task_0_0 =
++        new Task(application_0, priority_0, new String[] { host_0 });
++    application_0.addTask(task_0_0);
++
++    // Send resource requests to the scheduler
++    application_0.schedule();
++
++    nodeUpdate(nm_0);
++    // Kick off another heartbeat with the node state mocked to decommissioning
++    // This should update the schedulernodes to have 0 available resource
++    RMNode spyNode =
++        Mockito.spy(resourceManager.getRMContext().getRMNodes()
++            .get(nm_0.getNodeId()));
++    when(spyNode.getState()).thenReturn(NodeState.DECOMMISSIONING);
++    resourceManager.getResourceScheduler().handle(
++        new NodeUpdateSchedulerEvent(spyNode));
++
++    // Get allocations from the scheduler
++    application_0.schedule();
++
++    // Check the used resource is 1 GB 1 core
++    Assert.assertEquals(1 * GB, nm_0.getUsed().getMemory());
++    Resource usedResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getUsedResource();
++    Assert.assertEquals(usedResource.getMemory(), 1 * GB);
++    Assert.assertEquals(usedResource.getVirtualCores(), 1);
++    // Check total resource of scheduler node is also changed to 1 GB 1 core
++    Resource totalResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getTotalResource();
++    Assert.assertEquals(totalResource.getMemory(), 1 * GB);
++    Assert.assertEquals(totalResource.getVirtualCores(), 1);
++    // Check the available resource is 0/0
++    Resource availableResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getAvailableResource();
++    Assert.assertEquals(availableResource.getMemory(), 0);
++    Assert.assertEquals(availableResource.getVirtualCores(), 0);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index c5069da..4499e41 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -54,6 +54,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
++import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.security.GroupMappingServiceProvider;
+ import org.apache.hadoop.yarn.MockApps;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+@@ -64,6 +65,7 @@
+ import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
+@@ -71,12 +73,18 @@
+ import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.AsyncDispatcher;
++import org.apache.hadoop.yarn.event.Dispatcher;
++import org.apache.hadoop.yarn.event.Event;
++import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
++import org.apache.hadoop.yarn.server.resourcemanager.Application;
+ import org.apache.hadoop.yarn.server.resourcemanager.ApplicationMasterService;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
++import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
++import org.apache.hadoop.yarn.server.resourcemanager.Task;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.MockRMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+@@ -88,6 +96,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+@@ -104,6 +113,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.QueuePlacementRule.Default;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.DominantResourceFairnessPolicy;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.policies.FifoPolicy;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo.FifoScheduler;
+ import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+ import org.apache.hadoop.yarn.util.ControlledClock;
+ import org.apache.hadoop.yarn.util.resource.Resources;
+@@ -111,6 +121,7 @@
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ import org.xml.sax.SAXException;
+ 
+ import com.google.common.collect.Sets;
+@@ -6367,4 +6378,83 @@ public void testUpdateDemand() throws IOException {
+         Resources.equals(aQueue.getDemand(), maxResource) &&
+         Resources.equals(bQueue.getDemand(), maxResource));
+   }
++
++  @Test
++  public void testResourceUpdateDecommissioningNode() throws Exception {
++    // Mock the RMNodeResourceUpdate event handler to update SchedulerNode
++    // to have 0 available resource
++    RMContext spyContext = Mockito.spy(resourceManager.getRMContext());
++    Dispatcher mockDispatcher = mock(AsyncDispatcher.class);
++    when(mockDispatcher.getEventHandler()).thenReturn(new EventHandler() {
++      @Override
++      public void handle(Event event) {
++        if (event instanceof RMNodeResourceUpdateEvent) {
++          RMNodeResourceUpdateEvent resourceEvent =
++              (RMNodeResourceUpdateEvent) event;
++          resourceManager
++              .getResourceScheduler()
++              .getSchedulerNode(resourceEvent.getNodeId())
++              .setTotalResource(resourceEvent.getResourceOption().getResource());
++        }
++      }
++    });
++    Mockito.doReturn(mockDispatcher).when(spyContext).getDispatcher();
++    ((FairScheduler) resourceManager.getResourceScheduler())
++        .setRMContext(spyContext);
++    ((AsyncDispatcher) mockDispatcher).start();
++    // Register node
++    String host_0 = "host_0";
++    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm_0 =
++        registerNode(host_0, 1234, 2345, NetworkTopology.DEFAULT_RACK,
++            Resources.createResource(8 * GB, 4));
++
++    RMNode node =
++        resourceManager.getRMContext().getRMNodes().get(nm_0.getNodeId());
++    // Send a heartbeat to kick the tires on the Scheduler
++    NodeUpdateSchedulerEvent nodeUpdate = new NodeUpdateSchedulerEvent(node);
++    resourceManager.getResourceScheduler().handle(nodeUpdate);
++
++    // Kick off another heartbeat with the node state mocked to decommissioning
++    // This should update the schedulernodes to have 0 available resource
++    RMNode spyNode =
++        Mockito.spy(resourceManager.getRMContext().getRMNodes()
++            .get(nm_0.getNodeId()));
++    when(spyNode.getState()).thenReturn(NodeState.DECOMMISSIONING);
++    resourceManager.getResourceScheduler().handle(
++        new NodeUpdateSchedulerEvent(spyNode));
++
++    // Check the used resource is 0 GB 0 core
++    // Assert.assertEquals(1 * GB, nm_0.getUsed().getMemory());
++    Resource usedResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getUsedResource();
++    Assert.assertEquals(usedResource.getMemory(), 0);
++    Assert.assertEquals(usedResource.getVirtualCores(), 0);
++    // Check total resource of scheduler node is also changed to 0 GB 0 core
++    Resource totalResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getTotalResource();
++    Assert.assertEquals(totalResource.getMemory(), 0 * GB);
++    Assert.assertEquals(totalResource.getVirtualCores(), 0);
++    // Check the available resource is 0/0
++    Resource availableResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getAvailableResource();
++    Assert.assertEquals(availableResource.getMemory(), 0);
++    Assert.assertEquals(availableResource.getVirtualCores(), 0);
++  }
++
++  private org.apache.hadoop.yarn.server.resourcemanager.NodeManager registerNode(
++      String hostName, int containerManagerPort, int httpPort, String rackName,
++      Resource capability) throws IOException, YarnException {
++    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm =
++        new org.apache.hadoop.yarn.server.resourcemanager.NodeManager(hostName,
++            containerManagerPort, httpPort, rackName, capability,
++            resourceManager);
++    NodeAddedSchedulerEvent nodeAddEvent1 =
++        new NodeAddedSchedulerEvent(resourceManager.getRMContext().getRMNodes()
++            .get(nm.getNodeId()));
++    resourceManager.getResourceScheduler().handle(nodeAddEvent1);
++    return nm;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+index 273cd66..147f5e3 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+@@ -39,6 +39,7 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
+@@ -46,6 +47,9 @@
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.AsyncDispatcher;
++import org.apache.hadoop.yarn.event.Dispatcher;
++import org.apache.hadoop.yarn.event.Event;
++import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.event.InlineDispatcher;
+ import org.apache.hadoop.yarn.exceptions.YarnException;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+@@ -63,6 +67,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptMetrics;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
+@@ -85,6 +90,7 @@
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ 
+ public class TestFifoScheduler {
+   private static final Log LOG = LogFactory.getLog(TestFifoScheduler.class);
+@@ -113,9 +119,15 @@ public void tearDown() throws Exception {
+       registerNode(String hostName, int containerManagerPort, int nmHttpPort,
+           String rackName, Resource capability) throws IOException,
+           YarnException {
+-    return new org.apache.hadoop.yarn.server.resourcemanager.NodeManager(
+-        hostName, containerManagerPort, nmHttpPort, rackName, capability,
+-        resourceManager);
++    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm =
++        new org.apache.hadoop.yarn.server.resourcemanager.NodeManager(hostName,
++            containerManagerPort, nmHttpPort, rackName, capability,
++            resourceManager);
++    NodeAddedSchedulerEvent nodeAddEvent1 =
++        new NodeAddedSchedulerEvent(resourceManager.getRMContext().getRMNodes()
++            .get(nm.getNodeId()));
++    resourceManager.getResourceScheduler().handle(nodeAddEvent1);
++    return nm;
+   }
+   
+   private ApplicationAttemptId createAppAttemptId(int appId, int attemptId) {
+@@ -634,6 +646,96 @@ public void testAddAndRemoveAppFromFiFoScheduler() throws Exception {
+       fs.getSchedulerApplications(), fs, "queue");
+   }
+ 
++  @Test
++  public void testResourceUpdateDecommissioningNode() throws Exception {
++    // Mock the RMNodeResourceUpdate event handler to update SchedulerNode
++    // to have 0 available resource
++    RMContext spyContext = Mockito.spy(resourceManager.getRMContext());
++    Dispatcher mockDispatcher = mock(AsyncDispatcher.class);
++    when(mockDispatcher.getEventHandler()).thenReturn(new EventHandler() {
++      @Override
++      public void handle(Event event) {
++        if (event instanceof RMNodeResourceUpdateEvent) {
++          RMNodeResourceUpdateEvent resourceEvent =
++              (RMNodeResourceUpdateEvent) event;
++          resourceManager
++              .getResourceScheduler()
++              .getSchedulerNode(resourceEvent.getNodeId())
++              .setTotalResource(resourceEvent.getResourceOption().getResource());
++        }
++      }
++    });
++    Mockito.doReturn(mockDispatcher).when(spyContext).getDispatcher();
++    ((FifoScheduler) resourceManager.getResourceScheduler())
++        .setRMContext(spyContext);
++    ((AsyncDispatcher) mockDispatcher).start();
++    // Register node
++    String host_0 = "host_0";
++    org.apache.hadoop.yarn.server.resourcemanager.NodeManager nm_0 =
++        registerNode(host_0, 1234, 2345, NetworkTopology.DEFAULT_RACK,
++            Resources.createResource(8 * GB, 4));
++    nm_0.heartbeat();
++    // ResourceRequest priorities
++    Priority priority_0 =
++        org.apache.hadoop.yarn.server.resourcemanager.resource.Priority
++            .create(0);
++
++    // Submit an application
++    Application application_0 =
++        new Application("user_0", "a1", resourceManager);
++    application_0.submit();
++
++    application_0.addNodeManager(host_0, 1234, nm_0);
++
++    Resource capability_0_0 = Resources.createResource(1 * GB, 1);
++    application_0.addResourceRequestSpec(priority_0, capability_0_0);
++
++    Task task_0_0 =
++        new Task(application_0, priority_0, new String[] { host_0 });
++    application_0.addTask(task_0_0);
++
++    // Send resource requests to the scheduler
++    application_0.schedule();
++
++    RMNode node =
++        resourceManager.getRMContext().getRMNodes().get(nm_0.getNodeId());
++    // Send a heartbeat to kick the tires on the Scheduler
++    NodeUpdateSchedulerEvent nodeUpdate = new NodeUpdateSchedulerEvent(node);
++    resourceManager.getResourceScheduler().handle(nodeUpdate);
++
++    // Kick off another heartbeat with the node state mocked to decommissioning
++    // This should update the schedulernodes to have 0 available resource
++    RMNode spyNode =
++        Mockito.spy(resourceManager.getRMContext().getRMNodes()
++            .get(nm_0.getNodeId()));
++    when(spyNode.getState()).thenReturn(NodeState.DECOMMISSIONING);
++    resourceManager.getResourceScheduler().handle(
++        new NodeUpdateSchedulerEvent(spyNode));
++
++    // Get allocations from the scheduler
++    application_0.schedule();
++
++    // Check the used resource is 1 GB 1 core
++    // Assert.assertEquals(1 * GB, nm_0.getUsed().getMemory());
++    Resource usedResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getUsedResource();
++    Assert.assertEquals(usedResource.getMemory(), 1 * GB);
++    Assert.assertEquals(usedResource.getVirtualCores(), 1);
++    // Check total resource of scheduler node is also changed to 1 GB 1 core
++    Resource totalResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getTotalResource();
++    Assert.assertEquals(totalResource.getMemory(), 1 * GB);
++    Assert.assertEquals(totalResource.getVirtualCores(), 1);
++    // Check the available resource is 0/0
++    Resource availableResource =
++        resourceManager.getResourceScheduler()
++            .getSchedulerNode(nm_0.getNodeId()).getAvailableResource();
++    Assert.assertEquals(availableResource.getMemory(), 0);
++    Assert.assertEquals(availableResource.getVirtualCores(), 0);
++  }
++
+   private void checkApplicationResourceUsage(int expected, 
+       Application application) {
+     Assert.assertEquals(expected, application.getUsedResources().getMemory());
+-- 
+1.7.9.5
+

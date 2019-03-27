@@ -1,0 +1,199 @@
+From 74db48183a2c1c6b1e9f0c79286d0a137f19a90c Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Thu, 7 Sep 2017 15:54:52 -0700
+Subject: [PATCH 2634/2848] HDFS-12369. Edit log corruption due to hard lease
+ recovery of not-closed file which has snapshots.
+
+(cherry picked from commit 3964b131f3f0131a663377685950d1b7bd3fe63d)
+(cherry picked from commit 8b7d597d3a8d728aa05302ccd769af84a1c9ec0f)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+(cherry picked from commit 69d7b1ae506f4e65334d7af965b96081286bc70e)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+
+Change-Id: I6b995cc33e588b7c44445e0d8ef3e5470aac9392
+---
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    1 +
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   13 +++
+ .../hdfs/server/namenode/TestDeleteRace.java       |   84 ++++++++++++++++++++
+ 3 files changed, 98 insertions(+)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 8df966b..8b0d969 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -7167,6 +7167,7 @@ private long nextBlockId() throws IOException {
+   }
+ 
+   boolean isFileDeleted(INodeFile file) {
++    assert hasReadLock();
+     // Not in the inodeMap or in the snapshot but marked deleted.
+     if (dir.getInode(file.getId()) == null) {
+       return true;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 47e582d..6825b89 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -341,6 +341,13 @@ synchronized Lease addLease(String holder, long inodeId) {
+     return lease;
+   }
+ 
++  synchronized void removeLease(long inodeId) {
++    final Lease lease = leasesById.get(inodeId);
++    if (lease != null) {
++      removeLease(lease, inodeId);
++    }
++  }
++
+   /**
+    * Remove the specified lease and src.
+    */
+@@ -566,6 +573,12 @@ synchronized boolean checkLeases() {
+           if (!p.startsWith("/")) {
+             throw new IOException("Invalid path in the lease " + p);
+           }
++          final INodeFile lastINode = iip.getLastINode().asFile();
++          if (fsnamesystem.isFileDeleted(lastINode)) {
++            // INode referred by the lease could have been deleted.
++            removeLease(lastINode.getId());
++            continue;
++          }
+           boolean completed = fsnamesystem.internalReleaseLease(
+               leaseToCheck, p, iip, newHolder);
+           if (LOG.isDebugEnabled()) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeleteRace.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeleteRace.java
+index 133a18e..a13574f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeleteRace.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDeleteRace.java
+@@ -20,11 +20,13 @@
+ import java.io.FileNotFoundException;
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.EnumSet;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.TreeSet;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -49,16 +51,21 @@
+ import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStorageInfo;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.InternalDataNodeTestUtils;
++import org.apache.hadoop.hdfs.server.namenode.LeaseManager.Lease;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
+ import org.junit.Assert;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ import org.mockito.Mockito;
+ import org.mockito.internal.util.reflection.Whitebox;
+ 
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY;
+ 
+ /**
+  * Test race between delete and other operations.  For now only addBlock()
+@@ -71,6 +78,9 @@
+   private static final Configuration conf = new HdfsConfiguration();
+   private MiniDFSCluster cluster;
+ 
++  @Rule
++  public Timeout timeout = new Timeout(60000 * 3);
++
+   @Test  
+   public void testDeleteAddBlockRace() throws Exception {
+     testDeleteAddBlockRace(false);
+@@ -358,4 +368,78 @@ public void testDeleteAndCommitBlockSynchronizationRaceHasSnapshot()
+       throws Exception {
+     testDeleteAndCommitBlockSynchronizationRace(true);
+   }
++
++
++  /**
++   * Test the sequence of deleting a file that has snapshot,
++   * and lease manager's hard limit recovery.
++   */
++  @Test
++  public void testDeleteAndLeaseRecoveryHardLimitSnapshot() throws Exception {
++    final Path rootPath = new Path("/");
++    final Configuration config = new Configuration();
++    // Disable permissions so that another user can recover the lease.
++    config.setBoolean(DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY, false);
++    config.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, BLOCK_SIZE);
++    FSDataOutputStream stm = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(config).numDataNodes(3).build();
++      cluster.waitActive();
++
++      final DistributedFileSystem fs = cluster.getFileSystem();
++      final Path testPath = new Path("/testfile");
++      stm = fs.create(testPath);
++      LOG.info("test on " + testPath);
++
++      // write a half block
++      AppendTestUtil.write(stm, 0, BLOCK_SIZE / 2);
++      stm.hflush();
++
++      // create a snapshot, so delete does not release the file's inode.
++      SnapshotTestHelper.createSnapshot(fs, rootPath, "snap");
++
++      // delete the file without closing it.
++      fs.delete(testPath, false);
++
++      // write enough bytes to trigger an addBlock, which would fail in
++      // the streamer.
++      AppendTestUtil.write(stm, 0, BLOCK_SIZE);
++
++      // Mock a scenario that the lease reached hard limit.
++      final LeaseManager lm = (LeaseManager) Whitebox
++          .getInternalState(cluster.getNameNode().getNamesystem(),
++              "leaseManager");
++      final TreeSet<Lease> leases =
++          (TreeSet<Lease>) Whitebox.getInternalState(lm, "sortedLeases");
++      final TreeSet<Lease> spyLeases = new TreeSet<>(new Comparator<Lease>() {
++        @Override
++        public int compare(Lease o1, Lease o2) {
++          return Long.signum(o1.getLastUpdate() - o2.getLastUpdate());
++        }
++      });
++      while (!leases.isEmpty()) {
++        final Lease lease = leases.first();
++        final Lease spyLease = Mockito.spy(lease);
++        Mockito.doReturn(true).when(spyLease).expiredHardLimit();
++        spyLeases.add(spyLease);
++        leases.remove(lease);
++      }
++      Whitebox.setInternalState(lm, "sortedLeases", spyLeases);
++
++      // wait for lease manager's background 'Monitor' class to check leases.
++      Thread.sleep(2 * conf.getLong(DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY,
++          DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT));
++
++      LOG.info("Now check we can restart");
++      cluster.restartNameNodes();
++      LOG.info("Restart finished");
++    } finally {
++      if (stm != null) {
++        IOUtils.closeStream(stm);
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

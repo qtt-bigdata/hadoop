@@ -1,0 +1,150 @@
+From 8f65a6ad3736bcf3fc85307d94dbbd8d26a18d4b Mon Sep 17 00:00:00 2001
+From: Tsz-Wo Nicholas Sze <szetszwo@hortonworks.com>
+Date: Mon, 13 Jul 2015 15:12:26 -0700
+Subject: [PATCH 2668/2848] HDFS-8541. Mover should exit with NO_MOVE_PROGRESS
+ if there is no move progress.  Contributed by
+ Surendra Singh Lilhore
+
+(cherry picked from commit d8d6d69b093f96a59cc587751c73d9e892ac51b2)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+
+Change-Id: I4f375f01f3837925e3eb33d26125e48d69c043a5
+---
+ .../hadoop/hdfs/server/balancer/Dispatcher.java    |   18 +++++++++++++
+ .../org/apache/hadoop/hdfs/server/mover/Mover.java |   27 +++++++++++++++-----
+ .../apache/hadoop/hdfs/server/mover/TestMover.java |    2 +-
+ 3 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+index 66eeb9a..ce62126 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+@@ -351,6 +351,7 @@ private void dispatch() {
+         sendRequest(out, eb, accessToken);
+         receiveResponse(in);
+         nnc.getBytesMoved().addAndGet(block.getNumBytes());
++        target.getDDatanode().setHasSuccess();
+         LOG.info("Successfully moved " + this);
+       } catch (IOException e) {
+         LOG.warn("Failed to move " + this, e);
+@@ -551,6 +552,7 @@ public boolean equals(Object obj) {
+     /** blocks being moved but not confirmed yet */
+     private final List<PendingMove> pendings;
+     private volatile boolean hasFailure = false;
++    private volatile boolean hasSuccess = false;
+     private ExecutorService moveExecutor;
+ 
+     @Override
+@@ -634,6 +636,10 @@ synchronized boolean removePendingBlock(PendingMove pendingBlock) {
+     void setHasFailure() {
+       this.hasFailure = true;
+     }
++
++    void setHasSuccess() {
++      this.hasSuccess = true;
++    }
+   }
+ 
+   /** A node that can be the sources of a block move */
+@@ -1078,6 +1084,18 @@ public static boolean waitForMoveCompletion(
+   }
+ 
+   /**
++   * @return true if some moves are success.
++   */
++  public static boolean checkForSuccess(
++      Iterable<? extends StorageGroup> targets) {
++    boolean hasSuccess = false;
++    for (StorageGroup t : targets) {
++      hasSuccess |= t.getDDatanode().hasSuccess;
++    }
++    return hasSuccess;
++  }
++
++  /**
+    * Decide if the block is a good candidate to be moved from source to target.
+    * A block is a good candidate if
+    * 1. the block is not in the process of being moved/has not been moved;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+index 474d2fd..79fad98 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+@@ -267,10 +267,14 @@ private Result processNamespace() throws IOException {
+       // wait for pending move to finish and retry the failed migration
+       boolean hasFailed = Dispatcher.waitForMoveCompletion(storages.targets
+           .values());
+-      if (hasFailed) {
++      boolean hasSuccess = Dispatcher.checkForSuccess(storages.targets
++          .values());
++      if (hasFailed && !hasSuccess) {
+         if (retryCount.get() == retryMaxAttempts) {
+-          throw new IOException("Failed to move some block's after "
++          result.setRetryFailed();
++          LOG.error("Failed to move some block's after "
+               + retryMaxAttempts + " retries.");
++          return result;
+         } else {
+           retryCount.incrementAndGet();
+         }
+@@ -712,10 +716,12 @@ public int run(String[] args) throws Exception {
+ 
+     private boolean hasRemaining;
+     private boolean noBlockMoved;
++    private boolean retryFailed;
+ 
+     Result() {
+       hasRemaining = false;
+       noBlockMoved = true;
++      retryFailed = false;
+     }
+ 
+     boolean isHasRemaining() {
+@@ -734,16 +740,25 @@ void setNoBlockMoved(boolean noBlockMoved) {
+       this.noBlockMoved = noBlockMoved;
+     }
+ 
++    void setRetryFailed() {
++      this.retryFailed = true;
++    }
++
+     /**
+-     * @return SUCCESS if all moves are success and there is no remaining move.
++     * @return NO_MOVE_PROGRESS if no progress in move after some retry. Return
++     *         SUCCESS if all moves are success and there is no remaining move.
+      *         Return NO_MOVE_BLOCK if there moves available but all the moves
+      *         cannot be scheduled. Otherwise, return IN_PROGRESS since there
+      *         must be some remaining moves.
+      */
+     ExitStatus getExitStatus() {
+-      return !isHasRemaining() ? ExitStatus.SUCCESS
+-          : isNoBlockMoved() ? ExitStatus.NO_MOVE_BLOCK
+-              : ExitStatus.IN_PROGRESS;
++      if (retryFailed) {
++        return ExitStatus.NO_MOVE_PROGRESS;
++      } else {
++        return !isHasRemaining() ? ExitStatus.SUCCESS
++            : isNoBlockMoved() ? ExitStatus.NO_MOVE_BLOCK
++                : ExitStatus.IN_PROGRESS;
++      }
+     }
+ 
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
+index 67e2982..3314aed 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestMover.java
+@@ -385,7 +385,7 @@ public void testMoverFailedRetry() throws Exception {
+       int rc = ToolRunner.run(conf, new Mover.Cli(),
+           new String[] {"-p", file.toString()});
+       Assert.assertEquals("Movement should fail after some retry",
+-          ExitStatus.IO_EXCEPTION.getExitCode(), rc);
++          ExitStatus.NO_MOVE_PROGRESS.getExitCode(), rc);
+     } finally {
+       cluster.shutdown();
+     }
+-- 
+1.7.9.5
+

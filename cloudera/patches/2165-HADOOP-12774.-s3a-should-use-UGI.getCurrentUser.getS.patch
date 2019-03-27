@@ -1,0 +1,273 @@
+From c41a02151a935ccf7210dada00d10d45c020fcec Mon Sep 17 00:00:00 2001
+From: Chris Nauroth <cnauroth@apache.org>
+Date: Mon, 24 Oct 2016 21:54:06 -0700
+Subject: [PATCH 2165/2848] HADOOP-12774. s3a should use
+ UGI.getCurrentUser.getShortname() for username.
+ Contributed by Steve Loughran.
+
+(cherry picked from commit 3372e940303149d6258e0b72c54d72f080f0daa2)
+
+Change-Id: I5c1c9c3abae03e78aad5f001c0eba52d50ed4de8
+---
+ .../java/org/apache/hadoop/fs/s3a/Listing.java     |    5 +--
+ .../org/apache/hadoop/fs/s3a/S3AFileStatus.java    |   33 ++++++++++++++------
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   29 ++++++++++++-----
+ .../java/org/apache/hadoop/fs/s3a/S3AUtils.java    |    8 +++--
+ .../hadoop/fs/s3a/ITestS3AConfiguration.java       |   23 +++++++++++++-
+ 5 files changed, 74 insertions(+), 24 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
+index 4120b20..30d8e6f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
+@@ -298,7 +298,7 @@ private boolean buildNextStatusBatch(ObjectListing objects) {
+         // Skip over keys that are ourselves and old S3N _$folder$ files
+         if (acceptor.accept(keyPath, summary) && filter.accept(keyPath)) {
+           FileStatus status = createFileStatus(keyPath, summary,
+-              owner.getDefaultBlockSize(keyPath));
++              owner.getDefaultBlockSize(keyPath), owner.getUsername());
+           LOG.debug("Adding: {}", status);
+           stats.add(status);
+           added++;
+@@ -312,7 +312,8 @@ private boolean buildNextStatusBatch(ObjectListing objects) {
+       for (String prefix : objects.getCommonPrefixes()) {
+         Path keyPath = owner.keyToQualifiedPath(prefix);
+         if (acceptor.accept(keyPath, prefix) && filter.accept(keyPath)) {
+-          FileStatus status = new S3AFileStatus(true, false, keyPath);
++          FileStatus status = new S3AFileStatus(false, keyPath,
++              owner.getUsername());
+           LOG.debug("Adding directory: {}", status);
+           added++;
+           stats.add(status);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileStatus.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileStatus.java
+index 75a6500..b0f08e3 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileStatus.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileStatus.java
+@@ -33,28 +33,41 @@
+ public class S3AFileStatus extends FileStatus {
+   private boolean isEmptyDirectory;
+ 
+-  // Directories
+-  public S3AFileStatus(boolean isdir, boolean isemptydir, Path path) {
+-    super(0, isdir, 1, 0, 0, path);
++  /**
++   * Create a directory status.
++   * @param isemptydir is this an empty directory?
++   * @param path the path
++   * @param owner the owner
++   */
++  public S3AFileStatus(boolean isemptydir,
++      Path path,
++      String owner) {
++    super(0, true, 1, 0, 0, path);
+     isEmptyDirectory = isemptydir;
++    setOwner(owner);
++    setGroup(owner);
+   }
+ 
+-  // Files
++  /**
++   * A simple file.
++   * @param length file length
++   * @param modification_time mod time
++   * @param path path
++   * @param blockSize block size
++   * @param owner owner
++   */
+   public S3AFileStatus(long length, long modification_time, Path path,
+-      long blockSize) {
++      long blockSize, String owner) {
+     super(length, false, 1, blockSize, modification_time, path);
+     isEmptyDirectory = false;
++    setOwner(owner);
++    setGroup(owner);
+   }
+ 
+   public boolean isEmptyDirectory() {
+     return isEmptyDirectory;
+   }
+ 
+-  @Override
+-  public String getOwner() {
+-    return System.getProperty("user.name");
+-  }
+-
+   /** Compare if this object is equal to another object.
+    * @param   o the object to be compared.
+    * @return  true if two file status has the same path name; false if not.
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 2177a5a..0533045 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -87,6 +87,7 @@
+ import org.apache.hadoop.fs.StorageStatistics;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.s3native.S3xLoginHelper;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+@@ -120,6 +121,7 @@
+   public static final int DEFAULT_BLOCKSIZE = 32 * 1024 * 1024;
+   private URI uri;
+   private Path workingDir;
++  private String username;
+   private AmazonS3 s3;
+   private String bucket;
+   private int maxKeys;
+@@ -166,7 +168,9 @@ public void initialize(URI name, Configuration conf) throws IOException {
+       instrumentation = new S3AInstrumentation(name);
+ 
+       uri = S3xLoginHelper.buildFSURI(name);
+-      workingDir = new Path("/user", System.getProperty("user.name"))
++      // Username is the current user at the time the FS was instantiated.
++      username = UserGroupInformation.getCurrentUser().getShortUserName();
++      workingDir = new Path("/user", username)
+           .makeQualified(this.uri, this.getWorkingDirectory());
+ 
+       bucket = name.getHost();
+@@ -1401,6 +1405,14 @@ public Path getWorkingDirectory() {
+   }
+ 
+   /**
++   * Get the username of the FS.
++   * @return the short name of the user who instantiated the FS
++   */
++  public String getUsername() {
++    return username;
++  }
++
++  /**
+    *
+    * Make the given path and all non-existent parents into
+    * directories. Has the semantics of Unix {@code 'mkdir -p'}.
+@@ -1491,14 +1503,14 @@ public S3AFileStatus getFileStatus(final Path f) throws IOException {
+ 
+         if (objectRepresentsDirectory(key, meta.getContentLength())) {
+           LOG.debug("Found exact file: fake directory");
+-          return new S3AFileStatus(true, true,
+-              path);
++          return new S3AFileStatus(true, path, username);
+         } else {
+           LOG.debug("Found exact file: normal file");
+           return new S3AFileStatus(meta.getContentLength(),
+               dateToLong(meta.getLastModified()),
+               path,
+-              getDefaultBlockSize(path));
++              getDefaultBlockSize(path),
++              username);
+         }
+       } catch (AmazonServiceException e) {
+         if (e.getStatusCode() != 404) {
+@@ -1516,7 +1528,7 @@ public S3AFileStatus getFileStatus(final Path f) throws IOException {
+ 
+           if (objectRepresentsDirectory(newKey, meta.getContentLength())) {
+             LOG.debug("Found file (with /): fake directory");
+-            return new S3AFileStatus(true, true, path);
++            return new S3AFileStatus(true, path, username);
+           } else {
+             LOG.warn("Found file (with /): real file? should not happen: {}",
+                 key);
+@@ -1524,7 +1536,8 @@ public S3AFileStatus getFileStatus(final Path f) throws IOException {
+             return new S3AFileStatus(meta.getContentLength(),
+                 dateToLong(meta.getLastModified()),
+                 path,
+-                getDefaultBlockSize(path));
++                getDefaultBlockSize(path),
++                username);
+           }
+         } catch (AmazonServiceException e) {
+           if (e.getStatusCode() != 404) {
+@@ -1561,10 +1574,10 @@ public S3AFileStatus getFileStatus(final Path f) throws IOException {
+           }
+         }
+ 
+-        return new S3AFileStatus(true, false, path);
++        return new S3AFileStatus(false, path, username);
+       } else if (key.isEmpty()) {
+         LOG.debug("Found root directory");
+-        return new S3AFileStatus(true, true, path);
++        return new S3AFileStatus(true, path, username);
+       }
+     } catch (AmazonServiceException e) {
+       if (e.getStatusCode() != 404) {
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+index d812673..76f63da 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+@@ -241,17 +241,19 @@ public static String stringify(AmazonS3Exception e) {
+    * @param keyPath path to entry
+    * @param summary summary from AWS
+    * @param blockSize block size to declare.
++   * @param owner owner of the file
+    * @return a status entry
+    */
+   public static S3AFileStatus createFileStatus(Path keyPath,
+       S3ObjectSummary summary,
+-      long blockSize) {
++      long blockSize,
++      String owner) {
+     if (objectRepresentsDirectory(summary.getKey(), summary.getSize())) {
+-      return new S3AFileStatus(true, true, keyPath);
++      return new S3AFileStatus(true, keyPath, owner);
+     } else {
+       return new S3AFileStatus(summary.getSize(),
+           dateToLong(summary.getLastModified()), keyPath,
+-          blockSize);
++          blockSize, owner);
+     }
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AConfiguration.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AConfiguration.java
+index e8d0c82..5771eb4 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AConfiguration.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AConfiguration.java
+@@ -47,8 +47,10 @@
+ import java.io.File;
+ import java.lang.reflect.Field;
+ import java.net.URI;
++import java.security.PrivilegedExceptionAction;
+ 
+ import org.apache.hadoop.security.ProviderUtils;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.alias.CredentialProvider;
+ import org.apache.hadoop.security.alias.CredentialProviderFactory;
+ import org.apache.hadoop.util.VersionInfo;
+@@ -448,7 +450,7 @@ public void testDirectoryAllocatorRR() throws Throwable {
+     dir1.mkdirs();
+     dir2.mkdirs();
+     conf = new Configuration();
+-    conf.set(Constants.BUFFER_DIR, dir1 +", " + dir2);
++    conf.set(Constants.BUFFER_DIR, dir1 + ", " + dir2);
+     fs = S3ATestUtils.createTestFileSystem(conf);
+     File tmp1 = fs.createTmpFileForWrite("out-", 1024, conf);
+     tmp1.delete();
+@@ -458,6 +460,25 @@ public void testDirectoryAllocatorRR() throws Throwable {
+         tmp1.getParent(), tmp2.getParent());
+   }
+ 
++  @Test
++  public void testUsernameFromUGI() throws Throwable {
++    final String alice = "alice";
++    UserGroupInformation fakeUser =
++        UserGroupInformation.createUserForTesting(alice,
++            new String[]{"users", "administrators"});
++    conf = new Configuration();
++    fs = fakeUser.doAs(new PrivilegedExceptionAction<S3AFileSystem>() {
++      @Override
++      public S3AFileSystem run() throws Exception{
++        return S3ATestUtils.createTestFileSystem(conf);
++      }
++    });
++    assertEquals("username", alice, fs.getUsername());
++    S3AFileStatus status = fs.getFileStatus(new Path("/"));
++    assertEquals("owner in " + status, alice, status.getOwner());
++    assertEquals("group in " + status, alice, status.getGroup());
++  }
++
+   /**
+    * Reads and returns a field from an object using reflection.  If the field
+    * cannot be found, is null, or is not the expected type, then this method
+-- 
+1.7.9.5
+

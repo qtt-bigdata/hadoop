@@ -1,0 +1,128 @@
+From 1711a078f67997a673bd06ae8fc022f9615042de Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Tue, 6 Sep 2016 10:15:57 -0500
+Subject: [PATCH 2832/2848] CDH-71668. HADOOP-13549. Eliminate intermediate
+ buffer for server-side PB encoding. Contributed
+ by Daryn Sharp.
+
+(cherry picked from commit 39d1b1d747b1e325792b897b3264272f32b756a9)
+(cherry picked from commit 614f9a62c4bcd118f899e47ddbc42f81bd19b647)
+
+==C5_FEATURE_IMPALA_METADATA==
+
+Change-Id: I81ea58eebaf1c01f7d139b06251fb8063a74b423
+---
+ .../java/org/apache/hadoop/ipc/RpcWritable.java    |    6 ++-
+ .../main/java/org/apache/hadoop/ipc/Server.java    |   52 ++++++++++++++++++--
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RpcWritable.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RpcWritable.java
+index 5125939..9c035d8 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RpcWritable.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RpcWritable.java
+@@ -126,6 +126,10 @@ void writeTo(ResponseBuffer out) throws IOException {
+       }
+       return (T)message;
+     }
++
++    Message getMessage() {
++      return message;
++    }
+   }
+ 
+   // adapter to allow decoding of writables and protobufs from a byte buffer.
+@@ -181,4 +185,4 @@ int remaining() {
+       return bb.remaining();
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+index 3235357..0bd3e7a 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Server.java
+@@ -118,6 +118,7 @@
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.ByteString;
++import com.google.protobuf.CodedOutputStream;
+ import com.google.protobuf.Message;
+ import com.google.protobuf.Message.Builder;
+ import org.codehaus.jackson.map.ObjectMapper;
+@@ -2559,24 +2560,69 @@ private void setupResponse(
+ 
+   private void setupResponse(Call call,
+       RpcResponseHeaderProto header, Writable rv) throws IOException {
++    final byte[] response;
++    if (rv == null || (rv instanceof RpcWritable.ProtobufWrapper)) {
++      response = setupResponseForProtobuf(header, rv);
++    } else {
++      response = setupResponseForWritable(header, rv);
++    }
++    if (response.length > maxRespSize) {
++      LOG.warn("Large response size " + response.length + " for call "
++          + call.toString());
++    }
++    call.setResponse(ByteBuffer.wrap(response));
++  }
++
++  private byte[] setupResponseForWritable(
++      RpcResponseHeaderProto header, Writable rv) throws IOException {
+     ResponseBuffer buf = responseBuffer.get().reset();
+     try {
+       RpcWritable.wrap(header).writeTo(buf);
+       if (rv != null) {
+         RpcWritable.wrap(rv).writeTo(buf);
+       }
+-      call.setResponse(ByteBuffer.wrap(buf.toByteArray()));
++      return buf.toByteArray();
+     } finally {
+       // Discard a large buf and reset it back to smaller size
+       // to free up heap.
+       if (buf.capacity() > maxRespSize) {
+-        LOG.warn("Large response size " + buf.size() + " for call "
+-            + call.toString());
+         buf.setCapacity(INITIAL_RESP_BUF_SIZE);
+       }
+     }
+   }
+ 
++
++  // writing to a pre-allocated array is the most efficient way to construct
++  // a protobuf response.
++  private byte[] setupResponseForProtobuf(
++      RpcResponseHeaderProto header, Writable rv) throws IOException {
++    Message payload = (rv != null)
++        ? ((RpcWritable.ProtobufWrapper)rv).getMessage() : null;
++    int length = getDelimitedLength(header);
++    if (payload != null) {
++      length += getDelimitedLength(payload);
++    }
++    byte[] buf = new byte[length + 4];
++    CodedOutputStream cos = CodedOutputStream.newInstance(buf);
++    // the stream only supports little endian ints
++    cos.writeRawByte((byte)((length >>> 24) & 0xFF));
++    cos.writeRawByte((byte)((length >>> 16) & 0xFF));
++    cos.writeRawByte((byte)((length >>>  8) & 0xFF));
++    cos.writeRawByte((byte)((length >>>  0) & 0xFF));
++    cos.writeRawVarint32(header.getSerializedSize());
++    header.writeTo(cos);
++    if (payload != null) {
++      cos.writeRawVarint32(payload.getSerializedSize());
++      payload.writeTo(cos);
++    }
++    return buf;
++  }
++
++  private static int getDelimitedLength(Message message) {
++    int length = message.getSerializedSize();
++    return length + CodedOutputStream.computeRawVarint32Size(length);
++  }
++
+   /**
+    * Setup response for the IPC Call on Fatal Error from a 
+    * client that is using old version of Hadoop.
+-- 
+1.7.9.5
+

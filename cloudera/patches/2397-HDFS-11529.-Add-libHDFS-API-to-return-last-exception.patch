@@ -1,0 +1,766 @@
+From 61d0116d96a8f5589294ea9abd1b95ddca42fa06 Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Wed, 3 May 2017 00:53:36 -0700
+Subject: [PATCH 2397/2848] HDFS-11529. Add libHDFS API to return last
+ exception. Contributed by Sailesh Mukil.
+
+(cherry picked from commit fda86ef2a32026c02d9b5d4cca1ecb7b4decd872)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs-tests/test_libhdfs_threaded.c
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/exception.c
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/hdfs.c
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/include/hdfs/hdfs.h
+	hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/os/windows/thread_local_storage.c
+
+Change-Id: I2da6c7ed7251a52d0944788d9a8e259096e05660
+---
+ .../src/main/native/libhdfs/exception.c            |   75 +++++++++++-----
+ .../src/main/native/libhdfs/exception.h            |   16 +++-
+ .../hadoop-hdfs/src/main/native/libhdfs/expect.h   |   18 ++++
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.c     |    9 ++
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.h     |   30 +++++++
+ .../src/main/native/libhdfs/jni_helper.c           |   95 +++++++++++++++++---
+ .../src/main/native/libhdfs/jni_helper.h           |   35 ++++++++
+ .../native/libhdfs/os/posix/thread_local_storage.c |   54 ++++++++---
+ .../main/native/libhdfs/os/thread_local_storage.h  |   61 +++++++++----
+ .../libhdfs/os/windows/thread_local_storage.c      |   43 +++++++--
+ .../main/native/libhdfs/test_libhdfs_threaded.c    |    6 ++
+ 11 files changed, 364 insertions(+), 78 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
+index eb7115c..a0a60a6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
+@@ -110,15 +110,50 @@ void getExceptionInfo(const char *excName, int noPrintFlags,
+     }
+ }
+ 
++/**
++ * getExceptionUtilString: A helper function that calls 'methodName' in
++ * ExceptionUtils. The function 'methodName' should have a return type of a
++ * java String.
++ *
++ * @param env        The JNI environment.
++ * @param exc        The exception to get information for.
++ * @param methodName The method of ExceptionUtils to call that has a String
++ *                    return type.
++ *
++ * @return           A C-type string containing the string returned by
++ *                   ExceptionUtils.'methodName', or NULL on failure.
++ */
++static char* getExceptionUtilString(JNIEnv *env, jthrowable exc, char *methodName)
++{
++    jthrowable jthr;
++    jvalue jVal;
++    jstring jStr = NULL;
++    char *excString = NULL;
++    jthr = invokeMethod(env, &jVal, STATIC, NULL,
++        "org/apache/commons/lang/exception/ExceptionUtils",
++        methodName, "(Ljava/lang/Throwable;)Ljava/lang/String;", exc);
++    if (jthr) {
++        destroyLocalReference(env, jthr);
++        return NULL;
++    }
++    jStr = jVal.l;
++    jthr = newCStr(env, jStr, &excString);
++    if (jthr) {
++        destroyLocalReference(env, jthr);
++        return NULL;
++    }
++    destroyLocalReference(env, jStr);
++    return excString;
++}
++
+ int printExceptionAndFreeV(JNIEnv *env, jthrowable exc, int noPrintFlags,
+         const char *fmt, va_list ap)
+ {
+     int i, noPrint, excErrno;
+     char *className = NULL;
+-    jstring jStr = NULL;
+-    jvalue jVal;
+     jthrowable jthr;
+     const char *stackTrace;
++    const char *rootCause;
+ 
+     jthr = classNameOfObject(exc, env, &className);
+     if (jthr) {
+@@ -139,32 +174,30 @@ int printExceptionAndFreeV(JNIEnv *env, jthrowable exc, int noPrintFlags,
+         noPrint = 0;
+         excErrno = EINTERNAL;
+     }
++
++    // We don't want to use ExceptionDescribe here, because that requires a
++    // pending exception. Instead, use ExceptionUtils.
++    rootCause = getExceptionUtilString(env, exc, "getRootCauseMessage");
++    stackTrace = getExceptionUtilString(env, exc, "getStackTrace");
++    // Save the exception details in the thread-local state.
++    setTLSExceptionStrings(rootCause, stackTrace);
++
+     if (!noPrint) {
+         vfprintf(stderr, fmt, ap);
+         fprintf(stderr, " error:\n");
+ 
+-        // We don't want to  use ExceptionDescribe here, because that requires a
+-        // pending exception.  Instead, use ExceptionUtils.
+-        jthr = invokeMethod(env, &jVal, STATIC, NULL, 
+-            "org/apache/commons/lang/exception/ExceptionUtils",
+-            "getStackTrace", "(Ljava/lang/Throwable;)Ljava/lang/String;", exc);
+-        if (jthr) {
+-            fprintf(stderr, "(unable to get stack trace for %s exception: "
+-                    "ExceptionUtils::getStackTrace error.)\n", className);
+-            destroyLocalReference(env, jthr);
++        if (!rootCause) {
++            fprintf(stderr, "(unable to get root cause for %s)\n", className);
++        } else {
++            fprintf(stderr, "%s", rootCause);
++        }
++        if (!stackTrace) {
++            fprintf(stderr, "(unable to get stack trace for %s)\n", className);
+         } else {
+-            jStr = jVal.l;
+-            stackTrace = (*env)->GetStringUTFChars(env, jStr, NULL);
+-            if (!stackTrace) {
+-                fprintf(stderr, "(unable to get stack trace for %s exception: "
+-                        "GetStringUTFChars error.)\n", className);
+-            } else {
+-                fprintf(stderr, "%s", stackTrace);
+-                (*env)->ReleaseStringUTFChars(env, jStr, stackTrace);
+-            }
++            fprintf(stderr, "%s", stackTrace);
+         }
+     }
+-    destroyLocalReference(env, jStr);
++
+     destroyLocalReference(env, exc);
+     free(className);
+     return excErrno;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
+index 5fa7fa6..cdf93a1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
+@@ -29,9 +29,14 @@
+  *
+  * If you encounter an exception, return a local reference to it.  The caller is
+  * responsible for freeing the local reference, by calling a function like
+- * PrintExceptionAndFree.  (You can also free exceptions directly by calling
++ * printExceptionAndFree. (You can also free exceptions directly by calling
+  * DeleteLocalRef.  However, that would not produce an error message, so it's
+  * usually not what you want.)
++ *
++ * The root cause and stack trace exception strings retrieved from the last
++ * exception that happened on a thread are stored in the corresponding
++ * thread local state and are accessed by hdfsGetLastExceptionRootCause and
++ * hdfsGetLastExceptionStackTrace respectively.
+  */
+ 
+ #include "platform.h"
+@@ -81,7 +86,8 @@ void getExceptionInfo(const char *excName, int noPrintFlags,
+                       int *excErrno, int *shouldPrint);
+ 
+ /**
+- * Print out information about an exception and free it.
++ * Store the information about an exception in the thread-local state and print
++ * it and free the jthrowable object.
+  *
+  * @param env             The JNI environment
+  * @param exc             The exception to print and free
+@@ -97,7 +103,8 @@ int printExceptionAndFreeV(JNIEnv *env, jthrowable exc, int noPrintFlags,
+         const char *fmt, va_list ap);
+ 
+ /**
+- * Print out information about an exception and free it.
++ * Store the information about an exception in the thread-local state and print
++ * it and free the jthrowable object.
+  *
+  * @param env             The JNI environment
+  * @param exc             The exception to print and free
+@@ -113,7 +120,8 @@ int printExceptionAndFree(JNIEnv *env, jthrowable exc, int noPrintFlags,
+         const char *fmt, ...) TYPE_CHECKED_PRINTF_FORMAT(4, 5);
+ 
+ /**
+- * Print out information about the pending exception and free it.
++ * Store the information about the pending exception in the thread-local state
++ * and print it and free the jthrowable object.
+  *
+  * @param env             The JNI environment
+  * @param noPrintFlags    Flags which determine which exceptions we should NOT
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/expect.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/expect.h
+index 49aa285..528c96f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/expect.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/expect.h
+@@ -163,6 +163,24 @@ struct hdfsFile_internal;
+     ret = -errno; \
+     } while (ret == -EINTR);
+ 
++#define EXPECT_STR_CONTAINS(str, substr) \
++    do { \
++        char *_my_ret_ = (str); \
++        int _my_errno_ = errno; \
++        if ((str) == NULL) { \
++            fprintf(stderr, "TEST_ERROR: failed on %s:%d with NULL return " \
++              "return value (errno: %d): expected substring: %s\n", \
++              __FILE__, __LINE__, _my_errno_, (substr)); \
++            return -1; \
++        } \
++        if (strstr((str), (substr)) == NULL) { \
++            fprintf(stderr, "TEST_ERROR: failed on %s:%d with return " \
++              "value %s (errno: %d): expected substring: %s\n", \
++              __FILE__, __LINE__, _my_ret_, _my_errno_, (substr)); \
++            return -1; \
++        } \
++    } while (0);
++
+ /**
+  * Test that an HDFS file has the given statistics.
+  *
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+index bb6f766..586375c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+@@ -2919,6 +2919,7 @@ done:
+     destroyLocalReference(env, jFileBlockHosts);
+     destroyLocalReference(env, jHost);
+     if (ret) {
++        errno = ret;
+         if (blockHosts) {
+             hdfsFreeHosts(blockHosts);
+         }
+@@ -3475,7 +3476,15 @@ int hdfsFileIsEncrypted(hdfsFileInfo *fileInfo)
+     return !!(extInfo->flags & HDFS_EXTENDED_FILE_INFO_ENCRYPTED);
+ }
+ 
++char* hdfsGetLastExceptionRootCause()
++{
++  return getLastTLSExceptionRootCause();
++}
+ 
++char* hdfsGetLastExceptionStackTrace()
++{
++  return getLastTLSExceptionStackTrace();
++}
+ 
+ /**
+  * vim: ts=4: sw=4: et:
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+index 6c19f44..dd9a6ac 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+@@ -929,6 +929,36 @@ extern  "C" {
+      */
+     void hadoopRzBufferFree(hdfsFile file, struct hadoopRzBuffer *buffer);
+ 
++    /**
++     * Get the last exception root cause that happened in the context of the
++     * current thread, i.e. the thread that called into libHDFS.
++     *
++     * The pointer returned by this function is guaranteed to be valid until
++     * the next call into libHDFS by the current thread.
++     * Users of this function should not free the pointer.
++     *
++     * A NULL will be returned if no exception information could be retrieved
++     * for the previous call.
++     *
++     * @return           The root cause as a C-string.
++     */
++    char* hdfsGetLastExceptionRootCause();
++
++    /**
++     * Get the last exception stack trace that happened in the context of the
++     * current thread, i.e. the thread that called into libHDFS.
++     *
++     * The pointer returned by this function is guaranteed to be valid until
++     * the next call into libHDFS by the current thread.
++     * Users of this function should not free the pointer.
++     *
++     * A NULL will be returned if no exception information could be retrieved
++     * for the previous call.
++     *
++     * @return           The stack trace as a C-string.
++     */
++    char* hdfsGetLastExceptionStackTrace();
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.c
+index 50d9681..e7c08aa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.c
+@@ -498,29 +498,98 @@ static JNIEnv* getGlobalJNIEnv(void)
+  */
+ JNIEnv* getJNIEnv(void)
+ {
+-    JNIEnv *env;
+-    THREAD_LOCAL_STORAGE_GET_QUICK();
++    struct ThreadLocalState *state = NULL;
++    THREAD_LOCAL_STORAGE_GET_QUICK(&state);
++    if (state) return state->env;
++
+     mutexLock(&jvmMutex);
+-    if (threadLocalStorageGet(&env)) {
++    if (threadLocalStorageGet(&state)) {
+       mutexUnlock(&jvmMutex);
+       return NULL;
+     }
+-    if (env) {
++    if (state) {
+       mutexUnlock(&jvmMutex);
+-      return env;
++
++      // Free any stale exception strings.
++      free(state->lastExceptionRootCause);
++      free(state->lastExceptionStackTrace);
++      state->lastExceptionRootCause = NULL;
++      state->lastExceptionStackTrace = NULL;
++
++      return state->env;
+     }
+ 
+-    env = getGlobalJNIEnv();
+-    mutexUnlock(&jvmMutex);
+-    if (!env) {
+-      fprintf(stderr, "getJNIEnv: getGlobalJNIEnv failed\n");
++    /* Create a ThreadLocalState for this thread */
++    state = threadLocalStorageCreate();
++    if (!state) {
++      fprintf(stderr, "getJNIEnv: Unable to create ThreadLocalState\n");
+       return NULL;
+     }
+-    if (threadLocalStorageSet(env)) {
+-      return NULL;
++    state->env = getGlobalJNIEnv();
++    mutexUnlock(&jvmMutex);
++    if (!state->env) {
++      goto fail;
+     }
+-    THREAD_LOCAL_STORAGE_SET_QUICK(env);
+-    return env;
++    if (threadLocalStorageSet(state)) {
++      goto fail;
++    }
++    THREAD_LOCAL_STORAGE_SET_QUICK(state);
++
++    return state->env;
++
++fail:
++    fprintf(stderr, "getJNIEnv: getGlobalJNIEnv failed\n");
++    hdfsThreadDestructor(state);
++    return NULL;
++}
++
++char* getLastTLSExceptionRootCause()
++{
++    struct ThreadLocalState *state = NULL;
++    THREAD_LOCAL_STORAGE_GET_QUICK(&state);
++    if (!state) {
++        mutexLock(&jvmMutex);
++        if (threadLocalStorageGet(&state)) {
++            mutexUnlock(&jvmMutex);
++            return NULL;
++        }
++        mutexUnlock(&jvmMutex);
++    }
++    return state->lastExceptionRootCause;
++}
++
++char* getLastTLSExceptionStackTrace()
++{
++    struct ThreadLocalState *state = NULL;
++    THREAD_LOCAL_STORAGE_GET_QUICK(&state);
++    if (!state) {
++        mutexLock(&jvmMutex);
++        if (threadLocalStorageGet(&state)) {
++            mutexUnlock(&jvmMutex);
++            return NULL;
++        }
++        mutexUnlock(&jvmMutex);
++    }
++    return state->lastExceptionStackTrace;
++}
++
++void setTLSExceptionStrings(const char *rootCause, const char *stackTrace)
++{
++    struct ThreadLocalState *state = NULL;
++    THREAD_LOCAL_STORAGE_GET_QUICK(&state);
++    if (!state) {
++        mutexLock(&jvmMutex);
++        if (threadLocalStorageGet(&state)) {
++            mutexUnlock(&jvmMutex);
++            return;
++        }
++        mutexUnlock(&jvmMutex);
++    }
++
++    free(state->lastExceptionRootCause);
++    free(state->lastExceptionStackTrace);
++    state->lastExceptionRootCause = (char*)rootCause;
++    state->lastExceptionStackTrace = (char*)stackTrace;
+ }
+ 
+ int javaObjectIsOfClass(JNIEnv *env, jobject obj, const char *name)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.h
+index 90accc7..e63ce53 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/jni_helper.h
+@@ -105,6 +105,8 @@ jthrowable globalClassReference(const char *className, JNIEnv *env, jclass *out)
+ jthrowable classNameOfObject(jobject jobj, JNIEnv *env, char **name);
+ 
+ /** getJNIEnv: A helper function to get the JNIEnv* for the given thread.
++ * It gets this from the ThreadLocalState if it exists. If a ThreadLocalState
++ * does not exist, one will be created.
+  * If no JVM exists, then one will be created. JVM command line arguments
+  * are obtained from the LIBHDFS_OPTS environment variable.
+  * @param: None.
+@@ -113,6 +115,39 @@ jthrowable classNameOfObject(jobject jobj, JNIEnv *env, char **name);
+ JNIEnv* getJNIEnv(void);
+ 
+ /**
++ * Get the last exception root cause that happened in the context of the
++ * current thread.
++ *
++ * The pointer returned by this function is guaranteed to be valid until
++ * the next call to invokeMethod() by the current thread.
++ * Users of this function should not free the pointer.
++ *
++ * @return The root cause as a C-string.
++ */
++char* getLastTLSExceptionRootCause();
++
++/**
++ * Get the last exception stack trace that happened in the context of the
++ * current thread.
++ *
++ * The pointer returned by this function is guaranteed to be valid until
++ * the next call to invokeMethod() by the current thread.
++ * Users of this function should not free the pointer.
++ *
++ * @return The stack trace as a C-string.
++ */
++char* getLastTLSExceptionStackTrace();
++
++/** setTLSExceptionStrings: Sets the 'rootCause' and 'stackTrace' in the
++ * ThreadLocalState if one exists for the current thread.
++ *
++ * @param rootCause A string containing the root cause of an exception.
++ * @param stackTrace A string containing the stack trace of an exception.
++ * @return None.
++ */
++void setTLSExceptionStrings(const char *rootCause, const char *stackTrace);
++
++/**
+  * Figure out if a Java object is an instance of a particular class.
+  *
+  * @param env  The Java environment.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/posix/thread_local_storage.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/posix/thread_local_storage.c
+index 2f70e2c..9faa594 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/posix/thread_local_storage.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/posix/thread_local_storage.c
+@@ -19,6 +19,7 @@
+ #include "os/thread_local_storage.h"
+ 
+ #include <jni.h>
++#include <malloc.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ 
+@@ -34,23 +35,48 @@ static int gTlsKeyInitialized = 0;
+  *
+  * @param v         The thread-local data
+  */
+-static void hdfsThreadDestructor(void *v)
++void hdfsThreadDestructor(void *v)
+ {
+   JavaVM *vm;
+-  JNIEnv *env = v;
++  struct ThreadLocalState *state = (struct ThreadLocalState*)v;
++  JNIEnv *env = state->env;;
+   jint ret;
+ 
+-  ret = (*env)->GetJavaVM(env, &vm);
+-  if (ret) {
+-    fprintf(stderr, "hdfsThreadDestructor: GetJavaVM failed with error %d\n",
+-      ret);
+-    (*env)->ExceptionDescribe(env);
+-  } else {
+-    (*vm)->DetachCurrentThread(vm);
++  /* Detach the current thread from the JVM */
++  if (env) {
++    ret = (*env)->GetJavaVM(env, &vm);
++    if (ret) {
++      fprintf(stderr, "hdfsThreadDestructor: GetJavaVM failed with error %d\n",
++        ret);
++      (*env)->ExceptionDescribe(env);
++    } else {
++      (*vm)->DetachCurrentThread(vm);
++    }
++  }
++
++  /* Free exception strings */
++  if (state->lastExceptionStackTrace) free(state->lastExceptionStackTrace);
++  if (state->lastExceptionRootCause) free(state->lastExceptionRootCause);
++
++  /* Free the state itself */
++  free(state);
++}
++
++struct ThreadLocalState* threadLocalStorageCreate()
++{
++  struct ThreadLocalState *state;
++  state = (struct ThreadLocalState*)malloc(sizeof(struct ThreadLocalState));
++  if (state == NULL) {
++    fprintf(stderr,
++      "threadLocalStorageSet: OOM - Unable to allocate thread local state\n");
++    return NULL;
+   }
++  state->lastExceptionStackTrace = NULL;
++  state->lastExceptionRootCause = NULL;
++  return state;
+ }
+ 
+-int threadLocalStorageGet(JNIEnv **env)
++int threadLocalStorageGet(struct ThreadLocalState **state)
+ {
+   int ret = 0;
+   if (!gTlsKeyInitialized) {
+@@ -63,18 +89,18 @@ int threadLocalStorageGet(JNIEnv **env)
+     }
+     gTlsKeyInitialized = 1;
+   }
+-  *env = pthread_getspecific(gTlsKey);
++  *state = pthread_getspecific(gTlsKey);
+   return ret;
+ }
+ 
+-int threadLocalStorageSet(JNIEnv *env)
++int threadLocalStorageSet(struct ThreadLocalState *state)
+ {
+-  int ret = pthread_setspecific(gTlsKey, env);
++  int ret = pthread_setspecific(gTlsKey, state);
+   if (ret) {
+     fprintf(stderr,
+       "threadLocalStorageSet: pthread_setspecific failed with error %d\n",
+       ret);
+-    hdfsThreadDestructor(env);
++    hdfsThreadDestructor(state);
+   }
+   return ret;
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/thread_local_storage.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/thread_local_storage.h
+index a40d567..025ceff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/thread_local_storage.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/thread_local_storage.h
+@@ -34,42 +34,67 @@
+  * operating systems that support it.
+  */
+ #ifdef HAVE_BETTER_TLS
+-  #define THREAD_LOCAL_STORAGE_GET_QUICK() \
+-    static __thread JNIEnv *quickTlsEnv = NULL; \
++  #define THREAD_LOCAL_STORAGE_GET_QUICK(state) \
++    static __thread struct ThreadLocalState *quickTlsEnv = NULL; \
+     { \
+       if (quickTlsEnv) { \
+-        return quickTlsEnv; \
++        *state = quickTlsEnv; \
+       } \
+     }
+ 
+-  #define THREAD_LOCAL_STORAGE_SET_QUICK(env) \
++  #define THREAD_LOCAL_STORAGE_SET_QUICK(state) \
+     { \
+-      quickTlsEnv = (env); \
++      quickTlsEnv = (state); \
+     }
+ #else
+-  #define THREAD_LOCAL_STORAGE_GET_QUICK()
+-  #define THREAD_LOCAL_STORAGE_SET_QUICK(env)
++  #define THREAD_LOCAL_STORAGE_GET_QUICK(state)
++  #define THREAD_LOCAL_STORAGE_SET_QUICK(state)
+ #endif
+ 
++struct ThreadLocalState {
++  /* The JNIEnv associated with the current thread */
++  JNIEnv *env;
++  /* The last exception stack trace that occured on this thread */
++  char *lastExceptionStackTrace;
++  /* The last exception root cause that occured on this thread */
++  char *lastExceptionRootCause;
++};
++
++/**
++ * The function that is called whenever a thread with libhdfs thread local data
++ * is destroyed.
++ *
++ * @param v         The thread-local data
++ */
++void hdfsThreadDestructor(void *v);
++
++/**
++ * Creates an object of ThreadLocalState.
++ *
++ * @return The newly created object if successful, NULL otherwise.
++ */
++struct ThreadLocalState* threadLocalStorageCreate();
++
+ /**
+- * Gets the JNIEnv in thread-local storage for the current thread.  If the call
+- * succeeds, and there is a JNIEnv associated with this thread, then returns 0
+- * and populates env.  If the call succeeds, but there is no JNIEnv associated
+- * with this thread, then returns 0 and sets JNIEnv to NULL.  If the call fails,
+- * then returns non-zero.  Only one thread at a time may execute this function.
+- * The caller is responsible for enforcing mutual exclusion.
++ * Gets the ThreadLocalState in thread-local storage for the current thread.
++ * If the call succeeds, and there is a ThreadLocalState associated with this
++ * thread, then returns 0 and populates 'state'.  If the call succeeds, but
++ * there is no ThreadLocalState associated with this thread, then returns 0
++ * and sets ThreadLocalState to NULL. If the call fails, then returns non-zero.
++ * Only one thread at a time may execute this function. The caller is
++ * responsible for enforcing mutual exclusion.
+  *
+- * @param env JNIEnv out parameter
++ * @param env ThreadLocalState out parameter
+  * @return 0 if successful, non-zero otherwise
+  */
+-int threadLocalStorageGet(JNIEnv **env);
++int threadLocalStorageGet(struct ThreadLocalState **state);
+ 
+ /**
+- * Sets the JNIEnv in thread-local storage for the current thread.
++ * Sets the ThreadLocalState in thread-local storage for the current thread.
+  *
+- * @param env JNIEnv to set
++ * @param env ThreadLocalState to set
+  * @return 0 if successful, non-zero otherwise
+  */
+-int threadLocalStorageSet(JNIEnv *env);
++int threadLocalStorageSet(struct ThreadLocalState *state);
+ 
+ #endif
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/windows/thread_local_storage.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/windows/thread_local_storage.c
+index 70ad152..8583dc3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/windows/thread_local_storage.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/os/windows/thread_local_storage.c
+@@ -19,6 +19,7 @@
+ #include "os/thread_local_storage.h"
+ 
+ #include <jni.h>
++#include <malloc.h>
+ #include <stdio.h>
+ #include <windows.h>
+ 
+@@ -27,16 +28,21 @@ static DWORD gTlsIndex = TLS_OUT_OF_INDEXES;
+ 
+ /**
+  * If the current thread has a JNIEnv in thread-local storage, then detaches the
+- * current thread from the JVM.
++ * current thread from the JVM and also frees up the ThreadLocalState object.
+  */
+ static void detachCurrentThreadFromJvm()
+ {
++  struct ThreadLocalState *state = NULL;
+   JNIEnv *env = NULL;
+   JavaVM *vm;
+   jint ret;
+-  if (threadLocalStorageGet(&env) || !env) {
++  if (threadLocalStorageGet(&state) || !state) {
+     return;
+   }
++  if (!state->env) {
++    return;
++  }
++  env = state->env;
+   ret = (*env)->GetJavaVM(env, &vm);
+   if (ret) {
+     fprintf(stderr,
+@@ -46,6 +52,13 @@ static void detachCurrentThreadFromJvm()
+   } else {
+     (*vm)->DetachCurrentThread(vm);
+   }
++
++  /* Free exception strings */
++  if (state->lastExceptionStackTrace) free(state->lastExceptionStackTrace);
++  if (state->lastExceptionRootCause) free(state->lastExceptionRootCause);
++
++  /* Free the state itself */
++  free(state);
+ }
+ 
+ /**
+@@ -114,7 +127,21 @@ extern const PIMAGE_TLS_CALLBACK pTlsCallback;
+ const PIMAGE_TLS_CALLBACK pTlsCallback = tlsCallback;
+ #pragma const_seg()
+ 
+-int threadLocalStorageGet(JNIEnv **env)
++struct ThreadLocalState* threadLocalStorageCreate()
++{
++  struct ThreadLocalState *state;
++  state = (struct ThreadLocalState*)malloc(sizeof(struct ThreadLocalState));
++  if (state == NULL) {
++    fprintf(stderr,
++      "threadLocalStorageSet: OOM - Unable to allocate thread local state\n");
++    return NULL;
++  }
++  state->lastExceptionStackTrace = NULL;
++  state->lastExceptionRootCause = NULL;
++  return state;
++}
++
++int threadLocalStorageGet(struct ThreadLocalState **state)
+ {
+   LPVOID tls;
+   DWORD ret;
+@@ -129,13 +156,13 @@ int threadLocalStorageGet(JNIEnv **env)
+   }
+   tls = TlsGetValue(gTlsIndex);
+   if (tls) {
+-    *env = tls;
++    *state = tls;
+     return 0;
+   } else {
+     ret = GetLastError();
+     if (ERROR_SUCCESS == ret) {
+       /* Thread-local storage contains NULL, because we haven't set it yet. */
+-      *env = NULL;
++      *state = NULL;
+       return 0;
+     } else {
+       /*
+@@ -150,15 +177,15 @@ int threadLocalStorageGet(JNIEnv **env)
+   }
+ }
+ 
+-int threadLocalStorageSet(JNIEnv *env)
++int threadLocalStorageSet(struct ThreadLocalState *state)
+ {
+   DWORD ret = 0;
+-  if (!TlsSetValue(gTlsIndex, (LPVOID)env)) {
++  if (!TlsSetValue(gTlsIndex, (LPVOID)state)) {
+     ret = GetLastError();
+     fprintf(stderr,
+       "threadLocalStorageSet: TlsSetValue failed with error %d\n",
+       ret);
+-    detachCurrentThreadFromJvm(env);
++    detachCurrentThreadFromJvm(state);
+   }
+   return ret;
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+index ee14ef9..31fb2d9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+@@ -165,6 +165,12 @@ static int doTestHdfsOperations(struct tlhThreadInfo *ti, hdfsFS fs,
+     /* There should not be any file to open for reading. */
+     EXPECT_NULL(hdfsOpenFile(fs, paths->file1, O_RDONLY, 0, 0, 0));
+ 
++    /* Check if the exceptions are stored in the TLS */
++    EXPECT_STR_CONTAINS(hdfsGetLastExceptionRootCause(),
++                        "File does not exist");
++    EXPECT_STR_CONTAINS(hdfsGetLastExceptionStackTrace(),
++                        "java.io.FileNotFoundException");
++
+     /* hdfsOpenFile should not accept mode = 3 */
+     EXPECT_NULL(hdfsOpenFile(fs, paths->file1, 3, 0, 0, 0));
+ 
+-- 
+1.7.9.5
+

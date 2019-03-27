@@ -1,0 +1,169 @@
+From 5a699a055e19f131beffe9b96d0759f460c73781 Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Tue, 12 Jul 2016 23:18:37 -0700
+Subject: [PATCH 1745/2848] HDFS-10544. Balancer doesn't work with
+ IPFailoverProxyProvider.
+
+(cherry picked from commit 087290e6b1cb1082646d966b65494082712ebe3e)
+(cherry picked from commit 5b4e916b3cae2540267d48716fd9240dfc055288)
+
+Change-Id: I19db17bf7089e2897f46ee8b215f4a956e1cb75f
+---
+ .../main/java/org/apache/hadoop/hdfs/DFSUtil.java  |   42 ++++++++++++------
+ .../java/org/apache/hadoop/hdfs/TestDFSUtil.java   |   45 +++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 14 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index 00a957a..26e5167 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -973,10 +973,11 @@ public String toString() {
+ 
+   /**
+    * Get a URI for each internal nameservice. If a nameservice is
+-   * HA-enabled, then the logical URI of the nameservice is returned. If the
+-   * nameservice is not HA-enabled, then a URI corresponding to an RPC address
+-   * of the single NN for that nameservice is returned, preferring the service
+-   * RPC address over the client RPC address.
++   * HA-enabled, and the configured failover proxy provider supports logical
++   * URIs, then the logical URI of the nameservice is returned.
++   * Otherwise, a URI corresponding to an RPC address of the single NN for that
++   * nameservice is returned, preferring the service RPC address over the
++   * client RPC address.
+    * 
+    * @param conf configuration
+    * @return a collection of all configured NN URIs, preferring service
+@@ -990,9 +991,10 @@ public String toString() {
+ 
+   /**
+    * Get a URI for each configured nameservice. If a nameservice is
+-   * HA-enabled, then the logical URI of the nameservice is returned. If the
+-   * nameservice is not HA-enabled, then a URI corresponding to the address of
+-   * the single NN for that nameservice is returned.
++   * HA-enabled, and the configured failover proxy provider supports logical
++   * URIs, then the logical URI of the nameservice is returned.
++   * Otherwise, a URI corresponding to the address of the single NN for that
++   * nameservice is returned.
+    * 
+    * @param conf configuration
+    * @param keys configuration keys to try in order to get the URI for non-HA
+@@ -1011,13 +1013,27 @@ public String toString() {
+     Set<URI> nonPreferredUris = new HashSet<URI>();
+     
+     for (String nsId : nameServices) {
+-      if (HAUtil.isHAEnabled(conf, nsId)) {
++      URI nsUri;
++      try {
++        nsUri = new URI(HdfsConstants.HDFS_URI_SCHEME + "://" + nsId);
++      } catch (URISyntaxException ue) {
++        throw new IllegalArgumentException(ue);
++      }
++      /**
++       * Determine whether the logical URI of the name service can be resolved
++       * by the configured failover proxy provider. If not, we should try to
++       * resolve the URI here
++       */
++      boolean useLogicalUri = false;
++      try {
++        useLogicalUri = HAUtil.useLogicalUri(conf, nsUri);
++      } catch (IOException e){
++        LOG.warn("Getting exception  while trying to determine if nameservice "
++            + nsId + " can use logical URI: " + e);
++      }
++      if (HAUtil.isHAEnabled(conf, nsId) && useLogicalUri) {
+         // Add the logical URI of the nameservice.
+-        try {
+-          ret.add(new URI(HdfsConstants.HDFS_URI_SCHEME + "://" + nsId));
+-        } catch (URISyntaxException ue) {
+-          throw new IllegalArgumentException(ue);
+-        }
++        ret.add(nsUri);
+       } else {
+         // Add the URI corresponding to the address of the NN.
+         boolean uriFound = false;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+index 340b1f3..c241e69 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+@@ -62,6 +62,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+@@ -529,7 +530,11 @@ public void testHANameNodesWithFederation() throws URISyntaxException {
+     // Ditto for nameservice IDs, if multiple are defined
+     assertEquals(null, DFSUtil.getNamenodeNameServiceId(conf));
+     assertEquals(null, DFSUtil.getSecondaryNameServiceId(conf));
+-    
++
++    String proxyProviderKey = DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX +
++        ".ns2";
++    conf.set(proxyProviderKey, "org.apache.hadoop.hdfs.server.namenode.ha."
++        + "ConfiguredFailoverProxyProvider");
+     Collection<URI> uris = getInternalNameServiceUris(conf, DFS_NAMENODE_RPC_ADDRESS_KEY);
+     assertEquals(2, uris.size());
+     assertTrue(uris.contains(new URI("hdfs://ns1")));
+@@ -629,6 +634,7 @@ public void testSubstituteForWildcardAddress() throws IOException {
+   public void testGetNNUris() throws Exception {
+     HdfsConfiguration conf = new HdfsConfiguration();
+ 
++    final String NS1_NN_ADDR   = "ns1-nn.example.com:8020";
+     final String NS1_NN1_ADDR   = "ns1-nn1.example.com:8020";
+     final String NS1_NN2_ADDR   = "ns1-nn2.example.com:8020";
+     final String NS2_NN_ADDR    = "ns2-nn.example.com:8020";
+@@ -661,12 +667,49 @@ public void testGetNNUris() throws Exception {
+         DFS_NAMENODE_RPC_ADDRESS_KEY, "ns1", "nn2"), NS1_NN2_ADDR);
+ 
+     conf.set(DFSUtil.addKeySuffixes(
++        DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, "ns1"), NS1_NN_ADDR);
++
++    conf.set(DFSUtil.addKeySuffixes(
+         DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, "ns2"), NS2_NN_ADDR);
+ 
+     conf.set(DFS_NAMENODE_RPC_ADDRESS_KEY, "hdfs://" + NN1_ADDR);
+ 
+     conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY, "hdfs://" + NN2_ADDR);
+ 
++    /**
++     * {@link DFSUtil#getInternalNsRpcUris} decides whether to resolve a logical
++     * URI based on whether the failover proxy provider supports logical URIs.
++     * We will test both cases.
++     *
++     * First configure ns1 to use {@link IPFailoverProxyProvider} which doesn't
++     * support logical Uris. So {@link DFSUtil#getInternalNsRpcUris} will
++     * resolve the logical URI of ns1 based on the configured value at
++     * dfs.namenode.servicerpc-address.ns1, which is {@link NS1_NN_ADDR}
++     */
++    String proxyProviderKey = DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX +
++        ".ns1";
++    conf.set(proxyProviderKey, "org.apache.hadoop.hdfs.server.namenode.ha."
++        + "IPFailoverProxyProvider");
++
++    uris = DFSUtil.getInternalNsRpcUris(conf);
++    assertEquals("Incorrect number of URIs returned", 3, uris.size());
++    assertTrue("Missing URI for RPC address",
++        uris.contains(new URI("hdfs://" + NN1_ADDR)));
++    assertTrue("Missing URI for name service ns2",
++        uris.contains(new URI(HdfsConstants.HDFS_URI_SCHEME + "://" +
++            NS1_NN_ADDR)));
++    assertTrue("Missing URI for name service ns2",
++        uris.contains(new URI(HdfsConstants.HDFS_URI_SCHEME + "://" +
++            NS2_NN_ADDR)));
++
++    /**
++     * Second, test ns1 with {@link ConfiguredFailoverProxyProvider} which does
++     * support logical URIs. So instead of {@link NS1_NN_ADDR}, the logical URI
++     * of ns1, hdfs://ns1, will be returned.
++     */
++    conf.set(proxyProviderKey, "org.apache.hadoop.hdfs.server.namenode.ha."
++        + "ConfiguredFailoverProxyProvider");
++
+     uris = DFSUtil.getInternalNsRpcUris(conf);
+ 
+     assertEquals("Incorrect number of URIs returned", 3, uris.size());
+-- 
+1.7.9.5
+

@@ -1,0 +1,173 @@
+From 09d81a9f35851e3714e3eeffa6e8b385506eefe0 Mon Sep 17 00:00:00 2001
+From: cnauroth <cnauroth@apache.org>
+Date: Thu, 22 Jan 2015 16:03:17 -0800
+Subject: [PATCH 1424/2848] HDFS-3519. Checkpoint upload may interfere with a
+ concurrent saveNamespace. Contributed by Ming Ma.
+
+(cherry picked from commit 639c7b0ddc216395dc336f48c021ab0c4ce51ada)
+
+Change-Id: Id6a55756f203fcf7abee828f2b999396ebb677eb
+---
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   56 ++++++++++++++++----
+ .../hadoop/hdfs/server/namenode/ImageServlet.java  |   18 +++----
+ .../server/namenode/ha/TestStandbyCheckpoints.java |    2 +-
+ 3 files changed, 55 insertions(+), 21 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 9d2c9c1..5924be2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -29,9 +29,11 @@
+ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -97,6 +99,15 @@
+ 
+   protected NNStorageRetentionManager archivalManager;
+ 
++  /* Used to make sure there are no concurrent checkpoints for a given txid
++   * The checkpoint here could be one of the following operations.
++   * a. checkpoint when NN is in standby.
++   * b. admin saveNameSpace operation.
++   * c. download checkpoint file from any remote checkpointer.
++  */
++  private final Set<Long> currentlyCheckpointing =
++      Collections.<Long>synchronizedSet(new HashSet<Long>());
++
+   /**
+    * Construct an FSImage
+    * @param conf Configuration
+@@ -1074,18 +1085,26 @@ public synchronized void saveNamespace(FSNamesystem source, NameNodeFile nnf,
+       editLog.endCurrentLogSegment(true);
+     }
+     long imageTxId = getLastAppliedOrWrittenTxId();
++    if (!addToCheckpointing(imageTxId)) {
++      throw new IOException(
++          "FS image is being downloaded from another NN at txid " + imageTxId);
++    }
+     try {
+-      saveFSImageInAllDirs(source, nnf, imageTxId, canceler);
+-      storage.writeAll();
+-    } finally {
+-      if (editLogWasOpen) {
+-        editLog.startLogSegment(imageTxId + 1, true);
+-        // Take this opportunity to note the current transaction.
+-        // Even if the namespace save was cancelled, this marker
+-        // is only used to determine what transaction ID is required
+-        // for startup. So, it doesn't hurt to update it unnecessarily.
+-        storage.writeTransactionIdFileToStorage(imageTxId + 1);
++      try {
++        saveFSImageInAllDirs(source, nnf, imageTxId, canceler);
++        storage.writeAll();
++      } finally {
++        if (editLogWasOpen) {
++          editLog.startLogSegment(imageTxId + 1, true);
++          // Take this opportunity to note the current transaction.
++          // Even if the namespace save was cancelled, this marker
++          // is only used to determine what transaction ID is required
++          // for startup. So, it doesn't hurt to update it unnecessarily.
++          storage.writeTransactionIdFileToStorage(imageTxId + 1);
++        }
+       }
++    } finally {
++      removeFromCheckpointing(imageTxId);
+     }
+   }
+ 
+@@ -1094,7 +1113,22 @@ public synchronized void saveNamespace(FSNamesystem source, NameNodeFile nnf,
+    */
+   protected synchronized void saveFSImageInAllDirs(FSNamesystem source, long txid)
+       throws IOException {
+-    saveFSImageInAllDirs(source, NameNodeFile.IMAGE, txid, null);
++    if (!addToCheckpointing(txid)) {
++      throw new IOException(("FS image is being downloaded from another NN"));
++    }
++    try {
++      saveFSImageInAllDirs(source, NameNodeFile.IMAGE, txid, null);
++    } finally {
++      removeFromCheckpointing(txid);
++    }
++  }
++
++  public boolean addToCheckpointing(long txid) {
++    return currentlyCheckpointing.add(txid);
++  }
++
++  public void removeFromCheckpointing(long txid) {
++    currentlyCheckpointing.remove(txid);
+   }
+ 
+   private synchronized void saveFSImageInAllDirs(FSNamesystem source,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+index d635754..f193da9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+@@ -82,9 +82,6 @@
+   private static final String IMAGE_FILE_TYPE = "imageFile";
+   private static final String IS_BOOTSTRAP_STANDBY = "bootstrapstandby";
+ 
+-  private static final Set<Long> currentlyDownloadingCheckpoints =
+-    Collections.synchronizedSet(new HashSet<Long>());
+-  
+   @Override
+   public void doGet(final HttpServletRequest request,
+       final HttpServletResponse response) throws ServletException, IOException {
+@@ -489,17 +486,20 @@ public Void run() throws Exception {
+ 
+               final NameNodeFile nnf = parsedParams.getNameNodeFile();
+ 
+-              if (!currentlyDownloadingCheckpoints.add(txid)) {
++              if (!nnImage.addToCheckpointing(txid)) {
+                 response.sendError(HttpServletResponse.SC_CONFLICT,
+-                    "Another checkpointer is already in the process of uploading a"
+-                        + " checkpoint made at transaction ID " + txid);
++                    "Either current namenode is checkpointing or another"
++                        + " checkpointer is already in the process of "
++                        + "uploading a checkpoint made at transaction ID "
++                        + txid);
+                 return null;
+               }
+               try {
+                 if (nnImage.getStorage().findImageFile(nnf, txid) != null) {
+                   response.sendError(HttpServletResponse.SC_CONFLICT,
+-                      "Another checkpointer already uploaded an checkpoint "
+-                          + "for txid " + txid);
++                      "Either current namenode has checkpointed or "
++                          + "another checkpointer already uploaded an "
++                          + "checkpoint for txid " + txid);
+                   return null;
+                 }
+ 
+@@ -524,7 +524,7 @@ public Void run() throws Exception {
+                   stream.close();
+                 }
+               } finally {
+-                currentlyDownloadingCheckpoints.remove(txid);
++                nnImage.removeFromCheckpointing(txid);
+               }
+               return null;
+             }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+index 2f9b945..78783e5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+@@ -466,7 +466,7 @@ public CompressionOutputStream createOutputStream(OutputStream out)
+         throws IOException {
+       CompressionOutputStream ret = super.createOutputStream(out);
+       CompressionOutputStream spy = Mockito.spy(ret);
+-      Mockito.doAnswer(new GenericTestUtils.SleepAnswer(2))
++      Mockito.doAnswer(new GenericTestUtils.SleepAnswer(5))
+         .when(spy).write(Mockito.<byte[]>any(), Mockito.anyInt(), Mockito.anyInt());
+       return spy;
+     }
+-- 
+1.7.9.5
+

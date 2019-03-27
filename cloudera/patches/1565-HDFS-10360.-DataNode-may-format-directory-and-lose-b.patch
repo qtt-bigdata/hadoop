@@ -1,0 +1,241 @@
+From 47983dbc0cacd26dd689cde3b288f95fc0b21a6c Mon Sep 17 00:00:00 2001
+From: Lei Xu <lei@apache.org>
+Date: Tue, 17 May 2016 16:36:48 -0700
+Subject: [PATCH 1565/2848] HDFS-10360. DataNode may format directory and lose
+ blocks if current/VERSION is missing. (Wei-Chiu
+ Chuang via lei)
+
+(cherry picked from commit bae11b95d492e0be7c5576097424879c2539b474)
+(cherry picked from commit 2d1d2dde17e472a487b6ac2078529271ceadfb3f)
+
+Change-Id: I34e0c3fafa6f236b047eff57f43ea57d2460272c
+---
+ .../apache/hadoop/hdfs/server/common/Storage.java  |   65 ++++++++++++++++++--
+ .../hadoop/hdfs/server/datanode/DataStorage.java   |    2 +-
+ .../TestDataNodeVolumeFailureReporting.java        |   36 +++++++++++
+ .../hdfs/server/datanode/TestDataStorage.java      |   26 ++++++++
+ 4 files changed, 124 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+index 23c0592..854fb68 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+@@ -25,7 +25,10 @@
+ import java.lang.management.ManagementFactory;
+ import java.nio.channels.FileLock;
+ import java.nio.channels.OverlappingFileLockException;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Properties;
+@@ -330,9 +333,12 @@ public void read(File from, Storage storage) throws IOException {
+      */
+     public void clearDirectory() throws IOException {
+       File curDir = this.getCurrentDir();
+-      if (curDir.exists())
++      if (curDir.exists()) {
++        File[] files = FileUtil.listFiles(curDir);
++        LOG.info("Will remove files: " + Arrays.toString(files));
+         if (!(FileUtil.fullyDelete(curDir)))
+           throw new IOException("Cannot remove current directory: " + curDir);
++      }
+       if (!curDir.mkdirs())
+         throw new IOException("Cannot create directory " + curDir);
+     }
+@@ -455,16 +461,60 @@ public File getPreviousCheckpoint() {
+     }
+ 
+     /**
+-     * Check consistency of the storage directory
++     * Check to see if current/ directory is empty. This method is used
++     * before determining to format the directory.
++     *
++     * @throws InconsistentFSStateException if not empty.
++     * @throws IOException if unable to list files under the directory.
++     */
++    private void checkEmptyCurrent() throws InconsistentFSStateException,
++        IOException {
++      File currentDir = getCurrentDir();
++      if(!currentDir.exists()) {
++        // if current/ does not exist, it's safe to format it.
++        return;
++      }
++      try(DirectoryStream<java.nio.file.Path> dirStream =
++          Files.newDirectoryStream(currentDir.toPath())) {
++        if (dirStream.iterator().hasNext()) {
++          throw new InconsistentFSStateException(root,
++              "Can't format the storage directory because the current/ "
++                  + "directory is not empty.");
++        }
++      }
++    }
++
++    /**
++     * Check consistency of the storage directory.
++     *
++     * @param startOpt a startup option.
++     * @param storage The Storage object that manages this StorageDirectory.
++     *
++     * @return state {@link StorageState} of the storage directory
++     * @throws InconsistentFSStateException if directory state is not
++     * consistent and cannot be recovered.
++     * @throws IOException
++     */
++    public StorageState analyzeStorage(StartupOption startOpt, Storage storage)
++        throws IOException {
++      return analyzeStorage(startOpt, storage, false);
++    }
++
++    /**
++     * Check consistency of the storage directory.
+      * 
+      * @param startOpt a startup option.
++     * @param storage The Storage object that manages this StorageDirectory.
++     * @param checkCurrentIsEmpty if true, make sure current/ directory
++     *                            is empty before determining to format it.
+      *  
+      * @return state {@link StorageState} of the storage directory 
+      * @throws InconsistentFSStateException if directory state is not 
+      * consistent and cannot be recovered.
+      * @throws IOException
+      */
+-    public StorageState analyzeStorage(StartupOption startOpt, Storage storage)
++    public StorageState analyzeStorage(StartupOption startOpt, Storage storage,
++        boolean checkCurrentIsEmpty)
+         throws IOException {
+       assert root != null : "root is null";
+       boolean hadMkdirs = false;
+@@ -501,8 +551,12 @@ public StorageState analyzeStorage(StartupOption startOpt, Storage storage)
+       // If startOpt is HOTSWAP, it returns NOT_FORMATTED for empty directory,
+       // while it also checks the layout version.
+       if (startOpt == HdfsServerConstants.StartupOption.FORMAT ||
+-          (startOpt == StartupOption.HOTSWAP && hadMkdirs))
++          (startOpt == StartupOption.HOTSWAP && hadMkdirs)) {
++        if (checkCurrentIsEmpty) {
++          checkEmptyCurrent();
++        }
+         return StorageState.NOT_FORMATTED;
++      }
+ 
+       if (startOpt != HdfsServerConstants.StartupOption.IMPORT) {
+         storage.checkOldLayoutStorage(this);
+@@ -527,6 +581,9 @@ public StorageState analyzeStorage(StartupOption startOpt, Storage storage)
+         if (hasPrevious)
+           throw new InconsistentFSStateException(root,
+                               "version file in current directory is missing.");
++        if (checkCurrentIsEmpty) {
++          checkEmptyCurrent();
++        }
+         return StorageState.NOT_FORMATTED;
+       }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+index 810076c..d2b4b6a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+@@ -276,7 +276,7 @@ private StorageDirectory loadStorageDirectory(DataNode datanode,
+       List<Callable<StorageDirectory>> callables) throws IOException {
+     StorageDirectory sd = new StorageDirectory(dataDir, null, false);
+     try {
+-      StorageState curState = sd.analyzeStorage(startOpt, this);
++      StorageState curState = sd.analyzeStorage(startOpt, this, true);
+       // sd is locked but not opened
+       switch (curState) {
+       case NORMAL:
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeVolumeFailureReporting.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeVolumeFailureReporting.java
+index 68bdccb..b8b1fec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeVolumeFailureReporting.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeVolumeFailureReporting.java
+@@ -21,6 +21,7 @@
+ import static org.apache.hadoop.test.MetricsAsserts.getMetrics;
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assume.assumeTrue;
+@@ -439,6 +440,41 @@ public void testDataNodeReconfigureWithVolumeFailures() throws Exception {
+     checkFailuresAtNameNode(dm, dns.get(1), true);
+   }
+ 
++  @Test
++  public void testAutoFormatEmptyDirectory() throws Exception {
++    // remove the version file
++    File dn1Vol1 = cluster.getStorageDir(0, 0);
++    File current = new File(dn1Vol1, "current");
++    File currentVersion = new File(current, "VERSION");
++    currentVersion.delete();
++    // restart the data node
++    assertTrue(cluster.restartDataNodes(true));
++    // the DN should tolerate one volume failure.
++    cluster.waitActive();
++    ArrayList<DataNode> dns = cluster.getDataNodes();
++    DataNode dn = dns.get(0);
++    assertFalse("DataNode should not reformat if VERSION is missing",
++        currentVersion.exists());
++
++    // Make sure DN's JMX sees the failed volume
++    final String[] expectedFailedVolumes = {dn1Vol1.getAbsolutePath()};
++    DataNodeTestUtils.triggerHeartbeat(dn);
++    FsDatasetSpi<?> fsd = dn.getFSDataset();
++    assertEquals(expectedFailedVolumes.length, fsd.getNumFailedVolumes());
++    assertArrayEquals(expectedFailedVolumes, fsd.getFailedStorageLocations());
++    // there shouldn't be any more volume failures due to I/O failure
++    checkFailuresAtDataNode(dn, 0, false, expectedFailedVolumes);
++
++    // The NN reports one volume failures
++    final DatanodeManager dm = cluster.getNamesystem().getBlockManager().
++        getDatanodeManager();
++    long dnCapacity = DFSTestUtil.getDatanodeCapacity(dm, 0);
++    DFSTestUtil.waitForDatanodeStatus(dm, 1, 0, 1,
++        (1*dnCapacity), WAIT_FOR_HEARTBEATS);
++    checkAggregateFailuresAtNameNode(false, 1);
++    checkFailuresAtNameNode(dm, dns.get(0), false, dn1Vol1.getAbsolutePath());
++  }
++
+   /**
+    * Checks the NameNode for correct values of aggregate counters tracking failed
+    * volumes across all DataNodes.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataStorage.java
+index c55dbae..405d2e9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataStorage.java
+@@ -167,6 +167,32 @@ public void testAddStorageDirectories() throws IOException,
+   }
+ 
+   @Test
++  public void testMissingVersion() throws IOException,
++      URISyntaxException {
++    final int numLocations = 1;
++    final int numNamespace = 1;
++    List<StorageLocation> locations = createStorageLocations(numLocations);
++
++    StorageLocation firstStorage = locations.get(0);
++    Storage.StorageDirectory sd = new Storage.StorageDirectory(
++        firstStorage.getFile());
++    // the directory is not initialized so VERSION does not exist
++    // create a fake directory under current/
++    File currentDir = new File(sd.getCurrentDir(),
++        "BP-787466439-172.26.24.43-1462305406642");
++    assertTrue("unable to mkdir " + currentDir.getName(), currentDir.mkdirs());
++
++    // Add volumes for multiple namespaces.
++    List<NamespaceInfo> namespaceInfos = createNamespaceInfos(numNamespace);
++    for (NamespaceInfo ni : namespaceInfos) {
++      storage.addStorageLocations(mockDN, ni, locations, START_OPT);
++    }
++
++    // It should not format the directory because VERSION is missing.
++    assertTrue("Storage directory was formatted", currentDir.exists());
++  }
++
++  @Test
+   public void testRecoverTransitionReadFailure() throws IOException {
+     final int numLocations = 3;
+     List<StorageLocation> locations =
+-- 
+1.7.9.5
+

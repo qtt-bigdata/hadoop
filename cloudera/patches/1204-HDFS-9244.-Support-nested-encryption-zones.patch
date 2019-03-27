@@ -1,0 +1,529 @@
+From 9429611eab15d2d5a7fe8a6867c8215fdcb96b1e Mon Sep 17 00:00:00 2001
+From: zhezhang <zhz@apache.org>
+Date: Mon, 8 Feb 2016 16:30:51 -0800
+Subject: [PATCH 1204/2848] HDFS-9244. Support nested encryption zones.
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+
+Change-Id: I099371c2a1e8f9e106a76ede16bb4a196ee7b940
+---
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |    8 +-
+ .../server/namenode/EncryptionZoneManager.java     |   91 +++++----
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |   46 ++---
+ .../server/namenode/TestNestedEncryptionZones.java |  215 ++++++++++++++++++++
+ .../src/test/resources/testCryptoConf.xml          |    8 +-
+ 5 files changed, 298 insertions(+), 70 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNestedEncryptionZones.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index 4efdb27..4d659ed 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -2173,13 +2173,13 @@ public DFSInotifyEventInputStream getInotifyEventStream(long lastReadTxid)
+    */
+   @Override
+   public Path getTrashRoot(Path path) throws IOException {
+-    if ((path == null) || !dfs.isHDFSEncryptionEnabled()) {
++    if ((path == null) || path.isRoot() || !dfs.isHDFSEncryptionEnabled()) {
+       return super.getTrashRoot(path);
+     }
+ 
+-    String absSrc = path.toUri().getPath();
+-    EncryptionZone ez = dfs.getEZForPath(absSrc);
+-    if ((ez != null) && !ez.getPath().equals(absSrc)) {
++    String parentSrc = path.getParent().toUri().getPath();
++    EncryptionZone ez = dfs.getEZForPath(parentSrc);
++    if ((ez != null)) {
+       return this.makeQualified(
+           new Path(ez.getPath() + "/" + FileSystem.TRASH_PREFIX +
+               dfs.ugi.getShortUserName()));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+index 3c971c9..3350514 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+@@ -17,7 +17,10 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.util.Arrays;
++import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.NavigableMap;
+@@ -194,7 +197,7 @@ String getKeyName(final INodesInPath iip) {
+    * Looks up the EncryptionZoneInt for a path within an encryption zone.
+    * Returns null if path is not within an EZ.
+    * <p/>
+-   * Must be called while holding the manager lock.
++   * Called while holding the FSDirectory lock.
+    */
+   private EncryptionZoneInt getEncryptionZoneForPath(INodesInPath iip) {
+     assert dir.hasReadLock();
+@@ -213,6 +216,30 @@ private EncryptionZoneInt getEncryptionZoneForPath(INodesInPath iip) {
+   }
+ 
+   /**
++   * Looks up the nearest ancestor EncryptionZoneInt that contains the given
++   * path (excluding itself).
++   * Returns null if path is not within an EZ, or the path is the root dir '/'
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
++  private EncryptionZoneInt getParentEncryptionZoneForPath(INodesInPath iip) {
++    assert dir.hasReadLock();
++    Preconditions.checkNotNull(iip);
++    List<INode> inodes = Collections.unmodifiableList(
++        Arrays.asList(iip.getINodes()));
++    for (int i = inodes.size() - 2; i >= 0; i--) {
++      final INode inode = inodes.get(i);
++      if (inode != null) {
++        final EncryptionZoneInt ezi = encryptionZones.get(inode.getId());
++        if (ezi != null) {
++          return ezi;
++        }
++      }
++    }
++    return null;
++  }
++
++  /**
+    * Returns an EncryptionZone representing the ez for a given path.
+    * Returns an empty marker EncryptionZone if path is not in an ez.
+    *
+@@ -231,7 +258,7 @@ EncryptionZone getEZINodeForPath(INodesInPath iip) {
+ 
+   /**
+    * Throws an exception if the provided path cannot be renamed into the
+-   * destination because of differing encryption zones.
++   * destination because of differing parent encryption zones.
+    * <p/>
+    * Called while holding the FSDirectory lock.
+    *
+@@ -243,32 +270,24 @@ EncryptionZone getEZINodeForPath(INodesInPath iip) {
+   void checkMoveValidity(INodesInPath srcIIP, INodesInPath dstIIP, String src)
+       throws IOException {
+     assert dir.hasReadLock();
+-    final EncryptionZoneInt srcEZI = getEncryptionZoneForPath(srcIIP);
+-    final EncryptionZoneInt dstEZI = getEncryptionZoneForPath(dstIIP);
+-    final boolean srcInEZ = (srcEZI != null);
+-    final boolean dstInEZ = (dstEZI != null);
+-    if (srcInEZ) {
+-      if (!dstInEZ) {
+-        if (srcEZI.getINodeId() == srcIIP.getLastINode().getId()) {
+-          // src is ez root and dest is not in an ez. Allow the rename.
+-          return;
+-        }
+-        throw new IOException(
+-            src + " can't be moved from an encryption zone.");
+-      }
+-    } else {
+-      if (dstInEZ) {
+-        throw new IOException(
+-            src + " can't be moved into an encryption zone.");
+-      }
++    final EncryptionZoneInt srcParentEZI =
++        getParentEncryptionZoneForPath(srcIIP);
++    final EncryptionZoneInt dstParentEZI =
++        getParentEncryptionZoneForPath(dstIIP);
++    final boolean srcInEZ = (srcParentEZI != null);
++    final boolean dstInEZ = (dstParentEZI != null);
++    if (srcInEZ && !dstInEZ) {
++      throw new IOException(
++          src + " can't be moved from an encryption zone.");
++    } else if (dstInEZ && !srcInEZ) {
++      throw new IOException(
++          src + " can't be moved into an encryption zone.");
+     }
+ 
+-    if (srcInEZ || dstInEZ) {
+-      Preconditions.checkState(srcEZI != null, "couldn't find src EZ?");
+-      Preconditions.checkState(dstEZI != null, "couldn't find dst EZ?");
+-      if (srcEZI != dstEZI) {
+-        final String srcEZPath = getFullPathName(srcEZI);
+-        final String dstEZPath = getFullPathName(dstEZI);
++    if (srcInEZ) {
++      if (srcParentEZI != dstParentEZI) {
++        final String srcEZPath = getFullPathName(srcParentEZI);
++        final String dstEZPath = getFullPathName(dstParentEZI);
+         final StringBuilder sb = new StringBuilder(src);
+         sb.append(" can't be moved from encryption zone ");
+         sb.append(srcEZPath);
+@@ -289,21 +308,25 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+       CryptoProtocolVersion version, String keyName)
+       throws IOException {
+     assert dir.hasWriteLock();
++
++    // Check if src is a valid path for new EZ creation
++    final INodesInPath srcIIP = dir.getINodesInPath4Write(src, false);
++    if (srcIIP == null || srcIIP.getLastINode() == null) {
++      throw new FileNotFoundException("cannot find " + src);
++    }
+     if (dir.isNonEmptyDirectory(src)) {
+       throw new IOException(
+           "Attempt to create an encryption zone for a non-empty directory.");
+     }
+ 
+-    final INodesInPath srcIIP = dir.getINodesInPath4Write(src, false);
+-    if (srcIIP != null &&
+-        srcIIP.getLastINode() != null &&
+-        !srcIIP.getLastINode().isDirectory()) {
++    INode srcINode = srcIIP.getLastINode();
++    if (!srcINode.isDirectory()) {
+       throw new IOException("Attempt to create an encryption zone for a file.");
+     }
+-    EncryptionZoneInt ezi = getEncryptionZoneForPath(srcIIP);
+-    if (ezi != null) {
+-      throw new IOException("Directory " + src + " is already in an " +
+-          "encryption zone. (" + getFullPathName(ezi) + ")");
++
++    if (encryptionZones.get(srcINode.getId()) != null) {
++      throw new IOException("Directory " + src + " is already an encryption " +
++          "zone.");
+     }
+ 
+     final HdfsProtos.ZoneEncryptionInfoProto proto =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index 35cedde..1184604 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -237,17 +237,7 @@ public void testBasicOperations() throws Exception {
+     try {
+       dfsAdmin.createEncryptionZone(zone1, TEST_KEY);
+     } catch (IOException e) {
+-      assertExceptionContains("already in an encryption zone", e);
+-    }
+-
+-    /* Test failure of create EZ operation in an existing EZ. */
+-    final Path zone1Child = new Path(zone1, "child");
+-    fsWrapper.mkdir(zone1Child, FsPermission.getDirDefault(), false);
+-    try {
+-      dfsAdmin.createEncryptionZone(zone1Child, TEST_KEY);
+-      fail("EZ in an EZ");
+-    } catch (IOException e) {
+-      assertExceptionContains("already in an encryption zone", e);
++      assertExceptionContains("is already an encryption zone", e);
+     }
+ 
+     /* create EZ on parent of an EZ should fail */
+@@ -387,15 +377,6 @@ public void testBasicOperationsRootDir() throws Exception {
+     assertNumZones(++numZones);
+     assertZonePresent(null, rootDir.toString());
+ 
+-    /* create EZ on child of rootDir which is already an EZ should fail */
+-    fsWrapper.mkdir(zone1, FsPermission.getDirDefault(), true);
+-    try {
+-      dfsAdmin.createEncryptionZone(zone1, TEST_KEY);
+-      fail("EZ over an EZ");
+-    } catch (IOException e) {
+-      assertExceptionContains("already in an encryption zone", e);
+-    }
+-
+     // Verify rootDir ez is present after restarting the NameNode
+     // and saving/loading from fsimage.
+     fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+@@ -404,14 +385,6 @@ public void testBasicOperationsRootDir() throws Exception {
+     cluster.restartNameNode(true);
+     assertNumZones(numZones);
+     assertZonePresent(null, rootDir.toString());
+-
+-    /* create EZ on child of rootDir which is already an EZ should fail */
+-    try {
+-      dfsAdmin.createEncryptionZone(zone1, TEST_KEY);
+-      fail("EZ over an EZ");
+-    } catch (IOException e) {
+-      assertExceptionContains("already in an encryption zone", e);
+-    }
+   }
+ 
+   /**
+@@ -1376,6 +1349,23 @@ public void testEncryptionZoneWithTrash() throws Exception {
+     // Delete encryption zone from the shell with trash enabled
+     // Verify the zone is moved to appropriate trash location in user's home dir
+     verifyShellDeleteWithTrash(shell, zone1);
++
++    final Path topEZ = new Path("/topEZ");
++    fs.mkdirs(topEZ);
++    dfsAdmin.createEncryptionZone(topEZ, TEST_KEY);
++    final String NESTED_EZ_TEST_KEY = "nested_ez_test_key";
++    DFSTestUtil.createKey(NESTED_EZ_TEST_KEY, cluster, conf);
++    final Path nestedEZ = new Path(topEZ, "nestedEZ");
++    fs.mkdirs(nestedEZ);
++    dfsAdmin.createEncryptionZone(nestedEZ, NESTED_EZ_TEST_KEY);
++    final Path topEZFile = new Path(topEZ, "file");
++    final Path nestedEZFile = new Path(nestedEZ, "file");
++    DFSTestUtil.createFile(fs, topEZFile, len, (short) 1, 0xFEED);
++    DFSTestUtil.createFile(fs, nestedEZFile, len, (short) 1, 0xFEED);
++    verifyShellDeleteWithTrash(shell, topEZFile);
++    verifyShellDeleteWithTrash(shell, nestedEZFile);
++    verifyShellDeleteWithTrash(shell, nestedEZ);
++    verifyShellDeleteWithTrash(shell, topEZ);
+   }
+ 
+   private void verifyShellDeleteWithTrash(FsShell shell, Path path)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNestedEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNestedEncryptionZones.java
+new file mode 100644
+index 0000000..8847c91
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNestedEncryptionZones.java
+@@ -0,0 +1,215 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.crypto.key.JavaKeyStoreProvider;
++import org.apache.hadoop.fs.FileSystemTestHelper;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DFSTestUtil;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
++import org.apache.hadoop.hdfs.HdfsConfiguration;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.log4j.Level;
++import org.apache.log4j.Logger;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++/**
++ * Test the behavior of nested encryption zones.
++ */
++public class TestNestedEncryptionZones {
++  private File testRootDir;
++  private final String TOP_EZ_KEY = "topezkey";
++  private final String NESTED_EZ_KEY = "nestedezkey";
++
++  private MiniDFSCluster cluster;
++  protected DistributedFileSystem fs;
++
++  private final Path rootDir = new Path("/");
++  private final Path rawDir = new Path("/.reserved/raw/");
++  private final Path topEZDir = new Path(rootDir, "topEZ");
++  private final Path nestedEZDir = new Path(topEZDir, "nestedEZ");
++
++  private final Path topEZBaseFile = new Path(rootDir, "topEZBaseFile");
++  private Path topEZFile = new Path(topEZDir, "file");
++  private Path topEZRawFile = new Path(rawDir, "topEZ/file");
++
++  private final Path nestedEZBaseFile = new Path(rootDir, "nestedEZBaseFile");
++  private Path nestedEZFile = new Path(nestedEZDir, "file");
++  private Path nestedEZRawFile = new Path(rawDir, "topEZ/nestedEZ/file");
++
++  // File length
++  private final int len = 8196;
++
++  private String getKeyProviderURI() {
++    return JavaKeyStoreProvider.SCHEME_NAME + "://file" +
++        new Path(testRootDir.toString(), "test.jks").toUri();
++  }
++
++  private void setProvider() {
++    // Need to set the client's KeyProvider to the NN's for JKS,
++    // else the updates do not get flushed properly
++    fs.getClient().setKeyProvider(cluster.getNameNode().getNamesystem()
++        .getProvider());
++  }
++
++  @Before
++  public void setup() throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    FileSystemTestHelper fsHelper = new FileSystemTestHelper();
++    // Set up java key store
++    String testRoot = fsHelper.getTestRootDir();
++    testRootDir = new File(testRoot).getAbsoluteFile();
++    conf.set(DFSConfigKeys.DFS_ENCRYPTION_KEY_PROVIDER_URI, getKeyProviderURI());
++    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY, true);
++    // Lower the batch size for testing
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES,
++        2);
++    cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
++    Logger.getLogger(EncryptionZoneManager.class).setLevel(Level.TRACE);
++    fs = cluster.getFileSystem();
++    setProvider();
++
++    // Create test keys and EZs
++    DFSTestUtil.createKey(TOP_EZ_KEY, cluster, conf);
++    DFSTestUtil.createKey(NESTED_EZ_KEY, cluster, conf);
++    fs.mkdir(topEZDir, FsPermission.getDirDefault());
++    fs.createEncryptionZone(topEZDir, TOP_EZ_KEY);
++    fs.mkdir(nestedEZDir, FsPermission.getDirDefault());
++    fs.createEncryptionZone(nestedEZDir, NESTED_EZ_KEY);
++
++    DFSTestUtil.createFile(fs, topEZBaseFile, len, (short) 1, 0xFEED);
++    DFSTestUtil.createFile(fs, topEZFile, len, (short) 1, 0xFEED);
++    DFSTestUtil.createFile(fs, nestedEZBaseFile, len, (short) 1, 0xFEED);
++    DFSTestUtil.createFile(fs, nestedEZFile, len, (short) 1, 0xFEED);
++  }
++
++  @Test(timeout = 60000)
++  public void testNestedEncryptionZones() throws Exception {
++    verifyEncryption();
++
++    // Restart NameNode to test if nested EZs can be loaded from edit logs
++    cluster.restartNameNodes();
++    cluster.waitActive();
++    verifyEncryption();
++
++    // Checkpoint and restart NameNode, to test if nested EZs can be loaded
++    // from fsimage
++    fs.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_ENTER);
++    fs.saveNamespace();
++    fs.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++    cluster.restartNameNodes();
++    cluster.waitActive();
++    verifyEncryption();
++
++    Path renamedTopEZFile = new Path(topEZDir, "renamedFile");
++    Path renamedNestedEZFile = new Path(nestedEZDir, "renamedFile");
++    try {
++      fs.rename(topEZFile, renamedTopEZFile);
++      fs.rename(nestedEZFile, renamedNestedEZFile);
++    } catch (Exception e) {
++      fail("Should be able to rename files within the same EZ.");
++    }
++
++    topEZFile = renamedTopEZFile;
++    nestedEZFile = renamedNestedEZFile;
++    topEZRawFile = new Path(rawDir, "topEZ/renamedFile");
++    nestedEZRawFile = new Path(rawDir, "topEZ/nestedEZ/renamedFile");
++    verifyEncryption();
++
++    // Verify that files in top EZ cannot be moved into the nested EZ, and
++    // vice versa.
++    try {
++      fs.rename(topEZFile, new Path(nestedEZDir, "movedTopEZFile"));
++      fail("Shouldn't be able to rename between top EZ and nested EZ.");
++    } catch (Exception e) {
++      assertTrue(e.getMessage().contains(
++          "can't be moved from encryption zone " + topEZDir.toString() +
++              " to encryption zone " + nestedEZDir.toString()));
++    }
++    try {
++      fs.rename(nestedEZFile, new Path(topEZDir, "movedNestedEZFile"));
++      fail("Shouldn't be able to rename between top EZ and nested EZ.");
++    } catch (Exception e) {
++      assertTrue(e.getMessage().contains(
++          "can't be moved from encryption zone " + nestedEZDir.toString() +
++              " to encryption zone " + topEZDir.toString()));
++    }
++
++    // Verify that the nested EZ cannot be moved out of the top EZ.
++    try {
++      fs.rename(nestedEZFile, new Path(rootDir, "movedNestedEZFile"));
++      fail("Shouldn't be able to move the nested EZ out of the top EZ.");
++    } catch (Exception e) {
++      assertTrue(e.getMessage().contains(
++          "can't be moved from an encryption zone"));
++    }
++
++    // Verify that a non-nested EZ cannot be moved into another EZ
++    Path topEZ2Dir = new Path(rootDir, "topEZ2");
++    fs.mkdir(topEZ2Dir, FsPermission.getDirDefault());
++    fs.createEncryptionZone(topEZ2Dir, TOP_EZ_KEY);
++    try {
++      fs.rename(topEZ2Dir, new Path(topEZDir, "topEZ2"));
++      fail("Shouldn't be able to move a non-nested EZ into another " +
++          "existing EZ.");
++    } catch (Exception e){
++      assertTrue(e.getMessage().contains(
++          "can't be moved into an encryption zone"));
++    }
++
++    try {
++      fs.rename(topEZDir, new Path(rootDir, "newTopEZDir"));
++    } catch (Exception e) {
++      fail("Should be able to rename the root dir of an EZ.");
++    }
++
++    try {
++      fs.rename(new Path(rootDir, "newTopEZDir/nestedEZDir"),
++          new Path(rootDir, "newTopEZDir/newNestedEZDir"));
++    } catch (Exception e) {
++      fail("Should be able to rename the nested EZ dir within " +
++          "the same top EZ.");
++    }
++  }
++
++  private void verifyEncryption() throws Exception {
++    assertEquals("Top EZ dir is encrypted",
++        true, fs.getFileStatus(topEZDir).isEncrypted());
++    assertEquals("Nested EZ dir is encrypted",
++        true, fs.getFileStatus(nestedEZDir).isEncrypted());
++    assertEquals("Top zone file is encrypted",
++        true, fs.getFileStatus(topEZFile).isEncrypted());
++    assertEquals("Nested zone file is encrypted",
++        true, fs.getFileStatus(nestedEZFile).isEncrypted());
++
++    DFSTestUtil.verifyFilesEqual(fs, topEZBaseFile, topEZFile, len);
++    DFSTestUtil.verifyFilesEqual(fs, nestedEZBaseFile, nestedEZFile, len);
++    DFSTestUtil.verifyFilesNotEqual(fs, topEZRawFile, nestedEZRawFile, len);
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testCryptoConf.xml b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testCryptoConf.xml
+index 89c93e2..8a1c317 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testCryptoConf.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testCryptoConf.xml
+@@ -63,7 +63,7 @@
+     </test>
+ 
+     <test>
+-      <description>Test failure of create ez on an existing ez</description>
++      <description>Test failure of creating EZ on an existing EZ</description>
+       <test-commands>
+         <command>-fs NAMENODE -mkdir /foo</command>
+         <command>-fs NAMENODE -ls /</command>-
+@@ -76,13 +76,13 @@
+       <comparators>
+         <comparator>
+           <type>SubstringComparator</type>
+-          <expected-output>Directory /foo is already in an encryption zone</expected-output>
++          <expected-output>Directory /foo is already an encryption zone</expected-output>
+         </comparator>
+       </comparators>
+     </test>
+ 
+     <test>
+-      <description>Test failure of Create EZ operation in an existing EZ.</description>
++      <description>Test success of creating an EZ as a subdir of an existing EZ.</description>
+       <test-commands>
+         <command>-fs NAMENODE -mkdir /foo</command>
+         <command>-fs NAMENODE -ls /</command>-
+@@ -97,7 +97,7 @@
+       <comparators>
+         <comparator>
+           <type>SubstringComparator</type>
+-          <expected-output>Directory /foo/bar is already in an encryption zone. (/foo)</expected-output>
++          <expected-output>Added encryption zone /foo/bar</expected-output>
+         </comparator>
+       </comparators>
+     </test>
+-- 
+1.7.9.5
+

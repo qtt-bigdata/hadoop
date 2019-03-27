@@ -1,0 +1,586 @@
+From 0ec201c01f4b52ce1839df567a20127ca73a3a6c Mon Sep 17 00:00:00 2001
+From: Xiaoyu Yao <xyao@apache.org>
+Date: Tue, 24 Nov 2015 12:41:08 -0800
+Subject: [PATCH 1342/2848] HDFS-8855. Webhdfs client leaks active NameNode
+ connections. Contributed by Xiaobing Zhou.
+
+(cherry picked from commit fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+
+(cherry picked from commit ad4fcd1f9f84cfef8dc8bb48ef7fbdd5c7c20c6a)
+(cherry picked from commit 5ff2012f648cb2602009f8e27d1db76230397ad9)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+
+Change-Id: I66f75510427fce17d67c2003d68ed11f078edff2
+---
+ .../org/apache/hadoop/security/token/Token.java    |   10 +-
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |   20 +-
+ .../server/datanode/web/DatanodeHttpServer.java    |    4 +-
+ .../datanode/web/webhdfs/DataNodeUGIProvider.java  |  106 +++++++--
+ .../src/main/resources/hdfs-default.xml            |    8 +
+ .../web/webhdfs/TestDataNodeUGIProvider.java       |  235 ++++++++++++++++++++
+ 6 files changed, 355 insertions(+), 28 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+index 3944ad1..6403b22 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+@@ -19,6 +19,8 @@
+ package org.apache.hadoop.security.token;
+ 
+ import com.google.common.collect.Maps;
++import com.google.common.primitives.Bytes;
++
+ import org.apache.commons.codec.binary.Base64;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -32,6 +34,7 @@
+ import java.util.Arrays;
+ import java.util.Map;
+ import java.util.ServiceLoader;
++import java.util.UUID;
+ 
+ /**
+  * The client-side form of the token.
+@@ -337,7 +340,12 @@ public String toString() {
+     identifierToString(buffer);
+     return buffer.toString();
+   }
+-  
++
++  public String buildCacheKey() {
++    return UUID.nameUUIDFromBytes(
++        Bytes.concat(kind.getBytes(), identifier, password)).toString();
++  }
++
+   private static ServiceLoader<TokenRenewer> renewers =
+       ServiceLoader.load(TokenRenewer.class);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 6ca3700..194ad92 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -47,9 +47,9 @@
+   public static final String  DFS_USER_HOME_DIR_PREFIX_KEY = "dfs.user.home.dir.prefix";
+   public static final String  DFS_USER_HOME_DIR_PREFIX_DEFAULT = "/user";
+   public static final String  DFS_CLIENT_RETRY_POLICY_ENABLED_KEY = "dfs.client.retry.policy.enabled";
+-  public static final boolean DFS_CLIENT_RETRY_POLICY_ENABLED_DEFAULT = false; 
++  public static final boolean DFS_CLIENT_RETRY_POLICY_ENABLED_DEFAULT = false;
+   public static final String  DFS_CLIENT_RETRY_POLICY_SPEC_KEY = "dfs.client.retry.policy.spec";
+-  public static final String  DFS_CLIENT_RETRY_POLICY_SPEC_DEFAULT = "10000,6,60000,10"; //t1,n1,t2,n2,... 
++  public static final String  DFS_CLIENT_RETRY_POLICY_SPEC_DEFAULT = "10000,6,60000,10"; //t1,n1,t2,n2,...
+   public static final String  DFS_CHECKSUM_TYPE_KEY = "dfs.checksum.type";
+   public static final String  DFS_CHECKSUM_TYPE_DEFAULT = "CRC32C";
+   public static final String  DFS_CLIENT_WRITE_MAX_PACKETS_IN_FLIGHT_KEY = "dfs.client.write.max-packets-in-flight";
+@@ -100,6 +100,10 @@
+   public static final int     DFS_CLIENT_RETRY_INTERVAL_GET_LAST_BLOCK_LENGTH_DEFAULT = 4000;
+   public static final String DFS_WEBHDFS_ACL_PERMISSION_PATTERN_DEFAULT =
+       "^(default:)?(user|group|mask|other):[[A-Za-z_][A-Za-z0-9._-]]*:([rwx-]{3})?(,(default:)?(user|group|mask|other):[[A-Za-z_][A-Za-z0-9._-]]*:([rwx-]{3})?)*$";
++  public static final String  DFS_WEBHDFS_UGI_EXPIRE_AFTER_ACCESS_KEY =
++      "dfs.webhdfs.ugi.expire.after.access";
++  public static final int     DFS_WEBHDFS_UGI_EXPIRE_AFTER_ACCESS_DEFAULT =
++      10*60*1000; //10 minutes
+ 
+   // HA related configuration
+   public static final String  DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX = "dfs.client.failover.proxy.provider";
+@@ -115,7 +119,7 @@
+   public static final int     DFS_CLIENT_FAILOVER_CONNECTION_RETRIES_ON_SOCKET_TIMEOUTS_DEFAULT = 0;
+   public static final String  DFS_CLIENT_RETRY_MAX_ATTEMPTS_KEY = "dfs.client.retry.max.attempts";
+   public static final int     DFS_CLIENT_RETRY_MAX_ATTEMPTS_DEFAULT = 10;
+-  
++
+   public static final String  DFS_CLIENT_SOCKET_CACHE_EXPIRY_MSEC_KEY = "dfs.client.socketcache.expiryMsec";
+   public static final long    DFS_CLIENT_SOCKET_CACHE_EXPIRY_MSEC_DEFAULT = 3000;
+   public static final String  DFS_CLIENT_WRITE_EXCLUDE_NODES_CACHE_EXPIRY_INTERVAL = "dfs.client.write.exclude.nodes.cache.expiry.interval.millis";
+@@ -394,7 +398,7 @@
+   public static final String  DFS_NAMENODE_EDITS_PLUGIN_PREFIX = "dfs.namenode.edits.journal-plugin";
+   public static final String  DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY = "dfs.namenode.edits.dir.required";
+   public static final String  DFS_NAMENODE_EDITS_DIR_DEFAULT = "file:///tmp/hadoop/dfs/name";
+-  public static final String  DFS_CLIENT_READ_PREFETCH_SIZE_KEY = "dfs.client.read.prefetch.size"; 
++  public static final String  DFS_CLIENT_READ_PREFETCH_SIZE_KEY = "dfs.client.read.prefetch.size";
+   public static final String  DFS_CLIENT_RETRY_WINDOW_BASE= "dfs.client.retry.window.base";
+   public static final String  DFS_METRICS_SESSION_ID_KEY = "dfs.metrics.session-id";
+   public static final String  DFS_METRICS_PERCENTILES_INTERVALS_KEY = "dfs.metrics.percentiles.intervals";
+@@ -631,7 +635,7 @@
+   public static final String  DFS_NAMENODE_NAME_CACHE_THRESHOLD_KEY = "dfs.namenode.name.cache.threshold";
+   public static final int     DFS_NAMENODE_NAME_CACHE_THRESHOLD_DEFAULT = 10;
+   public static final String  DFS_NAMENODE_LEGACY_OIV_IMAGE_DIR_KEY = "dfs.namenode.legacy-oiv-image.dir";
+-  
++
+   public static final String  DFS_NAMESERVICES = "dfs.nameservices";
+   public static final String  DFS_NAMESERVICE_ID = "dfs.nameservice.id";
+   public static final String  DFS_INTERNAL_NAMESERVICES_KEY = "dfs.internal.nameservices";
+@@ -647,7 +651,7 @@
+   public static final String  DFS_WEB_AUTHENTICATION_KERBEROS_KEYTAB_KEY = "dfs.web.authentication.kerberos.keytab";
+   public static final String  DFS_NAMENODE_MAX_OP_SIZE_KEY = "dfs.namenode.max.op.size";
+   public static final int     DFS_NAMENODE_MAX_OP_SIZE_DEFAULT = 50 * 1024 * 1024;
+-  
++
+   public static final String DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY = "dfs.block.local-path-access.user";
+   public static final String DFS_DOMAIN_SOCKET_PATH_KEY = "dfs.domain.socket.path";
+   public static final String DFS_DOMAIN_SOCKET_PATH_DEFAULT = "";
+@@ -768,7 +772,7 @@
+   public static final int     DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_BASE_DEFAULT = 500;
+   public static final String  DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_MAX_KEY = "dfs.http.client.failover.sleep.max.millis";
+   public static final int     DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_MAX_DEFAULT = 15000;
+-  
++
+   // Handling unresolved DN topology mapping
+   public static final String  DFS_REJECT_UNRESOLVED_DN_TOPOLOGY_MAPPING_KEY = 
+       "dfs.namenode.reject-unresolved-dn-topology-mapping";
+@@ -835,7 +839,7 @@
+ 
+   static final String REPLICA_ACCESSOR_BUILDER_CLASSES_KEY =
+       "dfs.client.replica.accessor.builder.classes";
+-  public static final String DFS_DATANODE_BLOCK_PINNING_ENABLED = 
++  public static final String DFS_DATANODE_BLOCK_PINNING_ENABLED =
+     "dfs.datanode.block-pinning.enabled";
+   public static final boolean DFS_DATANODE_BLOCK_PINNING_ENABLED_DEFAULT =
+     false;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+index f645c96..0c82149 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.namenode.FileChecksumServlets;
+ import org.apache.hadoop.hdfs.server.namenode.StreamFile;
++import org.apache.hadoop.hdfs.server.datanode.web.webhdfs.DataNodeUGIProvider;
+ import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.http.HttpServer2;
+ import org.apache.hadoop.net.NetUtils;
+@@ -72,7 +73,6 @@
+   private final Configuration confForCreate;
+   private InetSocketAddress httpAddress;
+   private InetSocketAddress httpsAddress;
+-
+   static final Log LOG = LogFactory.getLog(DatanodeHttpServer.class);
+ 
+   public DatanodeHttpServer(final Configuration conf,
+@@ -101,7 +101,7 @@ public DatanodeHttpServer(final Configuration conf,
+     this.infoServer.setAttribute(JspHelper.CURRENT_CONF, conf);
+     this.infoServer.addServlet(null, "/blockScannerReport",
+                                BlockScanner.Servlet.class);
+-
++    DataNodeUGIProvider.init(conf);
+     this.infoServer.start();
+     final InetSocketAddress jettyAddr = infoServer.getConnectorAddress(0);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+index ea1c29f..233ba69 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+@@ -13,50 +13,103 @@
+  */
+ package org.apache.hadoop.hdfs.server.datanode.web.webhdfs;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+ import org.apache.hadoop.hdfs.server.common.JspHelper;
++import org.apache.hadoop.ipc.Client;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+ 
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.cache.Cache;
++import com.google.common.cache.CacheBuilder;
++
+ import java.io.ByteArrayInputStream;
+ import java.io.DataInputStream;
+ import java.io.IOException;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * Create UGI from the request for the WebHDFS requests for the DNs. Note that
+  * the DN does not authenticate the UGI -- the NN will authenticate them in
+  * subsequent operations.
+  */
+-class DataNodeUGIProvider {
++public class DataNodeUGIProvider {
+   private final ParameterParser params;
++  @VisibleForTesting
++  static Cache<String, UserGroupInformation> ugiCache;
++  public static final Log LOG = LogFactory.getLog(Client.class);
+ 
+   DataNodeUGIProvider(ParameterParser params) {
+     this.params = params;
+   }
+ 
+-  UserGroupInformation ugi() throws IOException {
+-    if (UserGroupInformation.isSecurityEnabled()) {
+-      return tokenUGI();
++  public static synchronized void init(Configuration conf) {
++    if (ugiCache == null) {
++      ugiCache = CacheBuilder
++          .newBuilder()
++          .expireAfterAccess(
++              conf.getInt(
++                  DFSConfigKeys.DFS_WEBHDFS_UGI_EXPIRE_AFTER_ACCESS_KEY,
++                  DFSConfigKeys.DFS_WEBHDFS_UGI_EXPIRE_AFTER_ACCESS_DEFAULT),
++              TimeUnit.MILLISECONDS).build();
+     }
++  }
+ 
+-    final String usernameFromQuery = params.userName();
+-    final String doAsUserFromQuery = params.doAsUser();
+-    final String remoteUser = usernameFromQuery == null
+-        ? JspHelper.getDefaultWebUserName(params.conf()) // not specified in
+-        // request
+-        : usernameFromQuery;
++  UserGroupInformation ugi() throws IOException {
++    UserGroupInformation ugi;
+ 
+-    UserGroupInformation ugi = UserGroupInformation.createRemoteUser(remoteUser);
+-    JspHelper.checkUsername(ugi.getShortUserName(), usernameFromQuery);
+-    if (doAsUserFromQuery != null) {
+-      // create and attempt to authorize a proxy user
+-      ugi = UserGroupInformation.createProxyUser(doAsUserFromQuery, ugi);
++    try {
++      if (UserGroupInformation.isSecurityEnabled()) {
++        final Token<DelegationTokenIdentifier> token = params.delegationToken();
++
++        ugi = ugiCache.get(buildTokenCacheKey(token),
++            new Callable<UserGroupInformation>() {
++              @Override
++              public UserGroupInformation call() throws Exception {
++                return tokenUGI(token);
++              }
++            });
++      } else {
++        final String usernameFromQuery = params.userName();
++        final String doAsUserFromQuery = params.doAsUser();
++        final String remoteUser = usernameFromQuery == null ? JspHelper
++            .getDefaultWebUserName(params.conf()) // not specified in request
++            : usernameFromQuery;
++
++        ugi = ugiCache.get(
++            buildNonTokenCacheKey(doAsUserFromQuery, remoteUser),
++            new Callable<UserGroupInformation>() {
++              @Override
++              public UserGroupInformation call() throws Exception {
++                return nonTokenUGI(usernameFromQuery, doAsUserFromQuery,
++                    remoteUser);
++              }
++            });
++      }
++    } catch (ExecutionException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof IOException) {
++        throw (IOException) cause;
++      } else {
++        throw new IOException(cause);
++      }
+     }
++
+     return ugi;
+   }
+ 
+-  private UserGroupInformation tokenUGI() throws IOException {
+-    Token<DelegationTokenIdentifier> token = params.delegationToken();
++  private String buildTokenCacheKey(Token<DelegationTokenIdentifier> token) {
++    return token.buildCacheKey();
++  }
++
++  private UserGroupInformation tokenUGI(Token<DelegationTokenIdentifier> token)
++      throws IOException {
+     ByteArrayInputStream buf =
+       new ByteArrayInputStream(token.getIdentifier());
+     DataInputStream in = new DataInputStream(buf);
+@@ -67,4 +120,23 @@ private UserGroupInformation tokenUGI() throws IOException {
+     return ugi;
+   }
+ 
++  private String buildNonTokenCacheKey(String doAsUserFromQuery,
++      String remoteUser) throws IOException {
++    String key = doAsUserFromQuery == null ? String.format("{%s}", remoteUser)
++        : String.format("{%s}:{%s}", remoteUser, doAsUserFromQuery);
++    return key;
++  }
++
++  private UserGroupInformation nonTokenUGI(String usernameFromQuery,
++      String doAsUserFromQuery, String remoteUser) throws IOException {
++
++    UserGroupInformation ugi = UserGroupInformation
++        .createRemoteUser(remoteUser);
++    JspHelper.checkUsername(ugi.getShortUserName(), usernameFromQuery);
++    if (doAsUserFromQuery != null) {
++      // create and attempt to authorize a proxy user
++      ugi = UserGroupInformation.createProxyUser(doAsUserFromQuery, ugi);
++    }
++    return ugi;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index fca52c4..c3ffa5d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2357,6 +2357,14 @@
+ </property>
+ 
+ <property>
++    <name>dfs.webhdfs.ugi.expire.after.access</name>
++    <value>600000</value>
++    <description>How long in milliseconds after the last access
++      the cached UGI will expire. With 0, never expire.
++    </description>
++</property>
++
++<property>
+   <name>dfs.namenode.blocks.per.postponedblocks.rescan</name>
+   <value>10000</value>
+   <description>Number of blocks to rescan for each iteration of
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+new file mode 100644
+index 0000000..ad7eb09
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+@@ -0,0 +1,235 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hdfs.server.datanode.web.webhdfs;
++
++import static org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod.KERBEROS;
++import static org.mockito.Mockito.mock;
++import io.netty.handler.codec.http.QueryStringDecoder;
++
++import java.io.IOException;
++import java.net.URI;
++import java.util.List;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
++import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager;
++import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
++import org.apache.hadoop.hdfs.web.SWebHdfsFileSystem;
++import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
++import org.apache.hadoop.hdfs.web.WebHdfsTestUtil;
++import org.apache.hadoop.hdfs.web.resources.DelegationParam;
++import org.apache.hadoop.hdfs.web.resources.LengthParam;
++import org.apache.hadoop.hdfs.web.resources.NamenodeAddressParam;
++import org.apache.hadoop.hdfs.web.resources.OffsetParam;
++import org.apache.hadoop.hdfs.web.resources.Param;
++import org.apache.hadoop.hdfs.web.resources.UserParam;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.test.GenericTestUtils;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++import com.google.common.base.Supplier;
++import com.google.common.collect.Lists;
++
++public class TestDataNodeUGIProvider {
++  private final URI uri = URI.create(SWebHdfsFileSystem.SCHEME + "://"
++      + "127.0.0.1:0");
++  private final String PATH = "/foo";
++  private final int OFFSET = 42;
++  private final int LENGTH = 512;
++  private final static int EXPIRE_AFTER_ACCESS = 5*1000;
++  private Configuration conf;
++  @Before
++  public void setUp(){
++    conf = WebHdfsTestUtil.createConf();
++    conf.setInt(DFSConfigKeys.DFS_WEBHDFS_UGI_EXPIRE_AFTER_ACCESS_KEY,
++        EXPIRE_AFTER_ACCESS);
++    DataNodeUGIProvider.init(conf);
++  }
++
++  @Test
++  public void testUGICacheSecure() throws Exception {
++    // fake turning on security so api thinks it should use tokens
++    SecurityUtil.setAuthenticationMethod(KERBEROS, conf);
++    UserGroupInformation.setConfiguration(conf);
++
++    UserGroupInformation ugi = UserGroupInformation
++        .createRemoteUser("test-user");
++    ugi.setAuthenticationMethod(KERBEROS);
++    ugi = UserGroupInformation.createProxyUser("test-proxy-user", ugi);
++    UserGroupInformation.setLoginUser(ugi);
++
++    List<Token<DelegationTokenIdentifier>> tokens = Lists.newArrayList();
++    getWebHdfsFileSystem(ugi, conf, tokens);
++
++    String uri1 = WebHdfsFileSystem.PATH_PREFIX
++        + PATH
++        + "?op=OPEN"
++        + Param.toSortedString("&", new NamenodeAddressParam("127.0.0.1:1010"),
++            new OffsetParam((long) OFFSET), new LengthParam((long) LENGTH),
++            new DelegationParam(tokens.get(0).encodeToUrlString()));
++
++    String uri2 = WebHdfsFileSystem.PATH_PREFIX
++        + PATH
++        + "?op=OPEN"
++        + Param.toSortedString("&", new NamenodeAddressParam("127.0.0.1:1010"),
++            new OffsetParam((long) OFFSET), new LengthParam((long) LENGTH),
++            new DelegationParam(tokens.get(1).encodeToUrlString()));
++
++    DataNodeUGIProvider ugiProvider1 = new DataNodeUGIProvider(
++        new ParameterParser(new QueryStringDecoder(URI.create(uri1)), conf));
++    UserGroupInformation ugi11 = ugiProvider1.ugi();
++    UserGroupInformation ugi12 = ugiProvider1.ugi();
++
++    Assert.assertEquals(
++        "With UGI cache, two UGIs returned by the same token should be same",
++        ugi11, ugi12);
++
++    DataNodeUGIProvider ugiProvider2 = new DataNodeUGIProvider(
++        new ParameterParser(new QueryStringDecoder(URI.create(uri2)), conf));
++    UserGroupInformation url21 = ugiProvider2.ugi();
++    UserGroupInformation url22 = ugiProvider2.ugi();
++
++    Assert.assertEquals(
++        "With UGI cache, two UGIs returned by the same token should be same",
++        url21, url22);
++
++    Assert.assertNotEquals(
++        "With UGI cache, two UGIs for the different token should not be same",
++        ugi11, url22);
++
++    awaitCacheEmptyDueToExpiration();
++    ugi12 = ugiProvider1.ugi();
++    url22 = ugiProvider2.ugi();
++
++    String msg = "With cache eviction, two UGIs returned" +
++    " by the same token should not be same";
++    Assert.assertNotEquals(msg, ugi11, ugi12);
++    Assert.assertNotEquals(msg, url21, url22);
++
++    Assert.assertNotEquals(
++        "With UGI cache, two UGIs for the different token should not be same",
++        ugi11, url22);
++  }
++
++  @Test
++  public void testUGICacheInSecure() throws Exception {
++    String uri1 = WebHdfsFileSystem.PATH_PREFIX
++        + PATH
++        + "?op=OPEN"
++        + Param.toSortedString("&", new OffsetParam((long) OFFSET),
++            new LengthParam((long) LENGTH), new UserParam("root"));
++
++    String uri2 = WebHdfsFileSystem.PATH_PREFIX
++        + PATH
++        + "?op=OPEN"
++        + Param.toSortedString("&", new OffsetParam((long) OFFSET),
++            new LengthParam((long) LENGTH), new UserParam("hdfs"));
++
++    DataNodeUGIProvider ugiProvider1 = new DataNodeUGIProvider(
++        new ParameterParser(new QueryStringDecoder(URI.create(uri1)), conf));
++    UserGroupInformation ugi11 = ugiProvider1.ugi();
++    UserGroupInformation ugi12 = ugiProvider1.ugi();
++
++    Assert.assertEquals(
++        "With UGI cache, two UGIs for the same user should be same", ugi11,
++        ugi12);
++
++    DataNodeUGIProvider ugiProvider2 = new DataNodeUGIProvider(
++        new ParameterParser(new QueryStringDecoder(URI.create(uri2)), conf));
++    UserGroupInformation url21 = ugiProvider2.ugi();
++    UserGroupInformation url22 = ugiProvider2.ugi();
++
++    Assert.assertEquals(
++        "With UGI cache, two UGIs for the same user should be same", url21,
++        url22);
++
++    Assert.assertNotEquals(
++        "With UGI cache, two UGIs for the different user should not be same",
++        ugi11, url22);
++
++    awaitCacheEmptyDueToExpiration();
++    ugi12 = ugiProvider1.ugi();
++    url22 = ugiProvider2.ugi();
++
++    String msg = "With cache eviction, two UGIs returned by" +
++    " the same user should not be same";
++    Assert.assertNotEquals(msg, ugi11, ugi12);
++    Assert.assertNotEquals(msg, url21, url22);
++
++    Assert.assertNotEquals(
++        "With UGI cache, two UGIs for the different user should not be same",
++        ugi11, url22);
++  }
++
++  /**
++   * Wait for expiration of entries from the UGI cache.  We need to be careful
++   * not to touch the entries in the cache while we're waiting for expiration.
++   * If we did, then that would reset the clock on expiration for those entries.
++   * Instead, we trigger internal clean-up of the cache and check for size 0.
++   *
++   * @throws Exception if there is any error
++   */
++  private void awaitCacheEmptyDueToExpiration() throws Exception {
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++        @Override
++        public Boolean get() {
++          DataNodeUGIProvider.ugiCache.cleanUp();
++          return DataNodeUGIProvider.ugiCache.size() == 0;
++        }
++      }, EXPIRE_AFTER_ACCESS, 10 * EXPIRE_AFTER_ACCESS);
++  }
++
++  private WebHdfsFileSystem getWebHdfsFileSystem(UserGroupInformation ugi,
++      Configuration conf, List<Token<DelegationTokenIdentifier>> tokens)
++      throws IOException {
++    if (UserGroupInformation.isSecurityEnabled()) {
++      DelegationTokenIdentifier dtId = new DelegationTokenIdentifier(new Text(
++          ugi.getUserName()), null, null);
++      FSNamesystem namesystem = mock(FSNamesystem.class);
++      DelegationTokenSecretManager dtSecretManager = new DelegationTokenSecretManager(
++          86400000, 86400000, 86400000, 86400000, namesystem);
++      dtSecretManager.startThreads();
++      Token<DelegationTokenIdentifier> token1 = new Token<DelegationTokenIdentifier>(
++          dtId, dtSecretManager);
++      Token<DelegationTokenIdentifier> token2 = new Token<DelegationTokenIdentifier>(
++          dtId, dtSecretManager);
++      SecurityUtil.setTokenService(token1,
++          NetUtils.createSocketAddr(uri.getAuthority()));
++      SecurityUtil.setTokenService(token2,
++          NetUtils.createSocketAddr(uri.getAuthority()));
++      token1.setKind(SWebHdfsFileSystem.TOKEN_KIND);
++      token2.setKind(SWebHdfsFileSystem.TOKEN_KIND);
++
++      tokens.add(token1);
++      tokens.add(token2);
++
++      ugi.addToken(token1);
++      ugi.addToken(token2);
++    }
++    return (WebHdfsFileSystem) FileSystem.get(uri, conf);
++  }
++}
+-- 
+1.7.9.5
+

@@ -1,0 +1,157 @@
+From 37362a1215682ade6ef156e03524eade542acee3 Mon Sep 17 00:00:00 2001
+From: Brahma Reddy Battula <brahma@apache.org>
+Date: Tue, 16 Jan 2018 16:13:19 +0530
+Subject: [PATCH 2771/2848] HDFS-8693. refreshNamenodes does not support
+ adding a new standby to a running DN. Contributed
+ by Ajith S.
+
+(cherry picked from commit 880b9d24ff7b5f350ec99bac9b0862009460b486)
+(cherry picked from commit 8e7ce0eb4c27dbdd63d02fda0295ba92d5df7f0d)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
+
+Change-Id: I1ee6c48ac2ebf61a1b3206625a8b3602d93e7e52
+---
+ .../hdfs/server/datanode/BPOfferService.java       |   23 ++++--
+ .../hdfs/server/datanode/TestBPOfferService.java   |   77 +++++++++++++++++++-
+ 2 files changed, 92 insertions(+), 8 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+index 7d87874..c0d8cc6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+@@ -135,11 +135,24 @@ void refreshNNList(ArrayList<InetSocketAddress> addrs) throws IOException {
+     }
+     Set<InetSocketAddress> newAddrs = Sets.newHashSet(addrs);
+     
+-    if (!Sets.symmetricDifference(oldAddrs, newAddrs).isEmpty()) {
+-      // Keep things simple for now -- we can implement this at a later date.
+-      throw new IOException(
+-          "HA does not currently support adding a new standby to a running DN. " +
+-          "Please do a rolling restart of DNs to reconfigure the list of NNs.");
++    // Process added NNs
++    Set<InetSocketAddress> addedNNs = Sets.difference(newAddrs, oldAddrs);
++    for (InetSocketAddress addedNN : addedNNs) {
++      BPServiceActor actor = new BPServiceActor(addedNN, this);
++      actor.start();
++      bpServices.add(actor);
++    }
++
++    // Process removed NNs
++    Set<InetSocketAddress> removedNNs = Sets.difference(oldAddrs, newAddrs);
++    for (InetSocketAddress removedNN : removedNNs) {
++      for (BPServiceActor actor : bpServices) {
++        if (actor.getNNSocketAddress().equals(removedNN)) {
++          actor.stop();
++          shutdownActor(actor);
++          break;
++        }
++      }
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
+index 90701e1..180c7af 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBPOfferService.java
+@@ -26,6 +26,7 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ThreadLocalRandom;
+@@ -96,10 +97,10 @@
+   private DatanodeProtocolClientSideTranslatorPB mockNN1;
+   private DatanodeProtocolClientSideTranslatorPB mockNN2;
+   private final NNHAStatusHeartbeat[] mockHaStatuses =
+-      new NNHAStatusHeartbeat[2];
++      new NNHAStatusHeartbeat[3];
+   private final DatanodeCommand[][] datanodeCommands =
+-      new DatanodeCommand[2][0];
+-  private final int[] heartbeatCounts = new int[2];
++      new DatanodeCommand[3][0];
++  private final int[] heartbeatCounts = new int[3];
+   private DataNode mockDn;
+   private FsDatasetSpi<?> mockFSDataset;
+   
+@@ -827,4 +828,74 @@ private int getStandbyIBRSize(BPOfferService bpos) {
+     }
+     return -1;
+   }
++
++  @Test
++  public void testRefreshNameNodes() throws Exception {
++
++    BPOfferService bpos = setupBPOSForNNs(mockDn, mockNN1, mockNN2);
++
++    bpos.start();
++    try {
++      waitForBothActors(bpos);
++
++      // The DN should have register to both NNs.
++      Mockito.verify(mockNN1)
++          .registerDatanode(Mockito.any(DatanodeRegistration.class));
++      Mockito.verify(mockNN2)
++          .registerDatanode(Mockito.any(DatanodeRegistration.class));
++
++      // Should get block reports from both NNs
++      waitForBlockReport(mockNN1);
++      waitForBlockReport(mockNN2);
++
++      // When we receive a block, it should report it to both NNs
++      bpos.notifyNamenodeReceivedBlock(FAKE_BLOCK, null, "", false);
++
++      ReceivedDeletedBlockInfo[] ret = waitForBlockReceived(FAKE_BLOCK,
++          mockNN1);
++      assertEquals(1, ret.length);
++      assertEquals(FAKE_BLOCK.getLocalBlock(), ret[0].getBlock());
++
++      ret = waitForBlockReceived(FAKE_BLOCK, mockNN2);
++      assertEquals(1, ret.length);
++      assertEquals(FAKE_BLOCK.getLocalBlock(), ret[0].getBlock());
++
++      // add new standby
++      DatanodeProtocolClientSideTranslatorPB mockNN3 = setupNNMock(2);
++      Mockito.doReturn(mockNN3).when(mockDn)
++          .connectToNN(Mockito.eq(new InetSocketAddress(2)));
++
++      ArrayList<InetSocketAddress> addrs = new ArrayList<>();
++      ArrayList<InetSocketAddress> lifelineAddrs = new ArrayList<>(
++          addrs.size());
++      // mockNN1
++      addrs.add(new InetSocketAddress(0));
++      lifelineAddrs.add(null);
++      // mockNN3
++      addrs.add(new InetSocketAddress(2));
++      lifelineAddrs.add(null);
++
++      bpos.refreshNNList(addrs);
++
++      assertEquals(2, bpos.getBPServiceActors().size());
++      // wait for handshake to run
++      Thread.sleep(1000);
++
++      // verify new NN registered
++      Mockito.verify(mockNN3)
++          .registerDatanode(Mockito.any(DatanodeRegistration.class));
++
++      // When we receive a block, it should report it to both NNs
++      bpos.notifyNamenodeReceivedBlock(FAKE_BLOCK, null, "", false);
++
++      // veridfy new NN recieved block report
++      ret = waitForBlockReceived(FAKE_BLOCK, mockNN3);
++      assertEquals(1, ret.length);
++      assertEquals(FAKE_BLOCK.getLocalBlock(), ret[0].getBlock());
++
++    } finally {
++      bpos.stop();
++      bpos.join();
++    }
++  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,247 @@
+From 1a7df77c666f488d160b3ca6769b0f22ab828c78 Mon Sep 17 00:00:00 2001
+From: Yongjun Zhang <yzhang@cloudera.com>
+Date: Tue, 21 Feb 2017 21:37:19 -0800
+Subject: [PATCH 2289/2848] HDFS-10966. Enhance Dispatcher logic on deciding
+ when to give up a source DataNode. Contributed by
+ Mark Wagner and Zhe Zhang.
+
+(cherry picked from commit 01ad9dee087cab5d1c472d4896c22f7de5098a9e)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+
+Change-Id: Ie80c4358b30f827981e53e1f205fb6a12b7277ee
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    4 +++
+ .../hadoop/hdfs/server/balancer/Balancer.java      |    9 +++--
+ .../hadoop/hdfs/server/balancer/Dispatcher.java    |   35 ++++++++++++--------
+ .../org/apache/hadoop/hdfs/server/mover/Mover.java |    5 ++-
+ .../src/main/resources/hdfs-default.xml            |   20 +++++++++++
+ .../hadoop/hdfs/server/balancer/TestBalancer.java  |    2 ++
+ 6 files changed, 58 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index ef7ea4e..760ccae 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -475,6 +475,8 @@
+   public static final String  DFS_BALANCER_KERBEROS_PRINCIPAL_KEY = "dfs.balancer.kerberos.principal";
+   public static final String  DFS_BALANCER_BLOCK_MOVE_TIMEOUT = "dfs.balancer.block-move.timeout";
+   public static final int     DFS_BALANCER_BLOCK_MOVE_TIMEOUT_DEFAULT = 0;
++  public static final String  DFS_BALANCER_MAX_NO_MOVE_INTERVAL_KEY = "dfs.balancer.max-no-move-interval";
++  public static final int    DFS_BALANCER_MAX_NO_MOVE_INTERVAL_DEFAULT = 60*1000; // One minute
+ 
+   public static final String  DFS_MOVER_MOVEDWINWIDTH_KEY = "dfs.mover.movedWinWidth";
+   public static final long    DFS_MOVER_MOVEDWINWIDTH_DEFAULT = 5400*1000L;
+@@ -482,6 +484,8 @@
+   public static final int     DFS_MOVER_MOVERTHREADS_DEFAULT = 1000;
+   public static final String  DFS_MOVER_RETRY_MAX_ATTEMPTS_KEY = "dfs.mover.retry.max.attempts";
+   public static final int     DFS_MOVER_RETRY_MAX_ATTEMPTS_DEFAULT = 10;
++  public static final String  DFS_MOVER_MAX_NO_MOVE_INTERVAL_KEY = "dfs.mover.max-no-move-interval";
++  public static final int    DFS_MOVER_MAX_NO_MOVE_INTERVAL_DEFAULT = 60*1000; // One minute
+ 
+   public static final String  DFS_DATANODE_ADDRESS_KEY = "dfs.datanode.address";
+   public static final int     DFS_DATANODE_DEFAULT_PORT = 50010;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+index 0496fca..1b0e6ab 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Balancer.java
+@@ -261,12 +261,15 @@ static int getInt(Configuration conf, String key, int defaultValue) {
+         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_KEY,
+         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_DEFAULT);
+     final int blockMoveTimeout = conf.getInt(
+-            DFSConfigKeys.DFS_BALANCER_BLOCK_MOVE_TIMEOUT,
+-            DFSConfigKeys.DFS_BALANCER_BLOCK_MOVE_TIMEOUT_DEFAULT);
++        DFSConfigKeys.DFS_BALANCER_BLOCK_MOVE_TIMEOUT,
++        DFSConfigKeys.DFS_BALANCER_BLOCK_MOVE_TIMEOUT_DEFAULT);
++    final int maxNoMoveInterval = conf.getInt(
++        DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_KEY,
++        DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_DEFAULT);
+     this.nnc = theblockpool;
+     this.dispatcher = new Dispatcher(theblockpool, p.includedNodes,
+         p.excludedNodes, movedWinWidth, moverThreads, dispatcherThreads,
+-        maxConcurrentMovesPerNode, blockMoveTimeout, conf);
++        maxConcurrentMovesPerNode, blockMoveTimeout, maxNoMoveInterval, conf);
+ 
+     this.threshold = p.threshold;
+     this.policy = p.policy;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+index 82516a6..17c5a63 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+@@ -120,6 +120,11 @@
+ 
+   private final boolean connectToDnViaHostname;
+   private final long blockMoveTimeout;
++  /**
++   * If no block can be moved out of a {@link Source} after this configured
++   * amount of time, the Source should give up choosing the next possible move.
++   */
++  private final int maxNoMoveInterval;
+ 
+   private static class GlobalBlockMap {
+     private final Map<Block, DBlock> map = new HashMap<Block, DBlock>();
+@@ -759,7 +764,7 @@ private boolean shouldFetchMoreBlocks() {
+      */
+     private void dispatchBlocks() {
+       this.blocksToReceive = 2 * getScheduledSize();
+-      int noPendingMoveIteration = 0;
++      long previousMoveTimestamp = Time.monotonicNow();
+       while (getScheduledSize() > 0 && !isIterationOver()
+           && (!srcBlocks.isEmpty() || blocksToReceive > 0)) {
+         if (LOG.isTraceEnabled()) {
+@@ -769,8 +774,8 @@ private void dispatchBlocks() {
+         }
+        final PendingMove p = chooseNextMove();
+         if (p != null) {
+-          // Reset no pending move counter
+-          noPendingMoveIteration=0;
++          // Reset previous move timestamp
++          previousMoveTimestamp = Time.monotonicNow();
+           executePendingMove(p);
+           continue;
+         }
+@@ -793,13 +798,11 @@ private void dispatchBlocks() {
+             return;
+           }
+         } else {
+-          // source node cannot find a pending block to move, iteration +1
+-          noPendingMoveIteration++;
+-          // in case no blocks can be moved for source node's task,
+-          // jump out of while-loop after 5 iterations.
+-          if (noPendingMoveIteration >= MAX_NO_PENDING_MOVE_ITERATIONS) {
+-            LOG.info("Failed to find a pending move "  + noPendingMoveIteration
+-                + " times.  Skipping " + this);
++          // jump out of while-loop after the configured timeout.
++          long noMoveInterval = Time.monotonicNow() - previousMoveTimestamp;
++          if (noMoveInterval > maxNoMoveInterval) {
++            LOG.info("Failed to find a pending move for "  + noMoveInterval
++                + " ms.  Skipping " + this);
+             resetScheduledSize();
+           }
+         }
+@@ -810,6 +813,9 @@ private void dispatchBlocks() {
+           synchronized (Dispatcher.this) {
+             Dispatcher.this.wait(1000); // wait for targets/sources to be idle
+           }
++          // Didn't find a possible move in this iteration of the while loop,
++          // adding a small delay before choosing next move again.
++          Thread.sleep(100);
+         } catch (InterruptedException ignored) {
+         }
+       }
+@@ -833,15 +839,17 @@ public boolean equals(Object obj) {
+ 
+   public Dispatcher(NameNodeConnector nnc, Set<String> includedNodes,
+       Set<String> excludedNodes, long movedWinWidth, int moverThreads,
+-      int dispatcherThreads, int maxConcurrentMovesPerNode, Configuration conf) {
++      int dispatcherThreads, int maxConcurrentMovesPerNode,
++      int maxNoMoveInterval, Configuration conf) {
+     this(nnc, includedNodes, excludedNodes, movedWinWidth,
+-        moverThreads, dispatcherThreads, maxConcurrentMovesPerNode, 0,  conf);
++        moverThreads, dispatcherThreads, maxConcurrentMovesPerNode,
++        0, maxNoMoveInterval, conf);
+   }
+ 
+   Dispatcher(NameNodeConnector nnc, Set<String> includedNodes,
+       Set<String> excludedNodes, long movedWinWidth, int moverThreads,
+       int dispatcherThreads, int maxConcurrentMovesPerNode,
+-      int blockMoveTimeout, Configuration conf) {
++      int blockMoveTimeout, int maxNoMoveInterval, Configuration conf) {
+     this.nnc = nnc;
+     this.excludedNodes = excludedNodes;
+     this.includedNodes = includedNodes;
+@@ -854,6 +862,7 @@ public Dispatcher(NameNodeConnector nnc, Set<String> includedNodes,
+         : Executors.newFixedThreadPool(dispatcherThreads);
+     this.maxConcurrentMovesPerNode = maxConcurrentMovesPerNode;
+     this.blockMoveTimeout = blockMoveTimeout;
++    this.maxNoMoveInterval = maxNoMoveInterval;
+ 
+     this.saslClient = new SaslDataTransferClient(conf,
+         DataTransferSaslUtil.getSaslPropertiesResolver(conf),
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+index 9748ab7..ee78c25 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/mover/Mover.java
+@@ -118,13 +118,16 @@ private StorageGroup getTarget(String uuid, StorageType storageType) {
+     final int maxConcurrentMovesPerNode = conf.getInt(
+         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_KEY,
+         DFSConfigKeys.DFS_DATANODE_BALANCE_MAX_NUM_CONCURRENT_MOVES_DEFAULT);
++    final int maxNoMoveInterval = conf.getInt(
++        DFSConfigKeys.DFS_MOVER_MAX_NO_MOVE_INTERVAL_KEY,
++        DFSConfigKeys.DFS_MOVER_MAX_NO_MOVE_INTERVAL_DEFAULT);
+     this.retryMaxAttempts = conf.getInt(
+         DFSConfigKeys.DFS_MOVER_RETRY_MAX_ATTEMPTS_KEY,
+         DFSConfigKeys.DFS_MOVER_RETRY_MAX_ATTEMPTS_DEFAULT);
+     this.retryCount = retryCount;
+     this.dispatcher = new Dispatcher(nnc, Collections.<String> emptySet(),
+         Collections.<String> emptySet(), movedWinWidth, moverThreads, 0,
+-        maxConcurrentMovesPerNode, conf);
++        maxConcurrentMovesPerNode, maxNoMoveInterval, conf);
+     this.storages = new StorageMap();
+     this.targetPaths = nnc.getTargetPaths();
+     this.blockStoragePolicies = new BlockStoragePolicy[1 <<
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index feba52a..32eafc2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -747,6 +747,16 @@
+   </description>
+ </property>
+ 
++ <property>
++  <name>dfs.mover.max-no-move-interval</name>
++  <value>60000</value>
++  <description>
++    If this specified amount of time has elapsed and no block has been moved
++    out of a source DataNode, on more effort will be made to move blocks out of
++    this DataNode in the current Mover iteration.
++  </description>
++</property>
++
+ <property>
+   <name>dfs.hosts</name>
+   <value></value>
+@@ -2590,6 +2600,16 @@
+     </description>
+   </property>
+ 
++<property>
++  <name>dfs.balancer.max-no-move-interval</name>
++  <value>60000</value>
++  <description>
++    If this specified amount of time has elapsed and no block has been moved
++    out of a source DataNode, on more effort will be made to move blocks out of
++    this DataNode in the current Balancer iteration.
++  </description>
++</property>
++
+   <property>
+     <name>dfs.disk.balancer.plan.threshold.percent</name>
+     <value>10</value>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+index 12868d6..88df718 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+@@ -138,6 +138,7 @@ static void initConf(Configuration conf) {
+     conf.setLong(DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_KEY, 1L);
+     SimulatedFSDataset.setFactory(conf);
+     conf.setLong(DFSConfigKeys.DFS_BALANCER_MOVEDWINWIDTH_KEY, 2000L);
++    conf.setInt(DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_KEY, 5*1000);
+   }
+ 
+   static void initConfWithRamDisk(Configuration conf) {
+@@ -147,6 +148,7 @@ static void initConfWithRamDisk(Configuration conf) {
+     conf.setInt(DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 500);
+     conf.setInt(DFS_DATANODE_LAZY_WRITER_INTERVAL_SEC, 1);
+     conf.setInt(DFS_DATANODE_RAM_DISK_LOW_WATERMARK_BYTES, DEFAULT_RAM_DISK_BLOCK_SIZE);
++    conf.setInt(DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_KEY, 5*1000);
+   }
+ 
+   static void initSecureConf(Configuration conf) throws Exception {
+-- 
+1.7.9.5
+

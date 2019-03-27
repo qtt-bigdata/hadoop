@@ -1,0 +1,131 @@
+From 12454e23784fc9b7940acb45fb051bbd4bfe9026 Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Fri, 25 Aug 2017 10:41:52 -0700
+Subject: [PATCH 2682/2848] HDFS-12319. DirectoryScanner will throw
+ IllegalStateException when Multiple BP's are
+ present. Contributed by Brahma Reddy Battula.
+
+(cherry picked from commit 22fb9bb843b870900022b35c8a9f6f1bc781c8a0)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+
+Change-Id: I8ab85a2fde439bafc7e005b0bd78134acefc7c91
+---
+ .../hdfs/server/datanode/DirectoryScanner.java     |    5 +-
+ .../hdfs/server/datanode/TestDirectoryScanner.java |   62 ++++++++++++++++++--
+ 2 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DirectoryScanner.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DirectoryScanner.java
+index 0bda256..5fad4c9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DirectoryScanner.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DirectoryScanner.java
+@@ -805,13 +805,12 @@ public ReportCompiler(DataNode datanode, FsVolumeSpi volume) {
+     public ScanInfoPerBlockPool call() throws IOException {
+       String[] bpList = volume.getBlockPoolList();
+       ScanInfoPerBlockPool result = new ScanInfoPerBlockPool(bpList.length);
++      perfTimer.start();
++      throttleTimer.start();
+       for (String bpid : bpList) {
+         LinkedList<ScanInfo> report = new LinkedList<>();
+         File bpFinalizedDir = volume.getFinalizedDir(bpid);
+ 
+-        perfTimer.start();
+-        throttleTimer.start();
+-
+         try {
+           result.put(bpid,
+               compileReport(volume, bpFinalizedDir, bpFinalizedDir, report));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+index b6f906e..b5038e7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+@@ -45,6 +45,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.*;
++import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.server.common.GenerationStamp;
+@@ -289,15 +290,22 @@ private void scan(long totalBlocks, int diffsize, long missingMetaFile, long mis
+          missingMemoryBlocks, mismatchBlocks, 0);
+   }
+ 
+-    private void scan(long totalBlocks, int diffsize, long missingMetaFile, long missingBlockFile,
+-      long missingMemoryBlocks, long mismatchBlocks, long duplicateBlocks) throws IOException {
++  private void scan(long totalBlocks, int diffsize, long missingMetaFile,
++      long missingBlockFile, long missingMemoryBlocks, long mismatchBlocks,
++      long duplicateBlocks) throws IOException {
+     scanner.reconcile();
+-    
++    verifyStats(totalBlocks, diffsize, missingMetaFile, missingBlockFile,
++        missingMemoryBlocks, mismatchBlocks, duplicateBlocks);
++  }
++
++  private void verifyStats(long totalBlocks, int diffsize, long missingMetaFile,
++      long missingBlockFile, long missingMemoryBlocks, long mismatchBlocks,
++      long duplicateBlocks) {
+     assertTrue(scanner.diffs.containsKey(bpid));
+     LinkedList<DirectoryScanner.ScanInfo> diff = scanner.diffs.get(bpid);
+     assertTrue(scanner.stats.containsKey(bpid));
+     DirectoryScanner.Stats stats = scanner.stats.get(bpid);
+-    
++
+     assertEquals(diffsize, diff.size());
+     assertEquals(totalBlocks, stats.totalBlocks);
+     assertEquals(missingMetaFile, stats.missingMetaFile);
+@@ -923,4 +931,50 @@ public void TestScanInfo() throws Exception {
+         new File(TEST_VOLUME.getFinalizedDir(BPID_2).getAbsolutePath(),
+             "blk_567__1004.meta"));
+   }
++
++  @Test
++  public void testDirectoryScannerInFederatedCluster() throws Exception {
++    //Create Federated cluster with two nameservices and one DN
++    cluster = new MiniDFSCluster.Builder(CONF)
++        .nnTopology(MiniDFSNNTopology.simpleHAFederatedTopology(2))
++        .numDataNodes(1).build();
++    try {
++      cluster.waitActive();
++      cluster.transitionToActive(1);
++      cluster.transitionToActive(3);
++      DataNode dataNode = cluster.getDataNodes().get(0);
++      fds = DataNodeTestUtils.getFSDataset(cluster.getDataNodes().get(0));
++      //Create one block in first nameservice
++      FileSystem fs = cluster.getFileSystem(1);
++      int bp1Files = 1;
++      writeFile(fs, bp1Files);
++      //Create two blocks in second nameservice
++      FileSystem fs2 = cluster.getFileSystem(3);
++      int bp2Files = 2;
++      writeFile(fs2, bp2Files);
++      //Call the Directory scanner
++      scanner = new DirectoryScanner(dataNode, fds, CONF);
++      scanner.setRetainDiffs(true);
++      scanner.reconcile();
++      //Check blocks in corresponding BP
++      bpid = cluster.getNamesystem(1).getBlockPoolId();
++      verifyStats(bp1Files, 0, 0, 0, 0, 0, 0);
++      bpid = cluster.getNamesystem(3).getBlockPoolId();
++      verifyStats(bp2Files, 0, 0, 0, 0, 0, 0);
++    } finally {
++      if (scanner != null) {
++        scanner.shutdown();
++        scanner = null;
++      }
++      cluster.shutdown();
++    }
++  }
++
++  private void writeFile(FileSystem fs, int numFiles) throws IOException {
++    final String fileName = "/" + GenericTestUtils.getMethodName();
++    final Path filePath = new Path(fileName);
++    for (int i = 0; i < numFiles; i++) {
++      DFSTestUtil.createFile(fs, filePath, 1, (short) 1, 0);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

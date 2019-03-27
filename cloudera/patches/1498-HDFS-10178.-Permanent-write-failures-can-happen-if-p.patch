@@ -1,0 +1,129 @@
+From c36f445502c261da7510d404a04c9ac1240e1690 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Mon, 4 Apr 2016 16:39:23 -0500
+Subject: [PATCH 1498/2848] HDFS-10178. Permanent write failures can happen if
+ pipeline recoveries occur for the first packet.
+ Contributed by Kihwal Lee.
+
+(cherry picked from commit a7d1fb0cd2fdbf830602eb4dbbd9bbe62f4d5584)
+
+Change-Id: I0be1f638e63212cb7e8929dd3c884002f6749bb4
+---
+ .../hadoop/hdfs/server/datanode/BlockReceiver.java |    2 +
+ .../hadoop/hdfs/server/datanode/BlockSender.java   |    6 ++-
+ .../server/datanode/DataNodeFaultInjector.java     |    2 +
+ .../TestClientProtocolForPipelineRecovery.java     |   54 ++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+index 0b660b5..f87c643 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+@@ -552,6 +552,8 @@ private int receivePacket() throws IOException {
+     if (mirrorOut != null && !mirrorError) {
+       try {
+         long begin = Time.monotonicNow();
++        // For testing. Normally no-op.
++        DataNodeFaultInjector.get().stopSendingPacketDownstream();
+         packetReceiver.mirrorPacketTo(mirrorOut);
+         mirrorOut.flush();
+         long now = Time.monotonicNow();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+index cf4cc29..0562f5a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+@@ -291,11 +291,15 @@
+ 
+             // The meta file will contain only the header if the NULL checksum
+             // type was used, or if the replica was written to transient storage.
++            // Also, when only header portion of a data packet was transferred
++            // and then pipeline breaks, the meta file can contain only the
++            // header and 0 byte in the block data file.
+             // Checksum verification is not performed for replicas on transient
+             // storage.  The header is important for determining the checksum
+             // type later when lazy persistence copies the block to non-transient
+             // storage and computes the checksum.
+-            if (metaIn.getLength() > BlockMetadataHeader.getHeaderSize()) {
++            if (!replica.isOnTransientStorage() &&
++                metaIn.getLength() >= BlockMetadataHeader.getHeaderSize()) {
+               checksumIn = new DataInputStream(new BufferedInputStream(
+                   metaIn, HdfsConstants.IO_FILE_BUFFER_SIZE));
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+index 0e38694..7327420 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+@@ -50,5 +50,7 @@ public boolean dropHeartbeatPacket() {
+     return false;
+   }
+ 
++  public void stopSendingPacketDownstream() throws IOException {}
++
+   public void noRegistration() throws IOException { }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
+index 18e0a1b..eeb7591 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
+@@ -375,4 +375,58 @@ public Boolean get() {
+       }
+     }
+   }
++
++  /**
++   * Test to make sure the checksum is set correctly after pipeline
++   * recovery transfers 0 byte partial block. If fails the test case
++   * will say "java.io.IOException: Failed to replace a bad datanode
++   * on the existing pipeline due to no more good datanodes being
++   * available to try."  This indicates there was a real failure
++   * after the staged failure.
++   */
++  @Test
++  public void testZeroByteBlockRecovery() throws Exception {
++    // Make the first datanode fail once. With 3 nodes and a block being
++    // created with 2 replicas, anything more than this planned failure
++    // will cause a test failure.
++    DataNodeFaultInjector dnFaultInjector = new DataNodeFaultInjector() {
++      int tries = 1;
++      @Override
++      public void stopSendingPacketDownstream() throws IOException {
++        if (tries > 0) {
++          tries--;
++          try {
++            Thread.sleep(60000);
++          } catch (InterruptedException ie) {
++            throw new IOException("Interrupted while sleeping. Bailing out.");
++          }
++        }
++      }
++    };
++    DataNodeFaultInjector oldDnInjector = DataNodeFaultInjector.get();
++    DataNodeFaultInjector.set(dnFaultInjector);
++
++    Configuration conf = new HdfsConfiguration();
++    conf.set(DFSConfigKeys.DFS_CLIENT_SOCKET_TIMEOUT_KEY, "1000");
++    conf.set(
++        DFSConfigKeys.DFS_CLIENT_WRITE_REPLACE_DATANODE_ON_FAILURE_POLICY_KEY,
++        "ALWAYS");
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
++      cluster.waitActive();
++
++      FileSystem fs = cluster.getFileSystem();
++      FSDataOutputStream out = fs.create(new Path("noheartbeat.dat"), (short)2);
++      out.write(0x31);
++      out.hflush();
++      out.close();
++
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      DataNodeFaultInjector.set(oldDnInjector);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

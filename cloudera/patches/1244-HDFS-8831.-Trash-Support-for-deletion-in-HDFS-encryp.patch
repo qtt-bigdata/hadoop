@@ -1,0 +1,806 @@
+From 53b33699ed48babf9606944bfe5317fb0622c1ce Mon Sep 17 00:00:00 2001
+From: Xiaoyu Yao <xyao@apache.org>
+Date: Fri, 4 Dec 2015 10:39:45 -0800
+Subject: [PATCH 1244/2848] HDFS-8831. Trash Support for deletion in HDFS
+ encryption zone. Contributed by Xiaoyu Yao.
+
+(cherry picked from commit cbc7b6bf97a80c39d4bbb3005e42dacae6726baf)
+(cherry picked from commit eb7f9901b4355c5488172dc93f734ee496b3e4dc)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FilterFileSystem.java
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Trash.java
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestHarFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+
+Change-Id: I255432ffa5bb02b3058b6c871facc6d5ac8627f0
+---
+ .../main/java/org/apache/hadoop/fs/FileSystem.java |   52 +++++-
+ .../org/apache/hadoop/fs/FilterFileSystem.java     |   12 ++
+ .../main/java/org/apache/hadoop/fs/FsShell.java    |   12 +-
+ .../src/main/java/org/apache/hadoop/fs/Trash.java  |   15 +-
+ .../java/org/apache/hadoop/fs/TrashPolicy.java     |   56 +++++-
+ .../org/apache/hadoop/fs/TrashPolicyDefault.java   |  193 ++++++++++++--------
+ .../org/apache/hadoop/fs/TestHarFileSystem.java    |    5 +
+ .../test/java/org/apache/hadoop/fs/TestTrash.java  |    9 +
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |   63 +++++++
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |   47 +++++
+ 10 files changed, 370 insertions(+), 94 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+index c9e8f47..527fa8b 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+@@ -27,6 +27,7 @@
+ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.EnumSet;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -103,6 +104,8 @@
+    */
+   public static final int SHUTDOWN_HOOK_PRIORITY = 10;
+ 
++  public static final String TRASH_PREFIX = ".Trash";
++
+   /** FileSystem cache */
+   static final Cache CACHE = new Cache();
+ 
+@@ -2589,6 +2592,53 @@ public void removeXAttr(Path path, String name) throws IOException {
+         + " doesn't support removeXAttr");
+   }
+ 
++  /**
++   * Get the root directory of Trash for current user when the path specified
++   * is deleted.
++   *
++   * @param path the trash root of the path to be determined.
++   * @return the default implementation returns "/user/$USER/.Trash".
++   * @throws IOException
++   */
++  public Path getTrashRoot(Path path) throws IOException {
++    return this.makeQualified(new Path(getHomeDirectory().toUri().getPath(),
++        TRASH_PREFIX));
++  }
++
++  /**
++   * Get all the trash roots for current user or all users.
++   *
++   * @param allUsers return trash roots for all users if true.
++   * @return all the trash root directories.
++   *         Default FileSystem returns .Trash under users' home directories if
++   *         /user/$USER/.Trash exists.
++   * @throws IOException
++   */
++  public Collection<FileStatus> getTrashRoots(boolean allUsers)
++      throws IOException {
++    Path userHome = new Path(getHomeDirectory().toUri().getPath());
++    List<FileStatus> ret = new ArrayList<FileStatus>();
++    if (!allUsers) {
++      Path userTrash = new Path(userHome, TRASH_PREFIX);
++      if (exists(userTrash)) {
++        ret.add(getFileStatus(userTrash));
++      }
++    } else {
++      Path homeParent = userHome.getParent();
++      if (exists(homeParent)) {
++        FileStatus[] candidates = listStatus(homeParent);
++        for (FileStatus candidate : candidates) {
++          Path userTrash = new Path(candidate.getPath(), TRASH_PREFIX);
++          if (exists(userTrash)) {
++            candidate.setPath(userTrash);
++            ret.add(candidate);
++          }
++        }
++      }
++    }
++    return ret;
++  }
++
+   // making it volatile to be able to do a double checked locking
+   private volatile static boolean FILE_SYSTEMS_LOADED = false;
+ 
+@@ -3114,7 +3164,7 @@ public void incrementWriteOps(int count) {
+      * For each StatisticsData object, we will call accept on the visitor.
+      * Finally, at the end, we will call aggregate to get the final total. 
+      *
+-     * @param         The visitor to use.
++     * @param         visitor to use.
+      * @return        The total.
+      */
+     private synchronized <T> T visitAll(StatisticsAggregator<T> visitor) {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FilterFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FilterFileSystem.java
+index e2a42e5..ca9e4da 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FilterFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FilterFileSystem.java
+@@ -21,6 +21,7 @@
+ import java.io.*;
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.util.Collection;
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -614,4 +615,15 @@ public void setXAttr(Path path, String name, byte[] value,
+   public void removeXAttr(Path path, String name) throws IOException {
+     fs.removeXAttr(path, name);
+   }
++
++  @Override
++  public Path getTrashRoot(Path path) throws IOException {
++    return fs.getTrashRoot(path);
++  }
++
++  @Override
++  public Collection<FileStatus> getTrashRoots(boolean allUsers)
++      throws IOException {
++    return fs.getTrashRoots(allUsers);
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsShell.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsShell.java
+index 9a5b651..b23a7e6 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsShell.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FsShell.java
+@@ -121,11 +121,21 @@ public Path getCurrentTrashDir() throws IOException {
+     return getTrash().getCurrentTrashDir();
+   }
+ 
++  /**
++   * Returns the current trash location for the path specified
++   * @param path to be deleted
++   * @return path to the trash
++   * @throws IOException
++   */
++  public Path getCurrentTrashDir(Path path) throws IOException {
++    return getTrash().getCurrentTrashDir(path);
++  }
++
+   // NOTE: Usage/Help are inner classes to allow access to outer methods
+   // that access commandFactory
+   
+   /**
+-   *  Display help for commands with their short usage and long description
++   *  Display help for commands with their short usage and long description.
+    */
+    protected class Usage extends FsCommand {
+     public static final String NAME = "usage";
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Trash.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Trash.java
+index aae5cf7..b771812 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Trash.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Trash.java
+@@ -54,7 +54,7 @@ public Trash(Configuration conf) throws IOException {
+    */
+   public Trash(FileSystem fs, Configuration conf) throws IOException {
+     super(conf);
+-    trashPolicy = TrashPolicy.getInstance(conf, fs, fs.getHomeDirectory());
++    trashPolicy = TrashPolicy.getInstance(conf, fs);
+   }
+ 
+   /**
+@@ -92,12 +92,7 @@ public static boolean moveToAppropriateTrash(FileSystem fs, Path p,
+       throw new IOException("Failed to get server trash configuration", e);
+     }
+     Trash trash = new Trash(fullyResolvedFs, conf);
+-    boolean success = trash.moveToTrash(fullyResolvedPath);
+-    if (success) {
+-      System.out.println("Moved: '" + p + "' to trash at: " +
+-          trash.getCurrentTrashDir() );
+-    }
+-    return success;
++    return trash.moveToTrash(fullyResolvedPath);
+   }
+   
+   /**
+@@ -125,7 +120,7 @@ public void expunge() throws IOException {
+   }
+ 
+   /** get the current working directory */
+-  Path getCurrentTrashDir() {
++  Path getCurrentTrashDir() throws IOException {
+     return trashPolicy.getCurrentTrashDir();
+   }
+ 
+@@ -140,4 +135,8 @@ TrashPolicy getTrashPolicy() {
+   public Runnable getEmptier() throws IOException {
+     return trashPolicy.getEmptier();
+   }
++
++  public Path getCurrentTrashDir(Path path) throws IOException {
++    return trashPolicy.getCurrentTrashDir(path);
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicy.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicy.java
+index eab83b3..1d901c1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicy.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicy.java
+@@ -38,7 +38,7 @@
+ 
+   /**
+    * Used to setup the trash policy. Must be implemented by all TrashPolicy
+-   * implementations
++   * implementations.
+    * @param conf the configuration to be used
+    * @param fs the filesystem to be used
+    * @param home the home directory
+@@ -46,7 +46,19 @@
+   public abstract void initialize(Configuration conf, FileSystem fs, Path home);
+ 
+   /**
+-   * Returns whether the Trash Policy is enabled for this filesystem
++   * Used to setup the trash policy. Must be implemented by all TrashPolicy
++   * implementations. Different from initialize(conf, fs, home), this one does
++   * not assume trash always under /user/$USER due to HDFS encryption zone.
++   * @param conf the configuration to be used
++   * @param fs the filesystem to be used
++   * @throws IOException
++   */
++  public void initialize(Configuration conf, FileSystem fs) throws IOException{
++    throw new UnsupportedOperationException();
++  }
++
++  /**
++   * Returns whether the Trash Policy is enabled for this filesystem.
+    */
+   public abstract boolean isEnabled();
+ 
+@@ -68,8 +80,27 @@
+ 
+   /**
+    * Get the current working directory of the Trash Policy
++   * This API does not work with files deleted from encryption zone when HDFS
++   * data encryption at rest feature is enabled as rename file between
++   * encryption zones or encryption zone and non-encryption zone is not allowed.
++   *
++   * The caller is recommend to use the new API
++   * TrashPolicy#getCurrentTrashDir(Path path).
++   * It returns the trash location correctly for the path specified no matter
++   * the path is in encryption zone or not.
++   */
++  public abstract Path getCurrentTrashDir() throws IOException;
++
++  /**
++   * Get the current trash directory for path specified based on the Trash
++   * Policy
++   * @param path path to be deleted
++   * @return current trash directory for the path to be deleted
++   * @throws IOException
+    */
+-  public abstract Path getCurrentTrashDir();
++  public Path getCurrentTrashDir(Path path) throws IOException {
++    throw new UnsupportedOperationException();
++  }
+ 
+   /** 
+    * Return a {@link Runnable} that periodically empties the trash of all
+@@ -78,7 +109,7 @@
+   public abstract Runnable getEmptier() throws IOException;
+ 
+   /**
+-   * Get an instance of the configured TrashPolicy based on the value 
++   * Get an instance of the configured TrashPolicy based on the value
+    * of the configuration parameter fs.trash.classname.
+    *
+    * @param conf the configuration to be used
+@@ -93,4 +124,21 @@ public static TrashPolicy getInstance(Configuration conf, FileSystem fs, Path ho
+     trash.initialize(conf, fs, home); // initialize TrashPolicy
+     return trash;
+   }
++
++  /**
++   * Get an instance of the configured TrashPolicy based on the value
++   * of the configuration parameter fs.trash.classname.
++   *
++   * @param conf the configuration to be used
++   * @param fs the file system to be used
++   * @return an instance of TrashPolicy
++   */
++  public static TrashPolicy getInstance(Configuration conf, FileSystem fs)
++      throws IOException {
++    Class<? extends TrashPolicy> trashClass = conf.getClass(
++        "fs.trash.classname", TrashPolicyDefault.class, TrashPolicy.class);
++    TrashPolicy trash = ReflectionUtils.newInstance(trashClass, conf);
++    trash.initialize(conf, fs); // initialize TrashPolicy
++    return trash;
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicyDefault.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicyDefault.java
+index efe6efd..efc0072 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicyDefault.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/TrashPolicyDefault.java
+@@ -27,6 +27,7 @@
+ import java.text.DateFormat;
+ import java.text.ParseException;
+ import java.text.SimpleDateFormat;
++import java.util.Collection;
+ import java.util.Date;
+ 
+ import org.apache.commons.logging.Log;
+@@ -66,23 +67,18 @@
+       new SimpleDateFormat("yyMMddHHmm");
+   private static final int MSECS_PER_MINUTE = 60*1000;
+ 
+-  private Path current;
+-  private Path homesParent;
+   private long emptierInterval;
+ 
+   public TrashPolicyDefault() { }
+ 
+-  private TrashPolicyDefault(FileSystem fs, Path home, Configuration conf)
++  private TrashPolicyDefault(FileSystem fs, Configuration conf)
+       throws IOException {
+-    initialize(conf, fs, home);
++    initialize(conf, fs);
+   }
+ 
+   @Override
+   public void initialize(Configuration conf, FileSystem fs, Path home) {
+     this.fs = fs;
+-    this.trash = new Path(home, TRASH);
+-    this.homesParent = home.getParent();
+-    this.current = new Path(trash, CURRENT);
+     this.deletionInterval = (long)(conf.getFloat(
+         FS_TRASH_INTERVAL_KEY, FS_TRASH_INTERVAL_DEFAULT)
+         * MSECS_PER_MINUTE);
+@@ -94,6 +90,17 @@ public void initialize(Configuration conf, FileSystem fs, Path home) {
+              (this.emptierInterval / MSECS_PER_MINUTE) + " minutes.");
+    }
+ 
++  @Override
++  public void initialize(Configuration conf, FileSystem fs) {
++    this.fs = fs;
++    this.deletionInterval = (long)(conf.getFloat(
++        FS_TRASH_INTERVAL_KEY, FS_TRASH_INTERVAL_DEFAULT)
++        * MSECS_PER_MINUTE);
++    this.emptierInterval = (long)(conf.getFloat(
++        FS_TRASH_CHECKPOINT_INTERVAL_KEY, FS_TRASH_CHECKPOINT_INTERVAL_DEFAULT)
++        * MSECS_PER_MINUTE);
++  }
++
+   private Path makeTrashRelativePath(Path basePath, Path rmFilePath) {
+     return Path.mergePaths(basePath, rmFilePath);
+   }
+@@ -116,17 +123,19 @@ public boolean moveToTrash(Path path) throws IOException {
+ 
+     String qpath = fs.makeQualified(path).toString();
+ 
+-    if (qpath.startsWith(trash.toString())) {
++    Path trashRoot = fs.getTrashRoot(path);
++    Path trashCurrent = new Path(trashRoot, CURRENT);
++    if (qpath.startsWith(trashRoot.toString())) {
+       return false;                               // already in trash
+     }
+ 
+-    if (trash.getParent().toString().startsWith(qpath)) {
++    if (trashRoot.getParent().toString().startsWith(qpath)) {
+       throw new IOException("Cannot move \"" + path +
+                             "\" to the trash, as it contains the trash");
+     }
+ 
+-    Path trashPath = makeTrashRelativePath(current, path);
+-    Path baseTrashPath = makeTrashRelativePath(current, path.getParent());
++    Path trashPath = makeTrashRelativePath(trashCurrent, path);
++    Path baseTrashPath = makeTrashRelativePath(trashCurrent, path.getParent());
+     
+     IOException cause = null;
+ 
+@@ -151,14 +160,16 @@ public boolean moveToTrash(Path path) throws IOException {
+           trashPath = new Path(orig + Time.now());
+         }
+         
+-        if (fs.rename(path, trashPath))           // move to current trash
++        if (fs.rename(path, trashPath)) {           // move to current trash
++          LOG.info("Moved: '" + path + "' to trash at: " + trashPath);
+           return true;
++        }
+       } catch (IOException e) {
+         cause = e;
+       }
+     }
+     throw (IOException)
+-      new IOException("Failed to move to trash: "+path).initCause(cause);
++      new IOException("Failed to move to trash: " + path).initCause(cause);
+   }
+ 
+   @SuppressWarnings("deprecation")
+@@ -169,72 +180,32 @@ public void createCheckpoint() throws IOException {
+ 
+   @SuppressWarnings("deprecation")
+   public void createCheckpoint(Date date) throws IOException {
+-
+-    if (!fs.exists(current))                     // no trash, no checkpoint
+-      return;
+-
+-    Path checkpointBase;
+-    synchronized (CHECKPOINT) {
+-      checkpointBase = new Path(trash, CHECKPOINT.format(date));
+-
++    Collection<FileStatus> trashRoots = fs.getTrashRoots(false);
++    for (FileStatus trashRoot: trashRoots) {
++      LOG.info("TrashPolicyDefault#createCheckpoint for trashRoot: " +
++          trashRoot.getPath());
++      createCheckpoint(trashRoot.getPath(), date);
+     }
+-    Path checkpoint = checkpointBase;
+-
+-    int attempt = 0;
+-    while (true) {
+-      try {
+-        fs.rename(current, checkpoint, Rename.NONE);
+-        break;
+-      } catch (FileAlreadyExistsException e) {
+-        if (++attempt > 1000) {
+-          throw new IOException("Failed to checkpoint trash: "+checkpoint);
+-        }
+-        checkpoint = checkpointBase.suffix("-" + attempt);
+-      }
+-    }
+-
+-    LOG.info("Created trash checkpoint: "+checkpoint.toUri().getPath());
+   }
+ 
+   @Override
+   public void deleteCheckpoint() throws IOException {
+-    FileStatus[] dirs = null;
+-    
+-    try {
+-      dirs = fs.listStatus(trash);            // scan trash sub-directories
+-    } catch (FileNotFoundException fnfe) {
+-      return;
++    Collection<FileStatus> trashRoots = fs.getTrashRoots(false);
++    for (FileStatus trashRoot : trashRoots) {
++      LOG.info("TrashPolicyDefault#deleteCheckpoint for trashRoot: " +
++          trashRoot.getPath());
++      deleteCheckpoint(trashRoot.getPath());
+     }
++  }
+ 
+-    long now = Time.now();
+-    for (int i = 0; i < dirs.length; i++) {
+-      Path path = dirs[i].getPath();
+-      String dir = path.toUri().getPath();
+-      String name = path.getName();
+-      if (name.equals(CURRENT.getName()))         // skip current
+-        continue;
+-
+-      long time;
+-      try {
+-        time = getTimeFromCheckpoint(name);
+-      } catch (ParseException e) {
+-        LOG.warn("Unexpected item in trash: "+dir+". Ignoring.");
+-        continue;
+-      }
+-
+-      if ((now - deletionInterval) > time) {
+-        if (fs.delete(path, true)) {
+-          LOG.info("Deleted trash checkpoint: "+dir);
+-        } else {
+-          LOG.warn("Couldn't delete checkpoint: "+dir+" Ignoring.");
+-        }
+-      }
+-    }
++  @Override
++  public Path getCurrentTrashDir() throws IOException {
++    return new Path(fs.getTrashRoot(null), CURRENT);
+   }
+ 
+   @Override
+-  public Path getCurrentTrashDir() {
+-    return current;
++  public Path getCurrentTrashDir(Path path) throws IOException {
++    return new Path(fs.getTrashRoot(path), CURRENT);
+   }
+ 
+   @Override
+@@ -277,25 +248,24 @@ public void run() {
+         try {
+           now = Time.now();
+           if (now >= end) {
+-
+-            FileStatus[] homes = null;
++            Collection<FileStatus> trashRoots;
+             try {
+-              homes = fs.listStatus(homesParent);         // list all home dirs
++              trashRoots = fs.getTrashRoots(true);      // list all home dirs
+             } catch (IOException e) {
+-              LOG.warn("Trash can't list homes: "+e+" Sleeping.");
++              LOG.warn("Trash can't list all trash roots: "+e+" Sleeping.");
+               continue;
+             }
+ 
+-            for (FileStatus home : homes) {         // dump each trash
+-              if (!home.isDirectory())
++            for (FileStatus trashRoot : trashRoots) {   // dump each trash
++              if (!trashRoot.isDirectory())
+                 continue;
+               try {
+-                TrashPolicyDefault trash = new TrashPolicyDefault(
+-                    fs, home.getPath(), conf);
+-                trash.deleteCheckpoint();
+-                trash.createCheckpoint(new Date(now));
++                TrashPolicyDefault trash = new TrashPolicyDefault(fs, conf);
++                trash.deleteCheckpoint(trashRoot.getPath());
++                trash.createCheckpoint(trashRoot.getPath(), new Date(now));
+               } catch (IOException e) {
+-                LOG.warn("Trash caught: "+e+". Skipping "+home.getPath()+".");
++                LOG.warn("Trash caught: "+e+". Skipping " +
++                    trashRoot.getPath() + ".");
+               } 
+             }
+           }
+@@ -318,6 +288,69 @@ private long floor(long time, long interval) {
+     }
+   }
+ 
++  private void createCheckpoint(Path trashRoot, Date date) throws IOException {
++    if (!fs.exists(new Path(trashRoot, CURRENT))) {
++      return;
++    }
++    Path checkpointBase;
++    synchronized (CHECKPOINT) {
++      checkpointBase = new Path(trashRoot, CHECKPOINT.format(date));
++    }
++    Path checkpoint = checkpointBase;
++    Path current = new Path(trashRoot, CURRENT);
++
++    int attempt = 0;
++    while (true) {
++      try {
++        fs.rename(current, checkpoint, Rename.NONE);
++        LOG.info("Created trash checkpoint: " + checkpoint.toUri().getPath());
++        break;
++      } catch (FileAlreadyExistsException e) {
++        if (++attempt > 1000) {
++          throw new IOException("Failed to checkpoint trash: " + checkpoint);
++        }
++        checkpoint = checkpointBase.suffix("-" + attempt);
++      }
++    }
++  }
++
++  private void deleteCheckpoint(Path trashRoot) throws IOException {
++    LOG.info("TrashPolicyDefault#deleteCheckpoint for trashRoot: " + trashRoot);
++
++    FileStatus[] dirs = null;
++    try {
++      dirs = fs.listStatus(trashRoot); // scan trash sub-directories
++    } catch (FileNotFoundException fnfe) {
++      return;
++    }
++
++    long now = Time.now();
++    for (int i = 0; i < dirs.length; i++) {
++      Path path = dirs[i].getPath();
++      String dir = path.toUri().getPath();
++      String name = path.getName();
++      if (name.equals(CURRENT.getName())) {         // skip current
++        continue;
++      }
++
++      long time;
++      try {
++        time = getTimeFromCheckpoint(name);
++      } catch (ParseException e) {
++        LOG.warn("Unexpected item in trash: "+dir+". Ignoring.");
++        continue;
++      }
++
++      if ((now - deletionInterval) > time) {
++        if (fs.delete(path, true)) {
++          LOG.info("Deleted trash checkpoint: "+dir);
++        } else {
++          LOG.warn("Couldn't delete checkpoint: " + dir + " Ignoring.");
++        }
++      }
++    }
++  }
++
+   private long getTimeFromCheckpoint(String name) throws ParseException {
+     long time;
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestHarFileSystem.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestHarFileSystem.java
+index 374bb2e..3bc016c 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestHarFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestHarFileSystem.java
+@@ -34,6 +34,7 @@
+ import java.io.IOException;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Modifier;
++import java.util.Collection;
+ import java.util.EnumSet;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -205,6 +206,10 @@ public void setXAttr(Path path, String name, byte[] value,
+     public AclStatus getAclStatus(Path path) throws IOException;
+ 
+     public void access(Path path, FsAction mode) throws IOException;
++
++    public Path getTrashRoot(Path path) throws IOException;
++
++    public Collection<FileStatus> getTrashRoots(boolean allUsers) throws IOException;
+   }
+ 
+   @Test
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestTrash.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestTrash.java
+index 9a91733..88194fd 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestTrash.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestTrash.java
+@@ -696,6 +696,10 @@ public void initialize(Configuration conf, FileSystem fs, Path home) {
+     }
+ 
+     @Override
++    public void initialize(Configuration conf, FileSystem fs) {
++    }
++
++    @Override
+     public boolean isEnabled() {
+       return false;
+     }
+@@ -719,6 +723,11 @@ public Path getCurrentTrashDir() {
+     }
+ 
+     @Override
++    public Path getCurrentTrashDir(Path path) throws IOException {
++      return null;
++    }
++
++    @Override
+     public Runnable getEmptier() throws IOException {
+       return null;
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index 7638bb9..83adda1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -23,6 +23,7 @@
+ import java.net.InetSocketAddress;
+ import java.net.URI;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -2161,4 +2162,66 @@ public DFSInotifyEventInputStream getInotifyEventStream(long lastReadTxid)
+       throws IOException {
+     return dfs.getInotifyEventStream(lastReadTxid);
+   }
++
++
++  /**
++   * Get the root directory of Trash for a path in HDFS.
++   * 1. File in encryption zone returns /ez1/.Trash/username
++   * 2. File not in encryption zone returns /users/username/.Trash
++   * Caller appends either Current or checkpoint timestamp for trash destination
++   * @param path the trash root of the path to be determined.
++   * @return trash root
++   * @throws IOException
++   */
++  @Override
++  public Path getTrashRoot(Path path) throws IOException {
++    if ((path == null) || !dfs.isHDFSEncryptionEnabled()) {
++      return super.getTrashRoot(path);
++    }
++
++    String absSrc = path.toUri().getPath();
++    EncryptionZone ez = dfs.getEZForPath(absSrc);
++    if ((ez != null) && !ez.getPath().equals(absSrc)) {
++      return this.makeQualified(
++          new Path(ez.getPath() + "/" + FileSystem.TRASH_PREFIX +
++              dfs.ugi.getShortUserName()));
++    } else {
++      return super.getTrashRoot(path);
++    }
++  }
++
++  /**
++   * Get all the trash roots of HDFS for current user or for all the users.
++   * 1. File deleted from non-encryption zone /user/username/.Trash
++   * 2. File deleted from encryption zones
++   *    e.g., ez1 rooted at /ez1 has its trash root at /ez1/.Trash/$USER
++   * @allUsers return trashRoots of all users if true, used by emptier
++   * @return trash roots of HDFS
++   * @throws IOException
++   */
++  @Override
++  public Collection<FileStatus> getTrashRoots(boolean allUsers) throws IOException {
++    List<FileStatus> ret = new ArrayList<FileStatus>();
++    // Get normal trash roots
++    ret.addAll(super.getTrashRoots(allUsers));
++
++    // Get EZ Trash roots
++    final RemoteIterator<EncryptionZone> it = dfs.listEncryptionZones();
++    while (it.hasNext()) {
++      Path ezTrashRoot = new Path(it.next().getPath(), FileSystem.TRASH_PREFIX);
++      if (allUsers) {
++        for (FileStatus candidate : listStatus(ezTrashRoot)) {
++          if (exists(candidate.getPath())) {
++            ret.add(candidate);
++          }
++        }
++      } else {
++        Path userTrash = new Path(ezTrashRoot, System.getProperty("user.name"));
++        if (exists(userTrash)) {
++          ret.add(getFileStatus(userTrash));
++        }
++      }
++    }
++    return ret;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index 2687a0f..35cedde 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -57,6 +57,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileSystemTestHelper;
+ import org.apache.hadoop.fs.FileSystemTestWrapper;
++import org.apache.hadoop.fs.FsShell;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -98,6 +99,7 @@
+ import static org.mockito.Mockito.withSettings;
+ import static org.mockito.Mockito.any;
+ import static org.mockito.Mockito.anyString;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_KEY;
+ import static org.apache.hadoop.hdfs.DFSTestUtil.verifyFilesEqual;
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+ import static org.junit.Assert.assertEquals;
+@@ -1348,4 +1350,49 @@ public void testEncryptionZonesOnRootPath() throws Exception {
+         true, fs.getFileStatus(zoneFile).isEncrypted());
+     DFSTestUtil.verifyFilesNotEqual(fs, zoneFile, rawFile, len);
+   }
++
++  @Test(timeout = 120000)
++  public void testEncryptionZoneWithTrash() throws Exception {
++    // Create the encryption zone1
++    final HdfsAdmin dfsAdmin =
++        new HdfsAdmin(FileSystem.getDefaultUri(conf), conf);
++    final Path zone1 = new Path("/zone1");
++    fs.mkdirs(zone1);
++    dfsAdmin.createEncryptionZone(zone1, TEST_KEY);
++
++    // Create the encrypted file in zone1
++    final Path encFile1 = new Path(zone1, "encFile1");
++    final int len = 8192;
++    DFSTestUtil.createFile(fs, encFile1, len, (short) 1, 0xFEED);
++
++    Configuration clientConf = new Configuration(conf);
++    clientConf.setLong(FS_TRASH_INTERVAL_KEY, 1);
++    FsShell shell = new FsShell(clientConf);
++
++    // Delete encrypted file from the shell with trash enabled
++    // Verify the file is moved to appropriate trash within the zone
++    verifyShellDeleteWithTrash(shell, encFile1);
++
++    // Delete encryption zone from the shell with trash enabled
++    // Verify the zone is moved to appropriate trash location in user's home dir
++    verifyShellDeleteWithTrash(shell, zone1);
++  }
++
++  private void verifyShellDeleteWithTrash(FsShell shell, Path path)
++      throws Exception{
++    try {
++      final Path trashFile =
++          new Path(shell.getCurrentTrashDir(path) + "/" + path);
++      String[] argv = new String[]{"-rm", "-r", path.toString()};
++      int res = ToolRunner.run(shell, argv);
++      assertEquals("rm failed", 0, res);
++      assertTrue("File not in trash : " + trashFile, fs.exists(trashFile));
++    } catch (IOException ioe) {
++      fail(ioe.getMessage());
++    } finally {
++      if (fs.exists(path)) {
++        fs.delete(path, true);
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

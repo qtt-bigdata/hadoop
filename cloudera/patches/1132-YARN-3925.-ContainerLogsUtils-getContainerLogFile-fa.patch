@@ -1,0 +1,163 @@
+From c3811dc9ff30a55f3cc6264c5706234e95b5acae Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Fri, 24 Jul 2015 22:14:39 +0000
+Subject: [PATCH 1132/2848] YARN-3925. ContainerLogsUtils#getContainerLogFile
+ fails to read container log files from full
+ disks. Contributed by zhihai xu (cherry picked
+ from commit
+ ff9c13e0a739bb13115167dc661b6a16b2ed2c04)
+
+(cherry picked from commit 2cf714123ac191527632e3b25d61a9eef1b94566)
+
+Change-Id: I3392a678841c991279f262f7fecc32d8f913ae9e
+---
+ .../nodemanager/LocalDirsHandlerService.java       |   35 +++++++++++++-
+ .../nodemanager/webapp/TestContainerLogsPage.java  |   50 +++++++++++++++++++-
+ 2 files changed, 82 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
+index 175c624..a57c44d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.yarn.server.nodemanager;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.net.URI;
+ import java.util.ArrayList;
+@@ -31,6 +32,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.LocalDirAllocator;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -475,6 +477,35 @@ private boolean disksTurnedGood(Set<String> preCheckDirs,
+     return disksTurnedGood;
+   }
+ 
++  private Path getPathToRead(String pathStr, List<String> dirs)
++      throws IOException {
++    // remove the leading slash from the path (to make sure that the uri
++    // resolution results in a valid path on the dir being checked)
++    if (pathStr.startsWith("/")) {
++      pathStr = pathStr.substring(1);
++    }
++
++    FileSystem localFS = FileSystem.getLocal(getConfig());
++    for (String dir : dirs) {
++      try {
++        Path tmpDir = new Path(dir);
++        File tmpFile = tmpDir.isAbsolute()
++            ? new File(localFS.makeQualified(tmpDir).toUri())
++            : new File(dir);
++        Path file = new Path(tmpFile.getPath(), pathStr);
++        if (localFS.exists(file)) {
++          return file;
++        }
++      } catch (IOException ie) {
++        // ignore
++        LOG.warn("Failed to find " + pathStr + " at " + dir, ie);
++      }
++    }
++
++    throw new IOException("Could not find " + pathStr + " in any of" +
++        " the directories");
++  }
++
+   public Path getLocalPathForWrite(String pathStr) throws IOException {
+     return localDirsAllocator.getLocalPathForWrite(pathStr, getConfig());
+   }
+@@ -492,9 +523,9 @@ public Path getLogPathForWrite(String pathStr, boolean checkWrite)
+   }
+ 
+   public Path getLogPathToRead(String pathStr) throws IOException {
+-    return logDirsAllocator.getLocalPathToRead(pathStr, getConfig());
++    return getPathToRead(pathStr, getLogDirsForRead());
+   }
+-  
++
+   public static String[] validatePaths(String[] paths) {
+     ArrayList<String> validPaths = new ArrayList<String>();
+     for (int i = 0; i < paths.length; ++i) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+index 39c52d9..979e745 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+@@ -39,6 +39,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.nativeio.NativeIO;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -62,6 +63,7 @@
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.Application;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container;
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerState;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainerLaunch;
+ import org.apache.hadoop.yarn.server.nodemanager.recovery.NMNullStateStoreService;
+ import org.apache.hadoop.yarn.server.nodemanager.webapp.ContainerLogsPage.ContainersLogsBlock;
+ import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
+@@ -136,7 +138,53 @@ public void testContainerLogDirs() throws IOException, YarnException {
+     File containerLogDir = new File(absLogDir, appId + "/" + container1);
+     Assert.assertTrue(dirs.contains(containerLogDir));
+   }
+-  
++
++  @Test(timeout=30000)
++  public void testContainerLogFile() throws IOException, YarnException {
++    File absLogDir = new File("target",
++        TestNMWebServer.class.getSimpleName() + "LogDir").getAbsoluteFile();
++    String logdirwithFile = absLogDir.toURI().toString();
++    Configuration conf = new Configuration();
++    conf.set(YarnConfiguration.NM_LOG_DIRS, logdirwithFile);
++    conf.setFloat(YarnConfiguration.NM_MAX_PER_DISK_UTILIZATION_PERCENTAGE,
++        0.0f);
++    LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++    dirsHandler.init(conf);
++    NMContext nmContext = new NodeManager.NMContext(null, null, dirsHandler,
++        new ApplicationACLsManager(conf), new NMNullStateStoreService());
++    // Add an application and the corresponding containers
++    String user = "nobody";
++    long clusterTimeStamp = 1234;
++    ApplicationId appId = BuilderUtils.newApplicationId(
++        clusterTimeStamp, 1);
++    Application app = mock(Application.class);
++    when(app.getUser()).thenReturn(user);
++    when(app.getAppId()).thenReturn(appId);
++    ApplicationAttemptId appAttemptId = BuilderUtils.newApplicationAttemptId(
++        appId, 1);
++    ContainerId containerId = BuilderUtils.newContainerId(
++        appAttemptId, 1);
++    nmContext.getApplications().put(appId, app);
++
++    MockContainer container =
++        new MockContainer(appAttemptId, new AsyncDispatcher(), conf, user,
++            appId, 1);
++    container.setState(ContainerState.RUNNING);
++    nmContext.getContainers().put(containerId, container);
++    File containerLogDir = new File(absLogDir,
++        ContainerLaunch.getRelativeContainerLogDir(appId.toString(),
++            containerId.toString()));
++    containerLogDir.mkdirs();
++    String fileName = "fileName";
++    File containerLogFile = new File(containerLogDir, fileName);
++    containerLogFile.createNewFile();
++    File file = ContainerLogsUtils.getContainerLogFile(containerId,
++        fileName, user, nmContext);
++    Assert.assertEquals(containerLogFile.toURI().toString(),
++        file.toURI().toString());
++    FileUtil.fullyDelete(absLogDir);
++  }
++
+   @Test(timeout = 10000)
+   public void testContainerLogPageAccess() throws IOException {
+     // SecureIOUtils require Native IO to be enabled. This test will run
+-- 
+1.7.9.5
+

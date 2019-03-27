@@ -1,0 +1,344 @@
+From 933fb4f0c140759e45bdf7fc6262c5d92cf76d1c Mon Sep 17 00:00:00 2001
+From: Robert Kanter <rkanter@apache.org>
+Date: Tue, 1 Nov 2016 20:47:25 -0700
+Subject: [PATCH 1992/2848] MAPREDUCE-6765. MR should not schedule container
+ requests in cases where reducer or mapper
+ containers demand resource larger than the
+ maximum supported (haibochen via rkanter)
+
+(cherry picked from commit fc2b69eba1c5df59f6175205c27dc7b584df50c0)
+(cherry picked from commit 568b5eecd81e64b35d6e9ca2e175bce9cdc78ce0)
+
+Change-Id: Id19b94ce7258242982c4da99d83c2f1aa1488731
+---
+ .../mapreduce/v2/app/rm/RMContainerAllocator.java  |  169 ++++++++++++--------
+ .../v2/app/rm/TestRMContainerAllocator.java        |   96 ++++++++++-
+ 2 files changed, 195 insertions(+), 70 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+index 11ca5fa..6f5fc06 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+@@ -141,10 +141,10 @@ added to the pending and are ramped up (added to scheduled) based
+ 
+   //holds information about the assigned containers to task attempts
+   private final AssignedRequests assignedRequests;
+-  
++
+   //holds scheduled requests to be fulfilled by RM
+   private final ScheduledRequests scheduledRequests = new ScheduledRequests();
+-  
++
+   private int containersAllocated = 0;
+   private int containersReleased = 0;
+   private int hostLocalAssigned = 0;
+@@ -341,74 +341,16 @@ public void handle(ContainerAllocatorEvent event) {
+     }
+   }
+ 
+-  @SuppressWarnings({ "unchecked" })
+   protected synchronized void handleEvent(ContainerAllocatorEvent event) {
+     recalculateReduceSchedule = true;
+     if (event.getType() == ContainerAllocator.EventType.CONTAINER_REQ) {
+       ContainerRequestEvent reqEvent = (ContainerRequestEvent) event;
+-      JobId jobId = getJob().getID();
+-      Resource supportedMaxContainerCapability = getMaxContainerCapability();
+-      if (reqEvent.getAttemptID().getTaskId().getTaskType().equals(TaskType.MAP)) {
+-        if (mapResourceRequest.equals(Resources.none())) {
+-          mapResourceRequest = reqEvent.getCapability();
+-          eventHandler.handle(new JobHistoryEvent(jobId,
+-            new NormalizedResourceEvent(
+-              org.apache.hadoop.mapreduce.TaskType.MAP, mapResourceRequest
+-                .getMemory())));
+-          LOG.info("mapResourceRequest:" + mapResourceRequest);
+-          if (mapResourceRequest.getMemory() > supportedMaxContainerCapability
+-            .getMemory()
+-              || mapResourceRequest.getVirtualCores() > supportedMaxContainerCapability
+-                .getVirtualCores()) {
+-            String diagMsg =
+-                "MAP capability required is more than the supported "
+-                    + "max container capability in the cluster. Killing the Job. mapResourceRequest: "
+-                    + mapResourceRequest + " maxContainerCapability:"
+-                    + supportedMaxContainerCapability;
+-            LOG.info(diagMsg);
+-            eventHandler.handle(new JobDiagnosticsUpdateEvent(jobId, diagMsg));
+-            eventHandler.handle(new JobEvent(jobId, JobEventType.JOB_KILL));
+-          }
+-        }
+-        // set the resources
+-        reqEvent.getCapability().setMemory(mapResourceRequest.getMemory());
+-        reqEvent.getCapability().setVirtualCores(
+-          mapResourceRequest.getVirtualCores());
+-        scheduledRequests.addMap(reqEvent);//maps are immediately scheduled
++      boolean isMap = reqEvent.getAttemptID().getTaskId().getTaskType().
++          equals(TaskType.MAP);
++      if (isMap) {
++        handleMapContainerRequest(reqEvent);
+       } else {
+-        if (reduceResourceRequest.equals(Resources.none())) {
+-          reduceResourceRequest = reqEvent.getCapability();
+-          eventHandler.handle(new JobHistoryEvent(jobId,
+-            new NormalizedResourceEvent(
+-              org.apache.hadoop.mapreduce.TaskType.REDUCE,
+-              reduceResourceRequest.getMemory())));
+-          LOG.info("reduceResourceRequest:" + reduceResourceRequest);
+-          if (reduceResourceRequest.getMemory() > supportedMaxContainerCapability
+-            .getMemory()
+-              || reduceResourceRequest.getVirtualCores() > supportedMaxContainerCapability
+-                .getVirtualCores()) {
+-            String diagMsg =
+-                "REDUCE capability required is more than the "
+-                    + "supported max container capability in the cluster. Killing the "
+-                    + "Job. reduceResourceRequest: " + reduceResourceRequest
+-                    + " maxContainerCapability:"
+-                    + supportedMaxContainerCapability;
+-            LOG.info(diagMsg);
+-            eventHandler.handle(new JobDiagnosticsUpdateEvent(jobId, diagMsg));
+-            eventHandler.handle(new JobEvent(jobId, JobEventType.JOB_KILL));
+-          }
+-        }
+-        // set the resources
+-        reqEvent.getCapability().setMemory(reduceResourceRequest.getMemory());
+-        reqEvent.getCapability().setVirtualCores(
+-          reduceResourceRequest.getVirtualCores());
+-        if (reqEvent.getEarlierAttemptFailed()) {
+-          //add to the front of queue for fail fast
+-          pendingReduces.addFirst(new ContainerRequest(reqEvent, PRIORITY_REDUCE));
+-        } else {
+-          pendingReduces.add(new ContainerRequest(reqEvent, PRIORITY_REDUCE));
+-          //reduces are added to pending and are slowly ramped up
+-        }
++        handleReduceContainerRequest(reqEvent);
+       }
+       
+     } else if (
+@@ -441,6 +383,103 @@ protected synchronized void handleEvent(ContainerAllocatorEvent event) {
+     }
+   }
+ 
++  @SuppressWarnings({ "unchecked" })
++  private void handleReduceContainerRequest(ContainerRequestEvent reqEvent) {
++    assert(reqEvent.getAttemptID().getTaskId().getTaskType().equals(
++        TaskType.REDUCE));
++
++    Resource supportedMaxContainerCapability = getMaxContainerCapability();
++    JobId jobId = getJob().getID();
++
++    if (reduceResourceRequest.equals(Resources.none())) {
++      reduceResourceRequest = reqEvent.getCapability();
++      eventHandler.handle(new JobHistoryEvent(jobId,
++          new NormalizedResourceEvent(
++              org.apache.hadoop.mapreduce.TaskType.REDUCE,
++              reduceResourceRequest.getMemory())));
++      LOG.info("reduceResourceRequest:" + reduceResourceRequest);
++    }
++
++    boolean reduceContainerRequestAccepted = true;
++    if (reduceResourceRequest.getMemory() >
++        supportedMaxContainerCapability.getMemory()
++        ||
++        reduceResourceRequest.getVirtualCores() >
++        supportedMaxContainerCapability.getVirtualCores()) {
++      reduceContainerRequestAccepted = false;
++    }
++
++    if (reduceContainerRequestAccepted) {
++      // set the resources
++      reqEvent.getCapability().setVirtualCores(
++          reduceResourceRequest.getVirtualCores());
++      reqEvent.getCapability().setMemory(
++          reduceResourceRequest.getMemory());
++
++      if (reqEvent.getEarlierAttemptFailed()) {
++        //previously failed reducers are added to the front for fail fast
++        pendingReduces.addFirst(new ContainerRequest(reqEvent,
++            PRIORITY_REDUCE));
++      } else {
++        //reduces are added to pending queue and are slowly ramped up
++        pendingReduces.add(new ContainerRequest(reqEvent,
++            PRIORITY_REDUCE));
++      }
++    } else {
++      String diagMsg = "REDUCE capability required is more than the " +
++          "supported max container capability in the cluster. Killing" +
++          " the Job. reduceResourceRequest: " + reduceResourceRequest +
++          " maxContainerCapability:" + supportedMaxContainerCapability;
++      LOG.info(diagMsg);
++      eventHandler.handle(new JobDiagnosticsUpdateEvent(jobId, diagMsg));
++      eventHandler.handle(new JobEvent(jobId, JobEventType.JOB_KILL));
++    }
++  }
++
++  @SuppressWarnings({ "unchecked" })
++  private void handleMapContainerRequest(ContainerRequestEvent reqEvent) {
++    assert(reqEvent.getAttemptID().getTaskId().getTaskType().equals(
++        TaskType.MAP));
++
++    Resource supportedMaxContainerCapability = getMaxContainerCapability();
++    JobId jobId = getJob().getID();
++
++    if (mapResourceRequest.equals(Resources.none())) {
++      mapResourceRequest = reqEvent.getCapability();
++      eventHandler.handle(new JobHistoryEvent(jobId,
++          new NormalizedResourceEvent(
++              org.apache.hadoop.mapreduce.TaskType.MAP,
++              mapResourceRequest.getMemory())));
++      LOG.info("mapResourceRequest:" + mapResourceRequest);
++    }
++
++    boolean mapContainerRequestAccepted = true;
++    if (mapResourceRequest.getMemory() >
++        supportedMaxContainerCapability.getMemory()
++        ||
++        mapResourceRequest.getVirtualCores() >
++        supportedMaxContainerCapability.getVirtualCores()) {
++      mapContainerRequestAccepted = false;
++    }
++
++    if(mapContainerRequestAccepted) {
++      // set the resources
++      reqEvent.getCapability().setMemory(
++          mapResourceRequest.getMemory());
++      reqEvent.getCapability().setVirtualCores(
++          mapResourceRequest.getVirtualCores());
++      scheduledRequests.addMap(reqEvent); //maps are immediately scheduled
++    } else {
++      String diagMsg = "The required MAP capability is more than the " +
++          "supported max container capability in the cluster. Killing" +
++          " the Job. mapResourceRequest: " + mapResourceRequest +
++          " maxContainerCapability:" + supportedMaxContainerCapability;
++      LOG.info(diagMsg);
++      eventHandler.handle(new JobDiagnosticsUpdateEvent(jobId, diagMsg));
++      eventHandler.handle(new JobEvent(jobId, JobEventType.JOB_KILL));
++    }
++  }
++
+   private static String getHost(String contMgrAddress) {
+     String host = contMgrAddress;
+     String[] hostport = host.split(":");
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
+index dc1eb4c..ace1568 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/rm/TestRMContainerAllocator.java
+@@ -1589,12 +1589,18 @@ public void forceResourceLimit(Resource resource) {
+ 
+   private ContainerRequestEvent createReq(JobId jobId, int taskAttemptId,
+       int memory, String[] hosts) {
+-    return createReq(jobId, taskAttemptId, memory, hosts, false, false);
++    return createReq(jobId, taskAttemptId, memory, 1, hosts, false, false);
+   }
+ 
+-  private ContainerRequestEvent
+-      createReq(JobId jobId, int taskAttemptId, int memory, String[] hosts,
+-          boolean earlierFailedAttempt, boolean reduce) {
++  private ContainerRequestEvent createReq(JobId jobId, int taskAttemptId,
++      int mem, String[] hosts, boolean earlierFailedAttempt, boolean reduce) {
++    return createReq(jobId, taskAttemptId, mem,
++        1, hosts, earlierFailedAttempt, reduce);
++  }
++
++  private ContainerRequestEvent createReq(JobId jobId, int taskAttemptId,
++      int memory, int vcore, String[] hosts, boolean earlierFailedAttempt,
++      boolean reduce) {
+     TaskId taskId;
+     if (reduce) {
+       taskId = MRBuilderUtils.newTaskId(jobId, 0, TaskType.REDUCE);
+@@ -1603,7 +1609,7 @@ private ContainerRequestEvent createReq(JobId jobId, int taskAttemptId,
+     }
+     TaskAttemptId attemptId = MRBuilderUtils.newTaskAttemptId(taskId,
+         taskAttemptId);
+-    Resource containerNeed = Resource.newInstance(memory, 1);
++    Resource containerNeed = Resource.newInstance(memory, vcore);
+     if (earlierFailedAttempt) {
+       return ContainerRequestEvent
+           .createContainerRequestEventForFailedContainer(attemptId,
+@@ -2401,6 +2407,86 @@ public void testRMContainerAllocatorResendsRequestsOnRMRestart()
+   }
+ 
+   @Test
++  public void testUnsupportedMapContainerRequirement() throws Exception {
++    final Resource maxContainerSupported = Resource.newInstance(1, 1);
++
++    final ApplicationId appId = ApplicationId.newInstance(1, 1);
++    final ApplicationAttemptId appAttemptId =
++        ApplicationAttemptId.newInstance(appId, 1);
++    final JobId jobId =
++        MRBuilderUtils.newJobId(appAttemptId.getApplicationId(), 0);
++
++    final MockScheduler mockScheduler = new MockScheduler(appAttemptId);
++    final Configuration conf = new Configuration();
++
++    final MyContainerAllocator allocator = new MyContainerAllocator(null,
++        conf, appAttemptId, mock(Job.class), new SystemClock()) {
++      @Override
++      protected void register() {
++      }
++      @Override
++      protected ApplicationMasterProtocol createSchedulerProxy() {
++        return mockScheduler;
++      }
++      @Override
++      protected Resource getMaxContainerCapability() {
++        return maxContainerSupported;
++      }
++    };
++
++    ContainerRequestEvent mapRequestEvt = createReq(jobId, 0,
++        (int) (maxContainerSupported.getMemory() + 10),
++        maxContainerSupported.getVirtualCores(),
++        new String[0], false, false);
++    allocator.sendRequests(Arrays.asList(mapRequestEvt));
++    allocator.schedule();
++
++    Assert.assertEquals(0, mockScheduler.lastAnyAskMap);
++  }
++
++  @Test
++  public void testUnsupportedReduceContainerRequirement() throws Exception {
++    final Resource maxContainerSupported = Resource.newInstance(1, 1);
++
++    final ApplicationId appId = ApplicationId.newInstance(1, 1);
++    final ApplicationAttemptId appAttemptId = ApplicationAttemptId.newInstance(
++        appId, 1);
++    final JobId jobId =
++        MRBuilderUtils.newJobId(appAttemptId.getApplicationId(), 0);
++
++    final MockScheduler mockScheduler = new MockScheduler(appAttemptId);
++    final Configuration conf = new Configuration();
++
++    final MyContainerAllocator allocator = new MyContainerAllocator(null,
++        conf, appAttemptId, mock(Job.class), new SystemClock()) {
++      @Override
++      protected void register() {
++      }
++      @Override
++      protected ApplicationMasterProtocol createSchedulerProxy() {
++        return mockScheduler;
++      }
++      @Override
++      protected Resource getMaxContainerCapability() {
++        return maxContainerSupported;
++      }
++    };
++
++    ContainerRequestEvent reduceRequestEvt = createReq(jobId, 0,
++        (int) (maxContainerSupported.getMemory() + 10),
++        maxContainerSupported.getVirtualCores(),
++        new String[0], false, true);
++    allocator.sendRequests(Arrays.asList(reduceRequestEvt));
++    // Reducer container requests are added to the pending queue upon request,
++    // schedule all reducers here so that we can observe if reducer requests
++    // are accepted by RMContainerAllocator on RM side.
++    allocator.scheduleAllReduces();
++    allocator.schedule();
++
++    Assert.assertEquals(0, mockScheduler.lastAnyAskReduce);
++  }
++
++  @Test
+   public void testRMUnavailable()
+       throws Exception {
+     Configuration conf = new Configuration();
+-- 
+1.7.9.5
+

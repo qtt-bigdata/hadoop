@@ -1,0 +1,434 @@
+From 1e5bd688901cfb80fb08445735a31a50b5273cd3 Mon Sep 17 00:00:00 2001
+From: Robert Kanter <rkanter@apache.org>
+Date: Fri, 21 Apr 2017 16:12:01 -0700
+Subject: [PATCH 2394/2848] MAPREDUCE-6871. Allow users to specify racks and
+ nodes for strict locality for AMs (rkanter)
+
+(cherry picked from commit 3721cfe1fbd98c5b6aa46aefdfcf62276c28c4a4)
+(cherry picked from commit d686560b353c59278ce6f67e43744bb8636442c6)
+
+Conflicts:
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+
+Detailed Conflicts:
+- MRJobConfig
+    - trivial conflict with node label constants
+- YARNRunner
+    - trivial conflict with constants due to missing MAPREDUCE-6304, which is for node labels
+    - Follow-on trivial conflict (setMemorySize call -> setMemory call) due to missing YARN-5270
+    - missing node labels -> surgically removed
+- TestYARNRunner
+    - missing test method -> removed
+    - trivial conflict (setMemorySize call -> setMemory call) due to missing YARN-5270
+    - missing node labels -> surgically removed
+
+Change-Id: I847e09576ae7ad36fa5949989c36a56d5f4e7fc8
+---
+ .../org/apache/hadoop/mapreduce/MRJobConfig.java   |    6 +
+ .../java/org/apache/hadoop/mapred/YARNRunner.java  |  131 ++++++++++++++--
+ .../org/apache/hadoop/mapred/TestYARNRunner.java   |  165 ++++++++++++++++++++
+ 3 files changed, 285 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+index 30e0a87..2fae5e3 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+@@ -66,6 +66,12 @@
+ 
+   public static final String QUEUE_NAME = "mapreduce.job.queuename";
+ 
++  /**
++   * Specify strict locality on a comma-separated list of racks and/or nodes.
++   * Syntax: /rack or /rack/node or node (assumes /default-rack)
++   */
++  public static final String AM_STRICT_LOCALITY = "mapreduce.job.am.strict-locality";
++
+   public static final String RESERVATION_ID = "mapreduce.job.reservation.id";
+ 
+   public static final String JOB_TAGS = "mapreduce.job.tags";
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+index 6f4abc5..605b573 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+@@ -22,12 +22,13 @@
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Vector;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -77,8 +78,10 @@
+ import org.apache.hadoop.yarn.api.records.LocalResource;
+ import org.apache.hadoop.yarn.api.records.LocalResourceType;
+ import org.apache.hadoop.yarn.api.records.LocalResourceVisibility;
++import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.ReservationId;
+ import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.api.records.URL;
+ import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+@@ -98,7 +101,34 @@
+ 
+   private static final Log LOG = LogFactory.getLog(YARNRunner.class);
+ 
+-  private final RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
++  private static final String RACK_GROUP = "rack";
++  private static final String NODE_IF_RACK_GROUP = "node1";
++  private static final String NODE_IF_NO_RACK_GROUP = "node2";
++
++  /**
++   * Matches any of the following patterns with capturing groups:
++   * <ul>
++   *  <li>/rack</li>
++   *  <li>/rack/node</li>
++   *  <li>node (assumes /default-rack)</li>
++   * </ul>
++   * The groups can be retrieved using the RACK_GROUP, NODE_IF_RACK_GROUP,
++   * and/or NODE_IF_NO_RACK_GROUP group keys.
++   */
++  private static final Pattern RACK_NODE_PATTERN =
++      Pattern.compile(
++          String.format("(?<%s>[^/]+?)|(?<%s>/[^/]+?)(?:/(?<%s>[^/]+?))?",
++          NODE_IF_NO_RACK_GROUP, RACK_GROUP, NODE_IF_RACK_GROUP));
++
++  private final static RecordFactory recordFactory = RecordFactoryProvider
++      .getRecordFactory(null);
++
++  public final static Priority AM_CONTAINER_PRIORITY = recordFactory
++      .newRecordInstance(Priority.class);
++  static {
++    AM_CONTAINER_PRIORITY.setPriority(0);
++  }
++
+   private ResourceMgrDelegate resMgrDelegate;
+   private ClientCache clientCache;
+   private Configuration conf;
+@@ -489,20 +519,6 @@ public ApplicationSubmissionContext createApplicationSubmissionContext(
+       throws IOException {
+     ApplicationId applicationId = resMgrDelegate.getApplicationId();
+ 
+-    // Setup resource requirements
+-    Resource capability = recordFactory.newRecordInstance(Resource.class);
+-    capability.setMemory(
+-        conf.getInt(
+-            MRJobConfig.MR_AM_VMEM_MB, MRJobConfig.DEFAULT_MR_AM_VMEM_MB
+-        )
+-    );
+-    capability.setVirtualCores(
+-        conf.getInt(
+-            MRJobConfig.MR_AM_CPU_VCORES, MRJobConfig.DEFAULT_MR_AM_CPU_VCORES
+-        )
+-    );
+-    LOG.debug("AppMaster capability = " + capability);
+-
+     // Setup LocalResources
+     Map<String, LocalResource> localResources =
+         setupLocalResources(jobConf, jobSubmitDir);
+@@ -557,7 +573,11 @@ public ApplicationSubmissionContext createApplicationSubmissionContext(
+     appContext.setMaxAppAttempts(
+         conf.getInt(MRJobConfig.MR_AM_MAX_ATTEMPTS,
+             MRJobConfig.DEFAULT_MR_AM_MAX_ATTEMPTS));
+-    appContext.setResource(capability);
++
++    // Setup the AM ResourceRequests
++    List<ResourceRequest> amResourceRequests = generateResourceRequests();
++    appContext.setAMContainerResourceRequests(amResourceRequests);
++
+     appContext.setApplicationType(MRJobConfig.MR_APPLICATION_TYPE);
+     if (tagsFromConf != null && !tagsFromConf.isEmpty()) {
+       appContext.setApplicationTags(new HashSet<>(tagsFromConf));
+@@ -566,6 +586,83 @@ public ApplicationSubmissionContext createApplicationSubmissionContext(
+     return appContext;
+   }
+ 
++  private List<ResourceRequest> generateResourceRequests() throws IOException {
++    Resource capability = recordFactory.newRecordInstance(Resource.class);
++    capability.setMemory(
++        conf.getInt(
++            MRJobConfig.MR_AM_VMEM_MB, MRJobConfig.DEFAULT_MR_AM_VMEM_MB
++        )
++    );
++    capability.setVirtualCores(
++        conf.getInt(
++            MRJobConfig.MR_AM_CPU_VCORES, MRJobConfig.DEFAULT_MR_AM_CPU_VCORES
++        )
++    );
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("AppMaster capability = " + capability);
++    }
++
++    List<ResourceRequest> amResourceRequests = new ArrayList<>();
++    // Always have an ANY request
++    ResourceRequest amAnyResourceRequest =
++        createAMResourceRequest(ResourceRequest.ANY, capability);
++    Map<String, ResourceRequest> rackRequests = new HashMap<>();
++    amResourceRequests.add(amAnyResourceRequest);
++    Collection<String> amStrictResources = conf.getStringCollection(
++        MRJobConfig.AM_STRICT_LOCALITY);
++    for (String amStrictResource : amStrictResources) {
++      amAnyResourceRequest.setRelaxLocality(false);
++      Matcher matcher = RACK_NODE_PATTERN.matcher(amStrictResource);
++      if (matcher.matches()) {
++        String nodeName;
++        String rackName = matcher.group(RACK_GROUP);
++        if (rackName == null) {
++          rackName = "/default-rack";
++          nodeName = matcher.group(NODE_IF_NO_RACK_GROUP);
++        } else {
++          nodeName = matcher.group(NODE_IF_RACK_GROUP);
++        }
++        ResourceRequest amRackResourceRequest = rackRequests.get(rackName);
++        if (amRackResourceRequest == null) {
++          amRackResourceRequest = createAMResourceRequest(rackName, capability);
++          amResourceRequests.add(amRackResourceRequest);
++          rackRequests.put(rackName, amRackResourceRequest);
++        }
++        if (nodeName != null) {
++          amRackResourceRequest.setRelaxLocality(false);
++          ResourceRequest amNodeResourceRequest =
++              createAMResourceRequest(nodeName, capability);
++          amResourceRequests.add(amNodeResourceRequest);
++        }
++      } else {
++        String errMsg =
++            "Invalid resource name: " + amStrictResource + " specified.";
++        LOG.warn(errMsg);
++        throw new IOException(errMsg);
++      }
++    }
++    if (LOG.isDebugEnabled()) {
++      for (ResourceRequest amResourceRequest : amResourceRequests) {
++        LOG.debug("ResourceRequest: resource = "
++            + amResourceRequest.getResourceName() + ", locality = "
++            + amResourceRequest.getRelaxLocality());
++      }
++    }
++    return amResourceRequests;
++  }
++
++  private ResourceRequest createAMResourceRequest(String resource,
++      Resource capability) {
++    ResourceRequest resourceRequest =
++        recordFactory.newRecordInstance(ResourceRequest.class);
++    resourceRequest.setPriority(AM_CONTAINER_PRIORITY);
++    resourceRequest.setResourceName(resource);
++    resourceRequest.setCapability(capability);
++    resourceRequest.setNumContainers(1);
++    resourceRequest.setRelaxLocality(true);
++    return resourceRequest;
++  }
++
+   @Override
+   public void setJobPriority(JobID arg0, String arg1) throws IOException,
+       InterruptedException {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+index d745cff..742167e 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+@@ -18,6 +18,11 @@
+ 
+ package org.apache.hadoop.mapred;
+ 
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ import static org.mockito.Matchers.any;
+ import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.doReturn;
+@@ -35,6 +40,7 @@
+ import java.net.InetSocketAddress;
+ import java.nio.ByteBuffer;
+ import java.security.PrivilegedExceptionAction;
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -89,6 +95,8 @@
+ import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.QueueInfo;
++import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+ import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
+ import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl;
+@@ -522,6 +530,163 @@ public void testAMProfiler() throws Exception {
+   }
+ 
+   @Test
++  public void testResourceRequestLocalityAny() throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, true);
++    verifyResourceRequestLocality(null, null, amAnyResourceRequest);
++    verifyResourceRequestLocality(null, "label1", amAnyResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityRack() throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/rack1", true);
++    verifyResourceRequestLocality("/rack1", null, amAnyResourceRequest,
++        amRackResourceRequest);
++    verifyResourceRequestLocality("/rack1", "label1", amAnyResourceRequest,
++        amRackResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityNode() throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/rack1", false);
++    ResourceRequest amNodeResourceRequest =
++        createResourceRequest("node1", true);
++    verifyResourceRequestLocality("/rack1/node1", null, amAnyResourceRequest,
++        amRackResourceRequest, amNodeResourceRequest);
++    verifyResourceRequestLocality("/rack1/node1", "label1",
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityNodeDefaultRack() throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/default-rack", false);
++    ResourceRequest amNodeResourceRequest =
++        createResourceRequest("node1", true);
++    verifyResourceRequestLocality("node1", null,
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest);
++    verifyResourceRequestLocality("node1", "label1",
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityMultipleNodes() throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/rack1", false);
++    ResourceRequest amNodeResourceRequest =
++        createResourceRequest("node1", true);
++    ResourceRequest amNode2ResourceRequest =
++        createResourceRequest("node2", true);
++    verifyResourceRequestLocality("/rack1/node1,/rack1/node2", null,
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amNode2ResourceRequest);
++    verifyResourceRequestLocality("/rack1/node1,/rack1/node2", "label1",
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amNode2ResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityMultipleNodesDifferentRack()
++      throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/rack1", false);
++    ResourceRequest amNodeResourceRequest =
++        createResourceRequest("node1", true);
++    ResourceRequest amRack2ResourceRequest =
++        createResourceRequest("/rack2", false);
++    ResourceRequest amNode2ResourceRequest =
++        createResourceRequest("node2", true);
++    verifyResourceRequestLocality("/rack1/node1,/rack2/node2", null,
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amRack2ResourceRequest, amNode2ResourceRequest);
++    verifyResourceRequestLocality("/rack1/node1,/rack2/node2", "label1",
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amRack2ResourceRequest, amNode2ResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityMultipleNodesDefaultRack()
++      throws Exception {
++    ResourceRequest amAnyResourceRequest =
++        createResourceRequest(ResourceRequest.ANY, false);
++    ResourceRequest amRackResourceRequest =
++        createResourceRequest("/rack1", false);
++    ResourceRequest amNodeResourceRequest =
++        createResourceRequest("node1", true);
++    ResourceRequest amRack2ResourceRequest =
++        createResourceRequest("/default-rack", false);
++    ResourceRequest amNode2ResourceRequest =
++        createResourceRequest("node2", true);
++    verifyResourceRequestLocality("/rack1/node1,node2", null,
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amRack2ResourceRequest, amNode2ResourceRequest);
++    verifyResourceRequestLocality("/rack1/node1,node2", "label1",
++        amAnyResourceRequest, amRackResourceRequest, amNodeResourceRequest,
++        amRack2ResourceRequest, amNode2ResourceRequest);
++  }
++
++  @Test
++  public void testResourceRequestLocalityInvalid() throws Exception {
++    try {
++      verifyResourceRequestLocality("rack/node1", null,
++          new ResourceRequest[]{});
++      fail("Should have failed due to invalid resource but did not");
++    } catch (IOException ioe) {
++      assertTrue(ioe.getMessage().contains("Invalid resource name"));
++    }
++    try {
++      verifyResourceRequestLocality("/rack/node1/blah", null,
++          new ResourceRequest[]{});
++      fail("Should have failed due to invalid resource but did not");
++    } catch (IOException ioe) {
++      assertTrue(ioe.getMessage().contains("Invalid resource name"));
++    }
++  }
++
++  private void verifyResourceRequestLocality(String strictResource,
++      String label, ResourceRequest... expectedReqs) throws Exception {
++    JobConf jobConf = new JobConf();
++    if (strictResource != null) {
++      jobConf.set(MRJobConfig.AM_STRICT_LOCALITY, strictResource);
++    }
++
++    YARNRunner yarnRunner = new YARNRunner(jobConf);
++    ApplicationSubmissionContext appSubCtx =
++        buildSubmitContext(yarnRunner, jobConf);
++    assertEquals(Arrays.asList(expectedReqs),
++        appSubCtx.getAMContainerResourceRequests());
++  }
++
++  private ResourceRequest createResourceRequest(String name,
++      boolean relaxLocality) {
++    Resource capability = recordFactory.newRecordInstance(Resource.class);
++    capability.setMemory(MRJobConfig.DEFAULT_MR_AM_VMEM_MB);
++    capability.setVirtualCores(MRJobConfig.DEFAULT_MR_AM_CPU_VCORES);
++
++    ResourceRequest req =
++        recordFactory.newRecordInstance(ResourceRequest.class);
++    req.setPriority(YARNRunner.AM_CONTAINER_PRIORITY);
++    req.setResourceName(name);
++    req.setCapability(capability);
++    req.setNumContainers(1);
++    req.setRelaxLocality(relaxLocality);
++
++    return req;
++  }
++
++  @Test
+   public void testAMStandardEnvWithDefaultLibPath() throws Exception {
+     testAMStandardEnv(false);
+   }
+-- 
+1.7.9.5
+

@@ -1,0 +1,303 @@
+From 35b53bf57d6d31d9f6dab1ccaebd9a7f6f7533e3 Mon Sep 17 00:00:00 2001
+From: Manoj Govindassamy <manojpec@apache.org>
+Date: Tue, 1 Aug 2017 16:28:20 -0700
+Subject: [PATCH 2571/2848] HDFS-12217. HDFS snapshots doesn't capture all
+ open files when one of the open files is deleted.
+
+(cherry picked from commit 52d7bafcf49916887197436ddb0f08f021d248d9)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+
+Change-Id: Idb78f1e8321773cd05861b2f212cca905954288f
+---
+ .../hadoop/hdfs/protocol/SnapshotException.java    |    4 +
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    2 +-
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   23 ++--
+ .../snapshot/DirectorySnapshottableFeature.java    |   18 +--
+ .../hdfs/server/namenode/TestLeaseManager.java     |    6 +-
+ .../snapshot/TestOpenFilesWithSnapshot.java        |  126 ++++++++++++++++++++
+ 6 files changed, 159 insertions(+), 20 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/SnapshotException.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/SnapshotException.java
+index e9c5b2a..49f3eaa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/SnapshotException.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/SnapshotException.java
+@@ -30,4 +30,8 @@ public SnapshotException(final String message) {
+   public SnapshotException(final Throwable cause) {
+     super(cause);
+   }
++
++  public SnapshotException(final String message, final Throwable cause) {
++    super(message, cause);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 217c8e4..9494b20 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -7113,7 +7113,7 @@ private long nextBlockId() throws IOException {
+     return blockId;
+   }
+ 
+-  private boolean isFileDeleted(INodeFile file) {
++  boolean isFileDeleted(INodeFile file) {
+     // Not in the inodeMap or in the snapshot but marked deleted.
+     if (dir.getInode(file.getId()) == null) {
+       return true;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index 99cb90c..d2aee54 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -137,18 +137,25 @@ synchronized long getNumUnderConstructionBlocks() {
+    *
+    * @return Set<INodesInPath>
+    */
+-  public Set<INodesInPath> getINodeWithLeases() {
++  @VisibleForTesting
++  Set<INodesInPath> getINodeWithLeases() throws IOException {
+     return getINodeWithLeases(null);
+   }
+ 
+   private synchronized INode[] getINodesWithLease() {
+-    int inodeCount = 0;
+-    INode[] inodes = new INode[leasesById.size()];
++    List<INode> inodes = new ArrayList<>(leasesById.size());
++    INode currentINode;
+     for (long inodeId : leasesById.keySet()) {
+-      inodes[inodeCount] = fsnamesystem.getFSDirectory().getInode(inodeId);
+-      inodeCount++;
++      currentINode = fsnamesystem.getFSDirectory().getInode(inodeId);
++      // A file with an active lease could get deleted, or its
++      // parent directories could get recursively deleted.
++      if (currentINode != null &&
++          currentINode.isFile() &&
++          !fsnamesystem.isFileDeleted(currentINode.asFile())) {
++        inodes.add(currentINode);
++      }
+     }
+-    return inodes;
++    return inodes.toArray(new INode[0]);
+   }
+ 
+   /**
+@@ -161,7 +168,7 @@ synchronized long getNumUnderConstructionBlocks() {
+    * @return Set<INodesInPath>
+    */
+   public Set<INodesInPath> getINodeWithLeases(final INodeDirectory
+-      ancestorDir) {
++      ancestorDir) throws IOException {
+     assert fsnamesystem.hasReadLock();
+     final long startTimeMs = Time.monotonicNow();
+     Set<INodesInPath> iipSet = new HashSet<>();
+@@ -216,7 +223,7 @@ synchronized long getNumUnderConstructionBlocks() {
+       try {
+         iipSet.addAll(f.get());
+       } catch (Exception e) {
+-        LOG.warn("INode filter task encountered exception: ", e);
++        throw new IOException("Failed to get files with active leases", e);
+       }
+     }
+     final long endTimeMs = Time.monotonicNow();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+index 1a69645..83d47ef 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+@@ -194,17 +194,17 @@ public Snapshot addSnapshot(INodeDirectory snapshotRoot, int id, String name,
+     s.getRoot().setModificationTime(now, Snapshot.CURRENT_STATE_ID);
+ 
+     if (captureOpenFiles) {
+-      Set<INodesInPath> openFilesIIP =
+-          leaseManager.getINodeWithLeases(snapshotRoot);
+-      for (INodesInPath openFileIIP : openFilesIIP)  {
+-        INode lastINode = openFileIIP.getLastINode();
+-        // TODO: Pending create file can get deleted and the lastINode
+-        // could thus be null. LeaseManager should return INodes for
+-        // non-deleted files only.
+-        if (lastINode != null) {
+-          INodeFile openFile = lastINode.asFile();
++      try {
++        Set<INodesInPath> openFilesIIP =
++            leaseManager.getINodeWithLeases(snapshotRoot);
++        for (INodesInPath openFileIIP : openFilesIIP) {
++          INodeFile openFile = openFileIIP.getLastINode().asFile();
+           openFile.recordModification(openFileIIP.getLatestSnapshotId());
+         }
++      } catch (Exception e) {
++        throw new SnapshotException("Failed to add snapshot: Unable to " +
++            "capture all open files under the snapshot dir " +
++            snapshotRoot.getFullPathName() + " for snapshot '" + name + "'", e);
+       }
+     }
+     return s;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+index 367b480..ce78553 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+@@ -40,6 +40,7 @@
+ import org.junit.Test;
+ import org.junit.rules.Timeout;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -259,7 +260,7 @@ public void testInodeWithLeasesAtScale() throws Exception {
+ 
+   private void testInodeWithLeasesAtScaleImpl(final LeaseManager leaseManager,
+       final FSDirectory fsDirectory, INodeDirectory ancestorDirectory,
+-      int scale) {
++      int scale) throws IOException {
+     verifyINodeLeaseCounts(leaseManager, ancestorDirectory, 0, 0, 0);
+ 
+     Set<Long> iNodeIds = new HashSet<>();
+@@ -370,7 +371,8 @@ public void testInodeWithLeasesForAncestorDir() throws Exception {
+ 
+   private void verifyINodeLeaseCounts(final LeaseManager leaseManager,
+       INodeDirectory ancestorDirectory, int iNodeIdWithLeaseCount,
+-      int iNodeWithLeaseCount, int iNodeUnderAncestorLeaseCount) {
++      int iNodeWithLeaseCount, int iNodeUnderAncestorLeaseCount)
++      throws IOException {
+     assertEquals(iNodeIdWithLeaseCount,
+         leaseManager.getINodeIdWithLeases().size());
+     assertEquals(iNodeWithLeaseCount,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestOpenFilesWithSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestOpenFilesWithSnapshot.java
+index 21ccf66..0613539 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestOpenFilesWithSnapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestOpenFilesWithSnapshot.java
+@@ -502,6 +502,132 @@ public void testSnapshotsForOpenFilesWithNNRestart() throws Exception {
+     flumeOutputStream.close();
+   }
+ 
++  /**
++   * Test snapshot capturing open files when an open file with active lease
++   * is deleted by the client.
++   */
++  @Test (timeout = 120000)
++  public void testSnapshotsForOpenFilesAndDeletion() throws Exception {
++    // Construct the directory tree
++    final Path snapRootDir = new Path("/level_0_A");
++    final String flumeFileName = "flume.log";
++    final String hbaseFileName = "hbase.log";
++    final String snap1Name = "snap_1";
++    final String snap2Name = "snap_2";
++    final String snap3Name = "snap_3";
++
++    // Create files and open streams
++    final Path flumeFile = new Path(snapRootDir, flumeFileName);
++    createFile(flumeFile);
++    final Path hbaseFile = new Path(snapRootDir, hbaseFileName);
++    createFile(hbaseFile);
++    FSDataOutputStream flumeOutputStream = fs.append(flumeFile);
++    FSDataOutputStream hbaseOutputStream = fs.append(hbaseFile);
++
++    // Create Snapshot S1
++    final Path snap1Dir = SnapshotTestHelper.createSnapshot(
++        fs, snapRootDir, snap1Name);
++    final Path flumeS1Path = new Path(snap1Dir, flumeFileName);
++    final long flumeFileLengthAfterS1 = fs.getFileStatus(flumeFile).getLen();
++    final Path hbaseS1Path = new Path(snap1Dir, hbaseFileName);
++    final long hbaseFileLengthAfterS1 = fs.getFileStatus(hbaseFile).getLen();
++
++    // Verify if Snap S1 file length is same as the the current versions
++    Assert.assertEquals(flumeFileLengthAfterS1,
++        fs.getFileStatus(flumeS1Path).getLen());
++    Assert.assertEquals(hbaseFileLengthAfterS1,
++        fs.getFileStatus(hbaseS1Path).getLen());
++
++    long flumeFileWrittenDataLength = flumeFileLengthAfterS1;
++    long hbaseFileWrittenDataLength = hbaseFileLengthAfterS1;
++    int newWriteLength = (int) (BLOCKSIZE * 1.5);
++    byte[] buf = new byte[newWriteLength];
++    Random random = new Random();
++    random.nextBytes(buf);
++
++    // Write more data to files
++    flumeFileWrittenDataLength += writeToStream(flumeOutputStream, buf);
++    hbaseFileWrittenDataLength += writeToStream(hbaseOutputStream, buf);
++
++    // Create Snapshot S2
++    final Path snap2Dir = SnapshotTestHelper.createSnapshot(
++        fs, snapRootDir, snap2Name);
++    final Path flumeS2Path = new Path(snap2Dir, flumeFileName);
++    final Path hbaseS2Path = new Path(snap2Dir, hbaseFileName);
++
++    // Verify current files length are same as all data written till now
++    final long flumeFileLengthAfterS2 = fs.getFileStatus(flumeFile).getLen();
++    Assert.assertEquals(flumeFileWrittenDataLength, flumeFileLengthAfterS2);
++    final long hbaseFileLengthAfterS2 = fs.getFileStatus(hbaseFile).getLen();
++    Assert.assertEquals(hbaseFileWrittenDataLength, hbaseFileLengthAfterS2);
++
++    // Verify if Snap S2 file length is same as the current versions
++    Assert.assertEquals(flumeFileLengthAfterS2,
++        fs.getFileStatus(flumeS2Path).getLen());
++    Assert.assertEquals(hbaseFileLengthAfterS2,
++        fs.getFileStatus(hbaseS2Path).getLen());
++
++    // Write more data to open files
++    writeToStream(flumeOutputStream, buf);
++    hbaseFileWrittenDataLength += writeToStream(hbaseOutputStream, buf);
++
++    // Verify old snapshots have point-in-time/frozen file
++    // lengths even after the current versions have moved forward.
++    Assert.assertEquals(flumeFileLengthAfterS1,
++        fs.getFileStatus(flumeS1Path).getLen());
++    Assert.assertEquals(flumeFileLengthAfterS2,
++        fs.getFileStatus(flumeS2Path).getLen());
++    Assert.assertEquals(hbaseFileLengthAfterS1,
++        fs.getFileStatus(hbaseS1Path).getLen());
++    Assert.assertEquals(hbaseFileLengthAfterS2,
++        fs.getFileStatus(hbaseS2Path).getLen());
++
++    // Delete flume current file. Snapshots should
++    // still have references to flume file.
++    boolean flumeFileDeleted = fs.delete(flumeFile, true);
++    Assert.assertTrue(flumeFileDeleted);
++    Assert.assertFalse(fs.exists(flumeFile));
++    Assert.assertTrue(fs.exists(flumeS1Path));
++    Assert.assertTrue(fs.exists(flumeS2Path));
++
++    SnapshotTestHelper.createSnapshot(fs, snapRootDir, "tmp_snap");
++    fs.deleteSnapshot(snapRootDir, "tmp_snap");
++
++    // Delete snap_2. snap_1 still has reference to
++    // the flume file.
++    fs.deleteSnapshot(snapRootDir, snap2Name);
++    Assert.assertFalse(fs.exists(flumeS2Path));
++    Assert.assertTrue(fs.exists(flumeS1Path));
++
++    // Delete snap_1. Now all traces of flume file
++    // is gone.
++    fs.deleteSnapshot(snapRootDir, snap1Name);
++    Assert.assertFalse(fs.exists(flumeS2Path));
++    Assert.assertFalse(fs.exists(flumeS1Path));
++
++    // Create Snapshot S3
++    final Path snap3Dir = SnapshotTestHelper.createSnapshot(
++        fs, snapRootDir, snap3Name);
++    final Path hbaseS3Path = new Path(snap3Dir, hbaseFileName);
++
++    // Verify live files length is same as all data written till now
++    final long hbaseFileLengthAfterS3 = fs.getFileStatus(hbaseFile).getLen();
++    Assert.assertEquals(hbaseFileWrittenDataLength, hbaseFileLengthAfterS3);
++
++    // Write more data to open files
++    hbaseFileWrittenDataLength += writeToStream(hbaseOutputStream, buf);
++
++    // Verify old snapshots have point-in-time/frozen file
++    // lengths even after the flume open file is deleted and
++    // the hbase live file has moved forward.
++    Assert.assertEquals(hbaseFileLengthAfterS3,
++        fs.getFileStatus(hbaseS3Path).getLen());
++    Assert.assertEquals(hbaseFileWrittenDataLength,
++        fs.getFileStatus(hbaseFile).getLen());
++
++    hbaseOutputStream.close();
++  }
++
+   private void restartNameNode() throws Exception {
+     cluster.triggerBlockReports();
+     NameNode nameNode = cluster.getNameNode();
+-- 
+1.7.9.5
+

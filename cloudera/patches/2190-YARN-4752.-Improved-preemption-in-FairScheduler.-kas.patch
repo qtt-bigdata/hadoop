@@ -1,0 +1,4335 @@
+From db090dc85c2aa117de4527b71447b8cbe4a20ba2 Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@apache.org>
+Date: Fri, 27 Jan 2017 10:38:57 -0800
+Subject: [PATCH 2190/2848] YARN-4752. Improved preemption in FairScheduler.
+ (kasha)
+
+The backport was done manually by copying changes from YARN-4752, because they were too many conflicts due to locking and node-labeling changes. Notable differences are:
+* FSLeafQueue#assignContainer is now more in line with upstream, capturing apps with demand in a TreeSet instead of explicit sorting.
+* RMContainerImpl now implements Comparable; upstream, this was introduced in YARN-2498 (CS preemption and node labels).
+* TestFairScheduler - a couple of tests needed adding scheduler.update() after submitting an application.
+* More tests deleted from TestFSLeafQueue; upstream, the same were in TestFairSchedulerPreemption.
+
+Change-Id: I54b92b8fd206b2d7cfc0dc163301348e9081b3fd
+---
+ .../hadoop/yarn/util/resource/Resources.java       |    4 +
+ .../rmcontainer/RMContainerImpl.java               |   30 +-
+ .../scheduler/AppSchedulingInfo.java               |   16 +
+ .../scheduler/SchedulerApplicationAttempt.java     |   16 +
+ .../scheduler/common/fica/FiCaSchedulerApp.java    |   14 +
+ .../scheduler/fair/FSAppAttempt.java               |  232 ++--
+ .../resourcemanager/scheduler/fair/FSContext.java  |   54 +
+ .../scheduler/fair/FSLeafQueue.java                |  281 ++---
+ .../scheduler/fair/FSParentQueue.java              |   52 +-
+ .../scheduler/fair/FSPreemptionThread.java         |  188 ++++
+ .../resourcemanager/scheduler/fair/FSQueue.java    |   30 +-
+ .../scheduler/fair/FSSchedulerNode.java            |   37 +-
+ .../scheduler/fair/FSStarvedApps.java              |   85 ++
+ .../scheduler/fair/FairScheduler.java              |  240 +----
+ .../scheduler/fair/Schedulable.java                |   31 +-
+ .../scheduler/fair/FairSchedulerTestBase.java      |   25 +-
+ .../fair/FairSchedulerWithMockPreemption.java      |   58 +
+ .../scheduler/fair/FakeSchedulable.java            |    5 -
+ .../scheduler/fair/TestFSAppStarvation.java        |  256 +++++
+ .../scheduler/fair/TestFSLeafQueue.java            |  170 +--
+ .../scheduler/fair/TestFairScheduler.java          | 1117 +-------------------
+ .../fair/TestFairSchedulerPreemption.java          |  318 +++---
+ .../fair/TestQueueManagerRealScheduler.java        |  128 +++
+ .../scheduler/fair/TestSchedulingPolicy.java       |    5 -
+ 24 files changed, 1491 insertions(+), 1901 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSContext.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSStarvedApps.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerWithMockPreemption.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSAppStarvation.java
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestQueueManagerRealScheduler.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/resource/Resources.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/resource/Resources.java
+index 5cce433..df6ccf8 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/resource/Resources.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/resource/Resources.java
+@@ -109,6 +109,10 @@ public static Resource none() {
+     return NONE;
+   }
+   
++  public static boolean isNone(Resource other) {
++    return NONE.equals(other);
++  }
++
+   public static Resource unbounded() {
+     return UNBOUNDED;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+index 75daa48..c9b44ea 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+@@ -57,7 +57,7 @@
+ import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
+ 
+ @SuppressWarnings({"unchecked", "rawtypes"})
+-public class RMContainerImpl implements RMContainer {
++public class RMContainerImpl implements RMContainer, Comparable<RMContainer> {
+ 
+   private static final Log LOG = LogFactory.getLog(RMContainerImpl.class);
+ 
+@@ -391,7 +391,33 @@ public void handle(RMContainerEvent event) {
+   public ContainerStatus getFinishedStatus() {
+     return finishedStatus;
+   }
+-  
++
++  @Override
++  public boolean equals(Object obj) {
++    if (obj instanceof RMContainer) {
++      if (null != getContainerId()) {
++        return getContainerId().equals(((RMContainer) obj).getContainerId());
++      }
++    }
++    return false;
++  }
++
++  @Override
++  public int hashCode() {
++    if (null != getContainerId()) {
++      return getContainerId().hashCode();
++    }
++    return super.hashCode();
++  }
++
++  @Override
++  public int compareTo(RMContainer o) {
++    if (getContainerId() != null && o.getContainerId() != null) {
++      return getContainerId().compareTo(o.getContainerId());
++    }
++    return -1;
++  }
++
+   private static class BaseTransition implements
+       SingleArcTransition<RMContainerImpl, RMContainerEvent> {
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+index 72146ff..44b3068 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+@@ -271,6 +271,22 @@ public synchronized Resource getResource(Priority priority) {
+   }
+ 
+   /**
++   * Method to return the next resource request to be serviced.
++   *
++   * In the initial implementation, we just pick any {@link ResourceRequest}
++   * corresponding to the highest priority.
++   *
++   * @return next {@link ResourceRequest} to allocate resources for.
++   */
++  @Unstable
++  public synchronized ResourceRequest getNextResourceRequest() {
++    for (ResourceRequest rr : getAllResourceRequests()) {
++      return rr;
++    }
++    return null;
++  }
++
++  /**
+    * Returns if the node is either blacklisted by the user or the system
+    * @param resourceName the resourcename
+    * @param useAMBlacklist true if it should check amBlacklist
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+index dfafc94..05e27a8 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+@@ -663,4 +663,20 @@ public void recordContainerAllocationTime(long value) {
+       }
+     }
+   }
++
++  @Override
++  public int hashCode() {
++    return getApplicationAttemptId().hashCode();
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (! (o instanceof SchedulerApplicationAttempt)) {
++      return false;
++    }
++
++    SchedulerApplicationAttempt other = (SchedulerApplicationAttempt) o;
++    return (this == other ||
++        this.getApplicationAttemptId().equals(other.getApplicationAttemptId()));
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+index 2f9569c..136ae5f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+@@ -309,5 +309,19 @@ public synchronized void transferStateFromPreviousAttempt(
+       ((FiCaSchedulerApp) appAttempt).getHeadroomProvider();
+   }
+ 
++  /*
++   * Overriding to appease findbugs
++   */
++  @Override
++  public int hashCode() {
++    return super.hashCode();
++  }
+ 
++  /*
++   * Overriding to appease findbugs
++   */
++  @Override
++  public boolean equals(Object o) {
++    return super.equals(o);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+index 4327c63..c35a007 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+@@ -30,6 +30,7 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+@@ -53,6 +54,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Queue;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
+@@ -77,10 +79,17 @@
+   private ResourceWeights resourceWeights;
+   private Resource demand = Resources.createResource(0);
+   private FairScheduler scheduler;
++  private FSQueue fsQueue;
+   private Resource fairShare = Resources.createResource(0, 0);
+-  private Resource preemptedResources = Resources.createResource(0);
+-  private RMContainerComparator comparator = new RMContainerComparator();
+-  private final Map<RMContainer, Long> preemptionMap = new HashMap<RMContainer, Long>();
++
++  // Preemption related variables
++  private final Resource preemptedResources = Resources.clone(Resources.none());
++  private final Set<RMContainer> containersToPreempt = new HashSet<>();
++  private Resource fairshareStarvation = Resources.none();
++  private long lastTimeAtFairShare;
++
++  // minshareStarvation attributed to this application by the leaf queue
++  private Resource minshareStarvation = Resources.none();
+ 
+   // Used to record node reservation by an app.
+   // Key = RackName, Value = Set of Nodes reserved by app on rack
+@@ -106,12 +115,14 @@ public FSAppAttempt(FairScheduler scheduler,
+     super(applicationAttemptId, user, queue, activeUsersManager, rmContext);
+ 
+     this.scheduler = scheduler;
++    this.fsQueue = queue;
+     this.startTime = scheduler.getClock().getTime();
++    this.lastTimeAtFairShare = this.startTime;
+     this.appPriority = Priority.newInstance(1);
+     this.resourceWeights = new ResourceWeights();
+   }
+ 
+-  public ResourceWeights getResourceWeights() {
++  ResourceWeights getResourceWeights() {
+     return resourceWeights;
+   }
+ 
+@@ -122,7 +133,7 @@ public QueueMetrics getMetrics() {
+     return queue.getMetrics();
+   }
+ 
+-  synchronized public void containerCompleted(RMContainer rmContainer,
++  synchronized void containerCompleted(RMContainer rmContainer,
+       ContainerStatus containerStatus, RMContainerEventType event) {
+     
+     Container container = rmContainer.getContainer();
+@@ -143,6 +154,7 @@ synchronized public void containerCompleted(RMContainer rmContainer,
+     
+     // Remove from the list of containers
+     liveContainers.remove(rmContainer.getContainerId());
++    untrackContainerForPreemption(rmContainer);
+ 
+     RMAuditLogger.logSuccess(getUser(), 
+         AuditConstants.RELEASE_CONTAINER, "SchedulerApp", 
+@@ -153,9 +165,6 @@ synchronized public void containerCompleted(RMContainer rmContainer,
+     queue.getMetrics().releaseResources(getUser(), 1, containerResource);
+     Resources.subtractFrom(currentConsumption, containerResource);
+ 
+-    // remove from preemption map if it is completed
+-    preemptionMap.remove(rmContainer);
+-
+     // Clear resource utilization metrics cache.
+     lastMemoryAggregateAllocationUpdateTime = -1;
+   }
+@@ -416,7 +425,7 @@ else if (allowed.equals(NodeType.RACK_LOCAL) &&
+    * degree of locality than the current threshold. Reset the allowed locality
+    * level to a higher degree of locality.
+    */
+-  public synchronized void resetAllowedLocalityLevel(Priority priority,
++  synchronized void resetAllowedLocalityLevel(Priority priority,
+       NodeType level) {
+     NodeType old = allowedLocalityLevel.get(priority);
+     LOG.info("Raising locality level from " + old + " to " + level + " at " +
+@@ -424,48 +433,107 @@ public synchronized void resetAllowedLocalityLevel(Priority priority,
+     allowedLocalityLevel.put(priority, level);
+   }
+ 
+-  // related methods
+-  public void addPreemption(RMContainer container, long time) {
+-    assert preemptionMap.get(container) == null;
+-    preemptionMap.put(container, time);
+-    Resources.addTo(preemptedResources, container.getAllocatedResource());
++  @Override
++  public FSLeafQueue getQueue() {
++    Queue queue = super.getQueue();
++    assert queue instanceof FSLeafQueue;
++    return (FSLeafQueue) queue;
+   }
+ 
+-  public Long getContainerPreemptionTime(RMContainer container) {
+-    return preemptionMap.get(container);
+-  }
++  // Preemption related methods
+ 
+-  public Set<RMContainer> getPreemptionContainers() {
+-    return preemptionMap.keySet();
++  /**
++   * Get overall starvation - fairshare and attributed minshare.
++   *
++   * @return total starvation attributed to this application
++   */
++  Resource getStarvation() {
++    return Resources.add(fairshareStarvation, minshareStarvation);
+   }
+-  
+-  @Override
+-  public FSLeafQueue getQueue() {
+-    return (FSLeafQueue)super.getQueue();
++
++  /**
++   * Set the minshare attributed to this application. To be called only from
++   * {@link FSLeafQueue#updateStarvedApps}.
++   * @param starvation minshare starvation attributed to this app
++   */
++  void setMinshareStarvation(Resource starvation) {
++    this.minshareStarvation = starvation;
+   }
+ 
+-  public Resource getPreemptedResources() {
+-    return preemptedResources;
++  /**
++   * Reset the minshare starvation attributed to this application. To be
++   * called only from {@link FSLeafQueue#updateStarvedApps}
++   */
++  void resetMinshareStarvation() {
++    this.minshareStarvation = Resources.none();
+   }
+ 
+-  public void resetPreemptedResources() {
+-    preemptedResources = Resources.createResource(0);
+-    for (RMContainer container : getPreemptionContainers()) {
++  void trackContainerForPreemption(RMContainer container) {
++    containersToPreempt.add(container);
++    synchronized (preemptedResources) {
+       Resources.addTo(preemptedResources, container.getAllocatedResource());
+     }
+   }
+ 
+-  public void clearPreemptedResources() {
+-    preemptedResources.setMemory(0);
+-    preemptedResources.setVirtualCores(0);
++  private void untrackContainerForPreemption(RMContainer container) {
++    synchronized (preemptedResources) {
++      Resources.subtractFrom(preemptedResources,
++          container.getAllocatedResource());
++    }
++    containersToPreempt.remove(container);
++  }
++
++  Set<RMContainer> getPreemptionContainers() {
++    return containersToPreempt;
++  }
++
++  private Resource getPreemptedResources() {
++    synchronized (preemptedResources) {
++      return preemptedResources;
++    }
++  }
++
++  boolean canContainerBePreempted(RMContainer container) {
++    // Sanity check that the app owns this container
++    if (!getLiveContainersMap().containsKey(container.getContainerId()) &&
++        !newlyAllocatedContainers.contains(container)){
++      LOG.error("Looking to preempt container " + container +
++          ". Container does not belong to app " + getApplicationId());
++      return false;
++    }
++
++    if (containersToPreempt.contains(container)) {
++      // The container is already under consideration for preemption
++      return false;
++    }
++
++    // Check if any of the parent queues are not preemptable
++    // TODO (YARN-5831): Propagate the "preemptable" flag all the way down to
++    // the app to avoid recursing up every time.
++    for (FSQueue q = getQueue();
++        !q.getQueueName().equals("root");
++        q = q.getParent()){
++      if (!q.isPreemptable()) {
++        return false;
++      }
++    }
++
++    // Check if the app's allocation will be over its fairshare even
++    // after preempting this container
++    Resource currentUsage = getResourceUsage();
++    Resource fairshare = getFairShare();
++    Resource overFairShareBy = Resources.subtract(currentUsage, fairshare);
++
++    return (Resources.fitsIn(container.getAllocatedResource(),
++        overFairShareBy));
+   }
+ 
+   /**
+    * Create and return a container object reflecting an allocation for the
+-   * given appliction on the given node with the given capability and
++   * given application on the given node with the given capability and
+    * priority.
+    */
+-  public Container createContainer(
++  private Container createContainer(
+       FSSchedulerNode node, Resource capability, Priority priority) {
+ 
+     NodeId nodeId = node.getRMNode().getNodeID();
+@@ -473,11 +541,8 @@ public Container createContainer(
+         getApplicationAttemptId(), getNewContainerId());
+ 
+     // Create the container
+-    Container container =
+-        BuilderUtils.newContainer(containerId, nodeId, node.getRMNode()
+-            .getHttpAddress(), capability, priority, null);
+-
+-    return container;
++    return BuilderUtils.newContainer(containerId, nodeId, node.getRMNode()
++        .getHttpAddress(), capability, priority, null);
+   }
+ 
+   /**
+@@ -824,7 +889,7 @@ private boolean isValidReservation(FSSchedulerNode node) {
+    *     Node that the application has an existing reservation on
+    * @return whether the reservation on the given node is valid.
+    */
+-  public boolean assignReservedContainer(FSSchedulerNode node) {
++  boolean assignReservedContainer(FSSchedulerNode node) {
+     RMContainer rmContainer = node.getReservedContainer();
+     Priority reservedPriority = rmContainer.getReservedPriority();
+ 
+@@ -852,20 +917,45 @@ public boolean assignReservedContainer(FSSchedulerNode node) {
+     return true;
+   }
+ 
+-  static class RMContainerComparator implements Comparator<RMContainer>,
+-      Serializable {
+-    @Override
+-    public int compare(RMContainer c1, RMContainer c2) {
+-      int ret = c1.getContainer().getPriority().compareTo(
+-          c2.getContainer().getPriority());
+-      if (ret == 0) {
+-        return c2.getContainerId().compareTo(c1.getContainerId());
+-      }
+-      return ret;
++  /**
++   * Helper method that computes the extent of fairshare fairshareStarvation.
++   */
++  Resource fairShareStarvation() {
++    Resource threshold = Resources.multiply(
++        getFairShare(), fsQueue.getFairSharePreemptionThreshold());
++    Resource starvation = Resources.subtractFrom(threshold, getResourceUsage());
++    long now = scheduler.getClock().getTime();
++    boolean starved = Resources.greaterThan(
++        fsQueue.getPolicy().getResourceCalculator(),
++        scheduler.getClusterResource(), starvation, Resources.none());
++
++    if (!starved) {
++      lastTimeAtFairShare = now;
+     }
++
++    if (starved &&
++        (now - lastTimeAtFairShare > fsQueue.getFairSharePreemptionTimeout())) {
++      this.fairshareStarvation = starvation;
++    } else {
++      this.fairshareStarvation = Resources.none();
++    }
++    return this.fairshareStarvation;
+   }
+ 
+-  /* Schedulable methods implementation */
++  ResourceRequest getNextResourceRequest() {
++    return appSchedulingInfo.getNextResourceRequest();
++  }
++
++  /**
++   * Helper method that captures if this app is identified to be starved.
++   * @return true if the app is starved for fairshare, false otherwise
++   */
++  @VisibleForTesting
++  boolean isStarvedForFairShare() {
++    return !Resources.isNone(fairshareStarvation);
++  }
++
++/* Schedulable methods implementation */
+ 
+   @Override
+   public String getName() {
+@@ -894,14 +984,13 @@ public Resource getMaxShare() {
+ 
+   @Override
+   public Resource getResourceUsage() {
+-    // Here the getPreemptedResources() always return zero, except in
+-    // a preemption round
+-    // In the common case where preempted resource is zero, return the
+-    // current consumption Resource object directly without calling
+-    // Resources.subtract which creates a new Resource object for each call.
+-    return getPreemptedResources().equals(Resources.none()) ?
+-        getCurrentConsumption() :
+-        Resources.subtract(getCurrentConsumption(), getPreemptedResources());
++    /*
++     * getResourcesToPreempt() returns zero, except when there are containers
++     * to preempt. Avoid creating an object in the common case.
++     */
++    return getPreemptedResources().equals(Resources.none())
++        ? getCurrentConsumption()
++        : Resources.subtract(getCurrentConsumption(), getPreemptedResources());
+   }
+ 
+   @Override
+@@ -956,24 +1045,19 @@ public Resource assignContainer(FSSchedulerNode node) {
+     return assignContainer(node, false);
+   }
+ 
+-  /**
+-   * Preempt a running container according to the priority
++  /*
++   * Overriding to appease findbugs
+    */
+   @Override
+-  public RMContainer preemptContainer() {
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("App " + getName() + " is going to preempt a running " +
+-          "container");
+-    }
++  public int hashCode() {
++    return super.hashCode();
++  }
+ 
+-    RMContainer toBePreempted = null;
+-    for (RMContainer container : getLiveContainers()) {
+-      if (!getPreemptionContainers().contains(container) &&
+-          (toBePreempted == null ||
+-              comparator.compare(toBePreempted, container) > 0)) {
+-        toBePreempted = container;
+-      }
+-    }
+-    return toBePreempted;
++  /*
++   * Overriding to appease findbugs
++   */
++  @Override
++  public boolean equals(Object o) {
++    return super.equals(o);
+   }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSContext.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSContext.java
+new file mode 100644
+index 0000000..56bc99c
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSContext.java
+@@ -0,0 +1,54 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++/**
++ * Helper class that holds basic information to be passed around
++ * FairScheduler classes. Think of this as a glorified map that holds key
++ * information about the scheduler.
++ */
++public class FSContext {
++  // Preemption-related info
++  private boolean preemptionEnabled = false;
++  private float preemptionUtilizationThreshold;
++  private FSStarvedApps starvedApps;
++
++  public boolean isPreemptionEnabled() {
++    return preemptionEnabled;
++  }
++
++  public void setPreemptionEnabled() {
++    this.preemptionEnabled = true;
++    if (starvedApps == null) {
++      starvedApps = new FSStarvedApps();
++    }
++  }
++
++  public FSStarvedApps getStarvedApps() {
++    return starvedApps;
++  }
++
++  public float getPreemptionUtilizationThreshold() {
++    return preemptionUtilizationThreshold;
++  }
++
++  public void setPreemptionUtilizationThreshold(
++      float preemptionUtilizationThreshold) {
++    this.preemptionUtilizationThreshold = preemptionUtilizationThreshold;
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+index 6fb48f2..ebcad84 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+@@ -21,8 +21,8 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.Comparator;
+ import java.util.List;
++import java.util.TreeSet;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+@@ -43,16 +43,20 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+ import org.apache.hadoop.yarn.util.resource.Resources;
+ 
++import static org.apache.hadoop.yarn.util.resource.Resources.none;
++
+ @Private
+ @Unstable
+ public class FSLeafQueue extends FSQueue {
+-  private static final Log LOG = LogFactory.getLog(
+-      FSLeafQueue.class.getName());
++  private static final Log LOG = LogFactory.getLog(FSLeafQueue.class.getName());
++  private static final List<FSQueue> EMPTY_LIST = Collections.emptyList();
++
++  private FairScheduler scheduler;
++  private FSContext context;
+ 
+-  private final List<FSAppAttempt> runnableApps = // apps that are runnable
+-      new ArrayList<FSAppAttempt>();
+-  private final List<FSAppAttempt> nonRunnableApps =
+-      new ArrayList<FSAppAttempt>();
++  // apps that are runnable
++  private final List<FSAppAttempt> runnableApps = new ArrayList<>();
++  private final List<FSAppAttempt> nonRunnableApps = new ArrayList<>();
+   // get a lock with fair distribution for app list updates
+   private final ReadWriteLock rwl = new ReentrantReadWriteLock(true);
+   private final Lock readLock = rwl.readLock();
+@@ -62,25 +66,24 @@
+   
+   // Variables used for preemption
+   private long lastTimeAtMinShare;
+-  private long lastTimeAtFairShareThreshold;
+-  
++
+   // Track the AM resource usage for this queue
+   private Resource amResourceUsage;
+ 
+   private final ActiveUsersManager activeUsersManager;
+-  public static final List<FSQueue> EMPTY_LIST = Collections.emptyList();
+ 
+   public FSLeafQueue(String name, FairScheduler scheduler,
+       FSParentQueue parent) {
+     super(name, scheduler, parent);
++    this.scheduler = scheduler;
++    this.context = scheduler.getContext();
+     this.lastTimeAtMinShare = scheduler.getClock().getTime();
+-    this.lastTimeAtFairShareThreshold = scheduler.getClock().getTime();
+     activeUsersManager = new ActiveUsersManager(getMetrics());
+     amResourceUsage = Resource.newInstance(0, 0);
+     getMetrics().setAMResourceUsage(amResourceUsage);
+   }
+   
+-  public void addApp(FSAppAttempt app, boolean runnable) {
++  void addApp(FSAppAttempt app, boolean runnable) {
+     writeLock.lock();
+     try {
+       if (runnable) {
+@@ -107,7 +110,7 @@ void addAppSchedulable(FSAppAttempt appSched) {
+    * Removes the given app from this queue.
+    * @return whether or not the app was runnable
+    */
+-  public boolean removeApp(FSAppAttempt app) {
++  boolean removeApp(FSAppAttempt app) {
+     boolean runnable = false;
+ 
+     // Remove app from runnable/nonRunnable list while holding the write lock
+@@ -139,7 +142,7 @@ public boolean removeApp(FSAppAttempt app) {
+    * Removes the given app if it is non-runnable and belongs to this queue
+    * @return true if the app is removed, false otherwise
+    */
+-  public boolean removeNonRunnableApp(FSAppAttempt app) {
++  boolean removeNonRunnableApp(FSAppAttempt app) {
+     writeLock.lock();
+     try {
+       return nonRunnableApps.remove(app);
+@@ -148,7 +151,7 @@ public boolean removeNonRunnableApp(FSAppAttempt app) {
+     }
+   }
+ 
+-  public boolean isRunnableApp(FSAppAttempt attempt) {
++  boolean isRunnableApp(FSAppAttempt attempt) {
+     readLock.lock();
+     try {
+       return runnableApps.contains(attempt);
+@@ -157,7 +160,7 @@ public boolean isRunnableApp(FSAppAttempt attempt) {
+     }
+   }
+ 
+-  public boolean isNonRunnableApp(FSAppAttempt attempt) {
++  boolean isNonRunnableApp(FSAppAttempt attempt) {
+     readLock.lock();
+     try {
+       return nonRunnableApps.contains(attempt);
+@@ -166,30 +169,8 @@ public boolean isNonRunnableApp(FSAppAttempt attempt) {
+     }
+   }
+ 
+-  public void resetPreemptedResources() {
+-    readLock.lock();
+-    try {
+-      for (FSAppAttempt attempt : runnableApps) {
+-        attempt.resetPreemptedResources();
+-      }
+-    } finally {
+-      readLock.unlock();
+-    }
+-  }
+-
+-  public void clearPreemptedResources() {
+-    readLock.lock();
+-    try {
+-      for (FSAppAttempt attempt : runnableApps) {
+-        attempt.clearPreemptedResources();
+-      }
+-    } finally {
+-      readLock.unlock();
+-    }
+-  }
+-
+-  public List<FSAppAttempt> getCopyOfNonRunnableAppSchedulables() {
+-    List<FSAppAttempt> appsToReturn = new ArrayList<FSAppAttempt>();
++  List<FSAppAttempt> getCopyOfNonRunnableAppSchedulables() {
++    List<FSAppAttempt> appsToReturn = new ArrayList<>();
+     readLock.lock();
+     try {
+       appsToReturn.addAll(nonRunnableApps);
+@@ -225,15 +206,76 @@ public void setPolicy(SchedulingPolicy policy)
+   }
+   
+   @Override
+-  public void recomputeShares() {
++  public void updateInternal(boolean checkStarvation) {
+     readLock.lock();
+     try {
+       policy.computeShares(runnableApps, getFairShare());
++      if (checkStarvation) {
++        updateStarvedApps();
++      }
+     } finally {
+       readLock.unlock();
+     }
+   }
+ 
++  /**
++   * Helper method to identify starved applications. This needs to be called
++   * ONLY from {@link #updateInternal}, after the application shares
++   * are updated.
++   *
++   * A queue can be starving due to fairshare or minshare.
++   *
++   * Minshare is defined only on the queue and not the applications.
++   * Fairshare is defined for both the queue and the applications.
++   *
++   * If this queue is starved due to minshare, we need to identify the most
++   * deserving apps if they themselves are not starved due to fairshare.
++   *
++   * If this queue is starving due to fairshare, there must be at least
++   * one application that is starved. And, even if the queue is not
++   * starved due to fairshare, there might still be starved applications.
++   */
++  private void updateStarvedApps() {
++    // First identify starved applications and track total amount of
++    // starvation (in resources)
++    Resource fairShareStarvation = Resources.clone(none());
++
++    // Fetch apps with unmet demand sorted by fairshare starvation
++    TreeSet<FSAppAttempt> appsWithDemand = fetchAppsWithDemand();
++    for (FSAppAttempt app : appsWithDemand) {
++      Resource appStarvation = app.fairShareStarvation();
++      if (!Resources.equals(none(), appStarvation))  {
++        context.getStarvedApps().addStarvedApp(app);
++        Resources.addTo(fairShareStarvation, appStarvation);
++      } else {
++        break;
++      }
++    }
++
++    // Compute extent of minshare starvation
++    Resource minShareStarvation = minShareStarvation();
++
++    // Compute minshare starvation that is not subsumed by fairshare starvation
++    Resources.subtractFrom(minShareStarvation, fairShareStarvation);
++
++    // Keep adding apps to the starved list until the unmet demand goes over
++    // the remaining minshare
++    for (FSAppAttempt app : appsWithDemand) {
++      if (Resources.greaterThan(policy.getResourceCalculator(),
++          scheduler.getClusterResource(), minShareStarvation, none())) {
++        Resource appPendingDemand =
++            Resources.subtract(app.getDemand(), app.getResourceUsage());
++        Resources.subtractFrom(minShareStarvation, appPendingDemand);
++        app.setMinshareStarvation(appPendingDemand);
++        context.getStarvedApps().addStarvedApp(app);
++      } else {
++        // Reset minshare starvation in case we had set it in a previous
++        // iteration
++        app.resetMinshareStarvation();
++      }
++    }
++  }
++
+   @Override
+   public Resource getDemand() {
+     return demand;
+@@ -256,7 +298,7 @@ public Resource getResourceUsage() {
+     return usage;
+   }
+ 
+-  public Resource getAmResourceUsage() {
++  Resource getAmResourceUsage() {
+     return amResourceUsage;
+   }
+ 
+@@ -301,7 +343,7 @@ private void updateDemandForApp(FSAppAttempt sched) {
+ 
+   @Override
+   public Resource assignContainer(FSSchedulerNode node) {
+-    Resource assigned = Resources.none();
++    Resource assigned = none();
+     if (LOG.isDebugEnabled()) {
+       LOG.debug("Node " + node.getNodeName() + " offered to queue: " +
+           getName() + " fairShare: " + getFairShare());
+@@ -311,72 +353,38 @@ public Resource assignContainer(FSSchedulerNode node) {
+       return assigned;
+     }
+ 
+-    Comparator<Schedulable> comparator = policy.getComparator();
+-    writeLock.lock();
+-    try {
+-      Collections.sort(runnableApps, comparator);
+-    } finally {
+-      writeLock.unlock();
+-    }
+-    // Release write lock here for better performance and avoiding deadlocks.
+-    // runnableApps can be in unsorted state because of this section,
+-    // but we can accept it in practice since the probability is low.
+-    readLock.lock();
+-    try {
+-      for (FSAppAttempt sched : runnableApps) {
+-        if (SchedulerAppUtils.isBlacklisted(sched, node, LOG)) {
+-          continue;
+-        }
+-
+-        assigned = sched.assignContainer(node);
+-        if (!assigned.equals(Resources.none())) {
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Assigned container in queue:" + getName() + " " +
+-                "container:" + assigned);
+-          }
+-          break;
++    for (FSAppAttempt sched : fetchAppsWithDemand()) {
++      if (SchedulerAppUtils.isBlacklisted(sched, node, LOG)) {
++        continue;
++      }
++      assigned = sched.assignContainer(node);
++      if (!assigned.equals(none())) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Assigned container in queue:" + getName() + " " +
++              "container:" + assigned);
+         }
++        break;
+       }
+-    } finally {
+-      readLock.unlock();
+     }
+     return assigned;
+   }
+ 
+-  @Override
+-  public RMContainer preemptContainer() {
+-    RMContainer toBePreempted = null;
+-
+-    // If this queue is not over its fair share, reject
+-    if (!preemptContainerPreCheck()) {
+-      return toBePreempted;
+-    }
+-
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Queue " + getName() + " is going to preempt a container " +
+-          "from its applications.");
+-    }
+-
+-    // Choose the app that is most over fair share
+-    Comparator<Schedulable> comparator = policy.getComparator();
+-    FSAppAttempt candidateSched = null;
++  private TreeSet<FSAppAttempt> fetchAppsWithDemand() {
++    TreeSet<FSAppAttempt> pendingForResourceApps =
++        new TreeSet<>(policy.getComparator());
+     readLock.lock();
+     try {
+-      for (FSAppAttempt sched : runnableApps) {
+-        if (candidateSched == null ||
+-            comparator.compare(sched, candidateSched) > 0) {
+-          candidateSched = sched;
++      for (FSAppAttempt app : runnableApps) {
++        Resource pending =
++            Resources.subtract(app.getDemand(), app.getCurrentConsumption());
++        if (!Resources.isNone(pending)) {
++          pendingForResourceApps.add(app);
+         }
+       }
+     } finally {
+       readLock.unlock();
+     }
+-
+-    // Preempt from the selected app
+-    if (candidateSched != null) {
+-      toBePreempted = candidateSched.preemptContainer();
+-    }
+-    return toBePreempted;
++    return pendingForResourceApps;
+   }
+ 
+   @Override
+@@ -388,7 +396,7 @@ public RMContainer preemptContainer() {
+   public List<QueueUserACLInfo> getQueueUserAclInfo(UserGroupInformation user) {
+     QueueUserACLInfo userAclInfo =
+       recordFactory.newRecordInstance(QueueUserACLInfo.class);
+-    List<QueueACL> operations = new ArrayList<QueueACL>();
++    List<QueueACL> operations = new ArrayList<>();
+     for (QueueACL operation : QueueACL.values()) {
+       if (hasAccess(operation, user)) {
+         operations.add(operation);
+@@ -400,23 +408,10 @@ public RMContainer preemptContainer() {
+     return Collections.singletonList(userAclInfo);
+   }
+   
+-  public long getLastTimeAtMinShare() {
+-    return lastTimeAtMinShare;
+-  }
+-
+   private void setLastTimeAtMinShare(long lastTimeAtMinShare) {
+     this.lastTimeAtMinShare = lastTimeAtMinShare;
+   }
+ 
+-  public long getLastTimeAtFairShareThreshold() {
+-    return lastTimeAtFairShareThreshold;
+-  }
+-
+-  private void setLastTimeAtFairShareThreshold(
+-      long lastTimeAtFairShareThreshold) {
+-    this.lastTimeAtFairShareThreshold = lastTimeAtFairShareThreshold;
+-  }
+-
+   @Override
+   public int getNumRunnableApps() {
+     readLock.lock();
+@@ -427,7 +422,7 @@ public int getNumRunnableApps() {
+     }
+   }
+ 
+-  public int getNumNonRunnableApps() {
++  int getNumNonRunnableApps() {
+     readLock.lock();
+     try {
+       return nonRunnableApps.size();
+@@ -523,7 +518,7 @@ public boolean canRunAppAM(Resource amResource) {
+     return Resources.fitsIn(ifRunAMResource, maxAMResource);
+   }
+ 
+-  public void addAMResourceUsage(Resource amResource) {
++  void addAMResourceUsage(Resource amResource) {
+     if (amResource != null) {
+       Resources.addTo(amResourceUsage, amResource);
+       getMetrics().setAMResourceUsage(amResourceUsage);
+@@ -537,51 +532,59 @@ public void recoverContainer(Resource clusterResource,
+   }
+ 
+   /**
+-   * Update the preemption fields for the queue, i.e. the times since last was
+-   * at its guaranteed share and over its fair share threshold.
++   * Helper method to compute the amount of minshare starvation.
+    */
+-  public void updateStarvationStats() {
++  private Resource minShareStarvation() {
++    // If demand < minshare, we should use demand to determine starvation
++    Resource desiredShare = Resources.min(policy.getResourceCalculator(),
++        scheduler.getClusterResource(), getMinShare(), getDemand());
++
++    Resource starvation = Resources.subtract(desiredShare, getResourceUsage());
++    boolean starved = !Resources.isNone(starvation);
++
+     long now = scheduler.getClock().getTime();
+-    if (!isStarvedForMinShare()) {
++    if (!starved) {
++      // Record that queue is not starved
+       setLastTimeAtMinShare(now);
+     }
+-    if (!isStarvedForFairShare()) {
+-      setLastTimeAtFairShareThreshold(now);
++
++    if (now - lastTimeAtMinShare < getMinSharePreemptionTimeout()) {
++      // the queue is not starved for the preemption timeout
++      starvation = Resources.clone(Resources.none());
+     }
++
++    return starvation;
+   }
+ 
+   /**
+-   * Helper method to check if the queue should preempt containers
+-   *
+-   * @return true if check passes (can preempt) or false otherwise
++   * Helper method for tests to check if a queue is starved for minShare.
++   * @return whether starved for minshare.
+    */
+-  private boolean preemptContainerPreCheck() {
+-    return parent.getPolicy().checkIfUsageOverFairShare(getResourceUsage(),
+-        getFairShare());
++  @VisibleForTesting
++  private boolean isStarvedForMinShare() {
++    return !Resources.isNone(minShareStarvation());
+   }
+ 
+   /**
+-   * Is a queue being starved for its min share.
++   * Helper method for tests to check if a queue is starved for fairshare.
++   * @return whether starved for fairshare
+    */
+   @VisibleForTesting
+-  boolean isStarvedForMinShare() {
+-    return isStarved(getMinShare());
++  private boolean isStarvedForFairShare() {
++    for (FSAppAttempt app : runnableApps) {
++      if (app.isStarvedForFairShare()) {
++        return true;
++      }
++    }
++    return false;
+   }
+ 
+   /**
+-   * Is a queue being starved for its fair share threshold.
++   * Helper method for tests to check if a queue is starved.
++   * @return whether starved for either minshare or fairshare
+    */
+   @VisibleForTesting
+-  boolean isStarvedForFairShare() {
+-    return isStarved(
+-        Resources.multiply(getFairShare(), getFairSharePreemptionThreshold()));
+-  }
+-
+-  private boolean isStarved(Resource share) {
+-    Resource desiredShare = Resources.min(policy.getResourceCalculator(),
+-            scheduler.getClusterResource(), share, getDemand());
+-    Resource resourceUsage = getResourceUsage();
+-    return Resources.lessThan(policy.getResourceCalculator(),
+-            scheduler.getClusterResource(), resourceUsage, desiredShare);
++  boolean isStarved() {
++    return isStarvedForMinShare() || isStarvedForFairShare();
+   }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
+index 58ed1c4..ccfb647 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
+@@ -21,7 +21,6 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.Comparator;
+ import java.util.List;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReadWriteLock;
+@@ -61,7 +60,7 @@ public FSParentQueue(String name, FairScheduler scheduler,
+     super(name, scheduler, parent);
+   }
+   
+-  public void addChildQueue(FSQueue child) {
++  void addChildQueue(FSQueue child) {
+     writeLock.lock();
+     try {
+       childQueues.add(child);
+@@ -70,7 +69,7 @@ public void addChildQueue(FSQueue child) {
+     }
+   }
+ 
+-  public void removeChildQueue(FSQueue child) {
++  void removeChildQueue(FSQueue child) {
+     writeLock.lock();
+     try {
+       childQueues.remove(child);
+@@ -80,20 +79,20 @@ public void removeChildQueue(FSQueue child) {
+   }
+ 
+   @Override
+-  public void recomputeShares() {
++  public void updateInternal(boolean checkStarvation) {
+     readLock.lock();
+     try {
+       policy.computeShares(childQueues, getFairShare());
+       for (FSQueue childQueue : childQueues) {
+         childQueue.getMetrics().setFairShare(childQueue.getFairShare());
+-        childQueue.recomputeShares();
++        childQueue.updateInternal(checkStarvation);
+       }
+     } finally {
+       readLock.unlock();
+     }
+   }
+ 
+-  public void recomputeSteadyShares() {
++  void recomputeSteadyShares() {
+     readLock.lock();
+     try {
+       policy.computeSteadyShares(childQueues, getSteadyFairShare());
+@@ -190,7 +189,7 @@ private QueueUserACLInfo getUserAclInfo(UserGroupInformation user) {
+   
+   @Override
+   public List<QueueUserACLInfo> getQueueUserAclInfo(UserGroupInformation user) {
+-    List<QueueUserACLInfo> userAcls = new ArrayList<QueueUserACLInfo>();
++    List<QueueUserACLInfo> userAcls = new ArrayList<>();
+     
+     // Add queue acls
+     userAcls.add(getUserAclInfo(user));
+@@ -248,41 +247,6 @@ public Resource assignContainer(FSSchedulerNode node) {
+   }
+ 
+   @Override
+-  public RMContainer preemptContainer() {
+-    RMContainer toBePreempted = null;
+-
+-    // Find the childQueue which is most over fair share
+-    FSQueue candidateQueue = null;
+-    Comparator<Schedulable> comparator = policy.getComparator();
+-
+-    readLock.lock();
+-    try {
+-      for (FSQueue queue : childQueues) {
+-        // Skip selection for non-preemptable queue
+-        if (!queue.isPreemptable()) {
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("skipping from queue=" + getName()
+-                + " because it's a non-preemptable queue");
+-          }
+-          continue;
+-        }
+-        if (candidateQueue == null ||
+-            comparator.compare(queue, candidateQueue) > 0) {
+-          candidateQueue = queue;
+-        }
+-      }
+-    } finally {
+-      readLock.unlock();
+-    }
+-
+-    // Let the selected queue choose which of its container to preempt
+-    if (candidateQueue != null) {
+-      toBePreempted = candidateQueue.preemptContainer();
+-    }
+-    return toBePreempted;
+-  }
+-
+-  @Override
+   public List<FSQueue> getChildQueues() {
+     readLock.lock();
+     try {
+@@ -305,7 +269,7 @@ public void setPolicy(SchedulingPolicy policy)
+     super.policy = policy;
+   }
+   
+-  public void incrementRunnableApps() {
++  void incrementRunnableApps() {
+     writeLock.lock();
+     try {
+       runnableApps++;
+@@ -314,7 +278,7 @@ public void incrementRunnableApps() {
+     }
+   }
+   
+-  public void decrementRunnableApps() {
++  void decrementRunnableApps() {
+     writeLock.lock();
+     try {
+       runnableApps--;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
+new file mode 100644
+index 0000000..f5c1f5b
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSPreemptionThread.java
+@@ -0,0 +1,188 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ContainerStatus;
++import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.api.records.ResourceRequest;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
++import org.apache.hadoop.yarn.util.resource.Resources;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Timer;
++import java.util.TimerTask;
++
++/**
++ * Thread that handles FairScheduler preemption.
++ */
++class FSPreemptionThread extends Thread {
++  private static final Log LOG = LogFactory.getLog(FSPreemptionThread.class);
++  protected final FSContext context;
++  private final FairScheduler scheduler;
++  private final long warnTimeBeforeKill;
++  private final Timer preemptionTimer;
++
++  FSPreemptionThread(FairScheduler scheduler) {
++    this.scheduler = scheduler;
++    this.context = scheduler.getContext();
++    FairSchedulerConfiguration fsConf = scheduler.getConf();
++    context.setPreemptionEnabled();
++    context.setPreemptionUtilizationThreshold(
++        fsConf.getPreemptionUtilizationThreshold());
++    warnTimeBeforeKill = fsConf.getWaitTimeBeforeKill();
++    preemptionTimer = new Timer("Preemption Timer", true);
++
++    setDaemon(true);
++    setName("FSPreemptionThread");
++  }
++
++  public void run() {
++    while (!Thread.interrupted()) {
++      FSAppAttempt starvedApp;
++      try{
++        starvedApp = context.getStarvedApps().take();
++        if (!Resources.isNone(starvedApp.getStarvation())) {
++          List<RMContainer> containers =
++              identifyContainersToPreempt(starvedApp);
++          if (containers != null) {
++            preemptContainers(containers);
++          }
++        }
++      } catch (InterruptedException e) {
++        LOG.info("Preemption thread interrupted! Exiting.");
++        return;
++      }
++    }
++  }
++
++  /**
++   * Given an app, identify containers to preempt to satisfy the app's next
++   * resource request.
++   *
++   * @param starvedApp starved application for which we are identifying
++   *                   preemption targets
++   * @return list of containers to preempt to satisfy starvedApp, null if the
++   * app cannot be satisfied by preempting any running containers
++   */
++  private List<RMContainer> identifyContainersToPreempt(
++      FSAppAttempt starvedApp) {
++    List<RMContainer> containers = new ArrayList<>(); // return value
++
++    // Find the nodes that match the next resource request
++    ResourceRequest request = starvedApp.getNextResourceRequest();
++    // TODO (KK): Should we check other resource requests if we can't match
++    // the first one?
++
++    Resource requestCapability = request.getCapability();
++    List<FSSchedulerNode> potentialNodes =
++        scheduler.getNodeTracker().getNodesByResourceName(
++            request.getResourceName());
++
++    // From the potential nodes, pick a node that has enough containers
++    // from apps over their fairshare
++    for (FSSchedulerNode node : potentialNodes) {
++      // Reset containers for the new node being considered.
++      containers.clear();
++
++      // TODO (YARN-5829): Attempt to reserve the node for starved app. The
++      // subsequent if-check needs to be reworked accordingly.
++      FSAppAttempt nodeReservedApp = node.getReservedAppSchedulable();
++      if (nodeReservedApp != null && !nodeReservedApp.equals(starvedApp)) {
++        // This node is already reserved by another app. Let us not consider
++        // this for preemption.
++        continue;
++      }
++
++      // Figure out list of containers to consider
++      List<RMContainer> containersToCheck =
++          node.getRunningContainers();
++      containersToCheck.removeAll(node.getContainersForPreemption());
++
++      // Initialize potential with unallocated resources
++      Resource potential = Resources.clone(node.getAvailableResource());
++      for (RMContainer container : containersToCheck) {
++        FSAppAttempt app =
++            scheduler.getSchedulerApp(container.getApplicationAttemptId());
++
++        if (app.canContainerBePreempted(container)) {
++          // Flag container for preemption
++          containers.add(container);
++          Resources.addTo(potential, container.getAllocatedResource());
++        }
++
++        // Check if we have already identified enough containers
++        if (Resources.fitsIn(requestCapability, potential)) {
++          // Mark the containers as being considered for preemption on the node.
++          // Make sure the containers are subsequently removed by calling
++          // FSSchedulerNode#removeContainerForPreemption.
++          node.addContainersForPreemption(containers);
++          return containers;
++        } else {
++          // TODO (YARN-5829): Unreserve the node for the starved app.
++        }
++      }
++    }
++    return null;
++  }
++
++  private void preemptContainers(List<RMContainer> containers) {
++    // Warn application about containers to be killed
++    for (RMContainer container : containers) {
++      ApplicationAttemptId appAttemptId = container.getApplicationAttemptId();
++      FSAppAttempt app = scheduler.getSchedulerApp(appAttemptId);
++      FSLeafQueue queue = app.getQueue();
++      LOG.info("Preempting container " + container +
++          " from queue " + queue.getName());
++      app.trackContainerForPreemption(container);
++    }
++
++    // Schedule timer task to kill containers
++    preemptionTimer.schedule(
++        new PreemptContainersTask(containers), warnTimeBeforeKill);
++  }
++
++  private class PreemptContainersTask extends TimerTask {
++    private List<RMContainer> containers;
++
++    PreemptContainersTask(List<RMContainer> containers) {
++      this.containers = containers;
++    }
++
++    @Override
++    public void run() {
++      for (RMContainer container : containers) {
++        ContainerStatus status = SchedulerUtils.createPreemptedContainerStatus(
++            container.getContainerId(), SchedulerUtils.PREEMPTED_CONTAINER);
++
++        LOG.info("Killing container " + container);
++        scheduler.completedContainer(
++            container, status, RMContainerEventType.KILL);
++
++        FSSchedulerNode containerNode = (FSSchedulerNode)
++            scheduler.getNodeTracker().getNode(container.getAllocatedNode());
++        containerNode.removeContainerForPreemption(container);
++      }
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+index f69476e..1ac807e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+@@ -214,7 +214,7 @@ public Resource getSteadyFairShare() {
+     return steadyFairShare;
+   }
+ 
+-  public void setSteadyFairShare(Resource steadyFairShare) {
++  void setSteadyFairShare(Resource steadyFairShare) {
+     this.steadyFairShare = steadyFairShare;
+     metrics.setSteadyFairShare(steadyFairShare);
+   }
+@@ -223,27 +223,27 @@ public boolean hasAccess(QueueACL acl, UserGroupInformation user) {
+     return scheduler.getAllocationConfiguration().hasAccess(name, acl, user);
+   }
+ 
+-  public long getFairSharePreemptionTimeout() {
++  long getFairSharePreemptionTimeout() {
+     return fairSharePreemptionTimeout;
+   }
+ 
+-  public void setFairSharePreemptionTimeout(long fairSharePreemptionTimeout) {
++  void setFairSharePreemptionTimeout(long fairSharePreemptionTimeout) {
+     this.fairSharePreemptionTimeout = fairSharePreemptionTimeout;
+   }
+ 
+-  public long getMinSharePreemptionTimeout() {
++  long getMinSharePreemptionTimeout() {
+     return minSharePreemptionTimeout;
+   }
+ 
+-  public void setMinSharePreemptionTimeout(long minSharePreemptionTimeout) {
++  void setMinSharePreemptionTimeout(long minSharePreemptionTimeout) {
+     this.minSharePreemptionTimeout = minSharePreemptionTimeout;
+   }
+ 
+-  public float getFairSharePreemptionThreshold() {
++  float getFairSharePreemptionThreshold() {
+     return fairSharePreemptionThreshold;
+   }
+ 
+-  public void setFairSharePreemptionThreshold(float fairSharePreemptionThreshold) {
++  void setFairSharePreemptionThreshold(float fairSharePreemptionThreshold) {
+     this.fairSharePreemptionThreshold = fairSharePreemptionThreshold;
+   }
+ 
+@@ -253,9 +253,17 @@ public boolean isPreemptable() {
+ 
+   /**
+    * Recomputes the shares for all child queues and applications based on this
+-   * queue's current share
++   * queue's current share and checks for starvation.
++   *
++   * @param checkStarvation whether to check for fairshare or minshare
++   *                        starvation on update
+    */
+-  public abstract void recomputeShares();
++  abstract void updateInternal(boolean checkStarvation);
++
++  public void update(Resource fairShare, boolean checkStarvation) {
++    setFairShare(fairShare);
++    updateInternal(checkStarvation);
++  }
+ 
+   /**
+    * Update the min/fair share preemption timeouts, threshold and preemption
+@@ -308,7 +316,7 @@ public abstract void collectSchedulerApplications(
+    * 
+    * @return true if check passes (can assign) or false otherwise
+    */
+-  protected boolean assignContainerPreCheck(FSSchedulerNode node) {
++  boolean assignContainerPreCheck(FSSchedulerNode node) {
+     if (!Resources.fitsIn(getResourceUsage(),
+         scheduler.getAllocationConfiguration().getMaxResources(getName()))
+         || node.getReservedContainer() != null) {
+@@ -343,7 +351,7 @@ public String getDefaultNodeLabelExpression() {
+     return null;
+   }
+ 
+-  public boolean fitsInMaxShare(Resource additionalResource) {
++  boolean fitsInMaxShare(Resource additionalResource) {
+     Resource usagePlusAddition =
+         Resources.add(getResourceUsage(), additionalResource);
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
+index c86201a..3e59551 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
+@@ -29,6 +29,10 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
+ 
++import java.util.Collection;
++import java.util.Set;
++import java.util.concurrent.ConcurrentSkipListSet;
++
+ @Private
+ @Unstable
+ public class FSSchedulerNode extends SchedulerNode {
+@@ -36,6 +40,8 @@
+   private static final Log LOG = LogFactory.getLog(FSSchedulerNode.class);
+ 
+   private FSAppAttempt reservedAppSchedulable;
++  private final Set<RMContainer> containersForPreemption =
++      new ConcurrentSkipListSet<>();
+ 
+   public FSSchedulerNode(RMNode node, boolean usePortForNodeName) {
+     super(node, usePortForNodeName);
+@@ -99,7 +105,36 @@ public synchronized void unreserveResource(
+     this.reservedAppSchedulable = null;
+   }
+ 
+-  public synchronized FSAppAttempt getReservedAppSchedulable() {
++  synchronized FSAppAttempt getReservedAppSchedulable() {
+     return reservedAppSchedulable;
+   }
++
++  /**
++   * Mark {@code containers} as being considered for preemption so they are
++   * not considered again. A call to this requires a corresponding call to
++   * {@link #removeContainerForPreemption} to ensure we do not mark a
++   * container for preemption and never consider it again and avoid memory
++   * leaks.
++   *
++   * @param containers container to mark
++   */
++  void addContainersForPreemption(Collection<RMContainer> containers) {
++    containersForPreemption.addAll(containers);
++  }
++
++  /**
++   * @return set of containers marked for preemption.
++   */
++  Set<RMContainer> getContainersForPreemption() {
++    return containersForPreemption;
++  }
++
++  /**
++   * Remove container from the set of containers marked for preemption.
++   *
++   * @param container container to remove
++   */
++  void removeContainerForPreemption(RMContainer container) {
++    containersForPreemption.remove(container);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSStarvedApps.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSStarvedApps.java
+new file mode 100644
+index 0000000..4f28e41
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSStarvedApps.java
+@@ -0,0 +1,85 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import org.apache.hadoop.yarn.util.resource.Resources;
++
++import java.io.Serializable;
++import java.util.Comparator;
++import java.util.concurrent.PriorityBlockingQueue;
++
++/**
++ * Helper class to track starved applications.
++ *
++ * Initially, this uses a blocking queue. We could use other data structures
++ * in the future. This class also has some methods to simplify testing.
++ */
++class FSStarvedApps {
++
++  // List of apps to be processed by the preemption thread.
++  private PriorityBlockingQueue<FSAppAttempt> appsToProcess;
++
++  // App being currently processed. This assumes a single reader.
++  private FSAppAttempt appBeingProcessed;
++
++  FSStarvedApps() {
++    appsToProcess = new PriorityBlockingQueue<>(10, new StarvationComparator());
++  }
++
++  /**
++   * Add a starved application if it is not already added.
++   * @param app application to add
++   */
++  void addStarvedApp(FSAppAttempt app) {
++    if (!app.equals(appBeingProcessed) && !appsToProcess.contains(app)) {
++      appsToProcess.add(app);
++    }
++  }
++
++  /**
++   * Blocking call to fetch the next app to process. The returned app is
++   * tracked until the next call to this method. This tracking assumes a
++   * single reader.
++   *
++   * @return starved application to process
++   * @throws InterruptedException if interrupted while waiting
++   */
++  FSAppAttempt take() throws InterruptedException {
++    // Reset appBeingProcessed before the blocking call
++    appBeingProcessed = null;
++
++    // Blocking call to fetch the next starved application
++    FSAppAttempt app = appsToProcess.take();
++    appBeingProcessed = app;
++    return app;
++  }
++
++  private static class StarvationComparator implements
++      Comparator<FSAppAttempt>, Serializable {
++    private static final long serialVersionUID = 1;
++
++    @Override
++    public int compare(FSAppAttempt app1, FSAppAttempt app2) {
++      int ret = 1;
++      if (Resources.fitsIn(app1.getStarvation(), app2.getStarvation())) {
++        ret = -1;
++      }
++      return ret;
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 793c7da..1e5aaa1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -125,6 +125,7 @@
+     AbstractYarnScheduler<FSAppAttempt, FSSchedulerNode> {
+   private FairSchedulerConfiguration conf;
+ 
++  private FSContext context;
+   private Resource incrAllocation;
+   private QueueManager queueMgr;
+   private volatile Clock clock;
+@@ -153,6 +154,9 @@
+ 
+   @VisibleForTesting
+   Thread schedulingThread;
++
++  Thread preemptionThread;
++
+   // timeout to join when we stop this service
+   protected final long THREAD_JOIN_TIMEOUT_MS = 1000;
+ 
+@@ -160,25 +164,6 @@
+   FSQueueMetrics rootMetrics;
+   FSOpDurations fsOpDurations;
+ 
+-  // Time when we last updated preemption vars
+-  protected long lastPreemptionUpdateTime;
+-  // Time we last ran preemptTasksIfNecessary
+-  private long lastPreemptCheckTime;
+-
+-  // Preemption related variables
+-  protected boolean preemptionEnabled;
+-  protected float preemptionUtilizationThreshold;
+-
+-  // How often tasks are preempted
+-  protected long preemptionInterval; 
+-  
+-  // ms to wait before force killing stuff (must be longer than a couple
+-  // of heartbeats to give task-kill commands a chance to act).
+-  protected long waitTimeBeforeKill; 
+-  
+-  // Containers whose AMs have been warned that they will be preempted soon.
+-  private List<RMContainer> warnedContainers = new ArrayList<RMContainer>();
+-
+   private float reservableNodesRatio; // percentage of available nodes
+                                       // an app can be reserved on
+ 
+@@ -211,12 +196,18 @@
+ 
+   public FairScheduler() {
+     super(FairScheduler.class.getName());
++    context = new FSContext();
+     clock = new SystemClock();
+     allocsLoader = new AllocationFileLoaderService();
+     queueMgr = new QueueManager(this);
+     maxRunningEnforcer = new MaxRunningAppsEnforcer(this);
+   }
+ 
++  @VisibleForTesting
++  public FSContext getContext() {
++    return context;
++  }
++
+   public boolean isAtLeastReservationThreshold(
+       ResourceCalculator resourceCalculator, Resource resource) {
+     return Resources.greaterThanOrEqual(resourceCalculator,
+@@ -297,7 +288,6 @@ public void run() {
+           }
+           long start = getClock().getTime();
+           update();
+-          preemptTasksIfNecessary();
+           long duration = getClock().getTime() - start;
+           fsOpDurations.addUpdateThreadRunDuration(duration);
+         } catch (InterruptedException ie) {
+@@ -337,7 +327,6 @@ public void run() {
+    */
+   protected synchronized void update() {
+     long start = getClock().getTime();
+-    updateStarvationStats(); // Determine if any queues merit preemption
+ 
+     FSQueue rootQueue = queueMgr.getRootQueue();
+ 
+@@ -345,10 +334,11 @@ protected synchronized void update() {
+     rootQueue.updateDemand();
+ 
+     Resource clusterResource = getClusterResource();
++    rootQueue.update(clusterResource, shouldAttemptPreemption());
+     rootQueue.setFairShare(clusterResource);
+-    // Recursively compute fair shares for all queues
+-    // and update metrics
+-    rootQueue.recomputeShares();
++
++    // Update metrics
++    updateRootQueueMetrics();
+ 
+     if (LOG.isDebugEnabled()) {
+       if (--updatesToSkipForDebug < 0) {
+@@ -366,183 +356,6 @@ protected synchronized void update() {
+     fsOpDurations.addUpdateCallDuration(duration);
+   }
+ 
+-  /**
+-   * Update the preemption fields for all QueueScheduables, i.e. the times since
+-   * each queue last was at its guaranteed share and over its fair share
+-   * threshold for each type of task.
+-   */
+-  private void updateStarvationStats() {
+-    lastPreemptionUpdateTime = clock.getTime();
+-    for (FSLeafQueue sched : queueMgr.getLeafQueues()) {
+-      sched.updateStarvationStats();
+-    }
+-  }
+-
+-  /**
+-   * Check for queues that need tasks preempted, either because they have been
+-   * below their guaranteed share for minSharePreemptionTimeout or they have
+-   * been below their fair share threshold for the fairSharePreemptionTimeout. If
+-   * such queues exist, compute how many tasks of each type need to be preempted
+-   * and then select the right ones using preemptTasks.
+-   */
+-  protected synchronized void preemptTasksIfNecessary() {
+-    if (!shouldAttemptPreemption()) {
+-      return;
+-    }
+-
+-    long curTime = getClock().getTime();
+-    if (curTime - lastPreemptCheckTime < preemptionInterval) {
+-      return;
+-    }
+-    lastPreemptCheckTime = curTime;
+-
+-    Resource resToPreempt = Resources.clone(Resources.none());
+-    for (FSLeafQueue sched : queueMgr.getLeafQueues()) {
+-      Resources.addTo(resToPreempt, resourceDeficit(sched, curTime));
+-    }
+-    if (isResourceGreaterThanNone(resToPreempt)) {
+-      preemptResources(resToPreempt);
+-    }
+-  }
+-
+-  /**
+-   * Preempt a quantity of resources. Each round, we start from the root queue,
+-   * level-by-level, until choosing a candidate application.
+-   * The policy for prioritizing preemption for each queue depends on its
+-   * SchedulingPolicy: (1) fairshare/DRF, choose the ChildSchedulable that is
+-   * most over its fair share; (2) FIFO, choose the childSchedulable that is
+-   * latest launched.
+-   * Inside each application, we further prioritize preemption by choosing
+-   * containers with lowest priority to preempt.
+-   * We make sure that no queue is placed below its fair share in the process.
+-   */
+-  protected void preemptResources(Resource toPreempt) {
+-    long start = getClock().getTime();
+-    if (Resources.equals(toPreempt, Resources.none())) {
+-      return;
+-    }
+-
+-    // Scan down the list of containers we've already warned and kill them
+-    // if we need to.  Remove any containers from the list that we don't need
+-    // or that are no longer running.
+-    Iterator<RMContainer> warnedIter = warnedContainers.iterator();
+-    while (warnedIter.hasNext()) {
+-      RMContainer container = warnedIter.next();
+-      if ((container.getState() == RMContainerState.RUNNING ||
+-              container.getState() == RMContainerState.ALLOCATED) &&
+-              isResourceGreaterThanNone(toPreempt)) {
+-        warnOrKillContainer(container);
+-        Resources.subtractFrom(toPreempt, container.getContainer().getResource());
+-      } else {
+-        warnedIter.remove();
+-      }
+-    }
+-
+-    try {
+-      // Reset preemptedResource for each app
+-      for (FSLeafQueue queue : getQueueManager().getLeafQueues()) {
+-        queue.resetPreemptedResources();
+-      }
+-
+-      while (isResourceGreaterThanNone(toPreempt)) {
+-        RMContainer container =
+-            getQueueManager().getRootQueue().preemptContainer();
+-        if (container == null) {
+-          break;
+-        } else {
+-          warnOrKillContainer(container);
+-          warnedContainers.add(container);
+-          Resources.subtractFrom(
+-              toPreempt, container.getContainer().getResource());
+-        }
+-      }
+-    } finally {
+-      // Clear preemptedResources for each app
+-      for (FSLeafQueue queue : getQueueManager().getLeafQueues()) {
+-        queue.clearPreemptedResources();
+-      }
+-    }
+-
+-    long duration = getClock().getTime() - start;
+-    fsOpDurations.addPreemptCallDuration(duration);
+-  }
+-
+-  private boolean isResourceGreaterThanNone(Resource toPreempt) {
+-    return (toPreempt.getMemory() > 0) || (toPreempt.getVirtualCores() > 0);
+-  }
+-
+-  protected void warnOrKillContainer(RMContainer container) {
+-    ApplicationAttemptId appAttemptId = container.getApplicationAttemptId();
+-    FSAppAttempt app = getSchedulerApp(appAttemptId);
+-    FSLeafQueue queue = app.getQueue();
+-    LOG.info("Preempting container (prio=" + container.getContainer().getPriority() +
+-        "res=" + container.getContainer().getResource() +
+-        ") from queue " + queue.getName());
+-    
+-    Long time = app.getContainerPreemptionTime(container);
+-
+-    if (time != null) {
+-      // if we asked for preemption more than maxWaitTimeBeforeKill ms ago,
+-      // proceed with kill
+-      if (time + waitTimeBeforeKill < getClock().getTime()) {
+-        ContainerStatus status =
+-          SchedulerUtils.createPreemptedContainerStatus(
+-            container.getContainerId(), SchedulerUtils.PREEMPTED_CONTAINER);
+-
+-        // TODO: Not sure if this ever actually adds this to the list of cleanup
+-        // containers on the RMNode (see SchedulerNode.releaseContainer()).
+-        completedContainer(container, status, RMContainerEventType.KILL);
+-        LOG.info("Killing container" + container +
+-            " (after waiting for preemption for " +
+-            (getClock().getTime() - time) + "ms)");
+-      }
+-    } else {
+-      // track the request in the FSAppAttempt itself
+-      app.addPreemption(container, getClock().getTime());
+-    }
+-  }
+-
+-  /**
+-   * Return the resource amount that this queue is allowed to preempt, if any.
+-   * If the queue has been below its min share for at least its preemption
+-   * timeout, it should preempt the difference between its current share and
+-   * this min share. If it has been below its fair share preemption threshold
+-   * for at least the fairSharePreemptionTimeout, it should preempt enough tasks
+-   * to get up to its full fair share. If both conditions hold, we preempt the
+-   * max of the two amounts (this shouldn't happen unless someone sets the
+-   * timeouts to be identical for some reason).
+-   */
+-  protected Resource resourceDeficit(FSLeafQueue sched, long curTime) {
+-    long minShareTimeout = sched.getMinSharePreemptionTimeout();
+-    long fairShareTimeout = sched.getFairSharePreemptionTimeout();
+-    Resource resDueToMinShare = Resources.none();
+-    Resource resDueToFairShare = Resources.none();
+-    ResourceCalculator calc = sched.getPolicy().getResourceCalculator();
+-    Resource clusterResource = getClusterResource();
+-    if (curTime - sched.getLastTimeAtMinShare() > minShareTimeout) {
+-      Resource target = Resources.componentwiseMin(
+-          sched.getMinShare(), sched.getDemand());
+-      resDueToMinShare = Resources.max(calc, clusterResource,
+-          Resources.none(), Resources.subtract(target, sched.getResourceUsage()));
+-    }
+-    if (curTime - sched.getLastTimeAtFairShareThreshold() > fairShareTimeout) {
+-      Resource target = Resources.componentwiseMin(
+-              sched.getFairShare(), sched.getDemand());
+-      resDueToFairShare = Resources.max(calc, clusterResource,
+-          Resources.none(), Resources.subtract(target, sched.getResourceUsage()));
+-    }
+-    Resource deficit = Resources.max(calc, clusterResource,
+-        resDueToMinShare, resDueToFairShare);
+-    if (Resources.greaterThan(calc, clusterResource,
+-        deficit, Resources.none())) {
+-      String message = "Should preempt " + deficit + " res for queue "
+-          + sched.getName() + ": resDueToMinShare = " + resDueToMinShare
+-          + ", resDueToFairShare = " + resDueToFairShare;
+-      LOG.info(message);
+-    }
+-    return deficit;
+-  }
+-
+   public synchronized RMContainerTokenSecretManager
+       getContainerTokenSecretManager() {
+     return rmContext.getContainerTokenSecretManager();
+@@ -1203,9 +1016,9 @@ private void updateRootQueueMetrics() {
+    * @return true if preemption should be attempted, false otherwise.
+    */
+   private boolean shouldAttemptPreemption() {
+-    if (preemptionEnabled) {
++    if (context.isPreemptionEnabled()) {
+       Resource clusterResource = getClusterResource();
+-      return (preemptionUtilizationThreshold < Math.max(
++      return (context.getPreemptionUtilizationThreshold() < Math.max(
+           (float) rootMetrics.getAllocatedMB() / clusterResource.getMemory(),
+           (float) rootMetrics.getAllocatedVirtualCores() /
+               clusterResource.getVirtualCores()));
+@@ -1341,15 +1154,10 @@ private void initScheduler(Configuration conf) throws IOException {
+       rackLocalityThreshold = this.conf.getLocalityThresholdRack();
+       nodeLocalityDelayMs = this.conf.getLocalityDelayNodeMs();
+       rackLocalityDelayMs = this.conf.getLocalityDelayRackMs();
+-      preemptionEnabled = this.conf.getPreemptionEnabled();
+-      preemptionUtilizationThreshold =
+-          this.conf.getPreemptionUtilizationThreshold();
+       assignMultiple = this.conf.getAssignMultiple();
+       maxAssignDynamic = this.conf.isMaxAssignDynamic();
+       maxAssign = this.conf.getMaxAssign();
+       sizeBasedWeight = this.conf.getSizeBasedWeight();
+-      preemptionInterval = this.conf.getPreemptionInterval();
+-      waitTimeBeforeKill = this.conf.getWaitTimeBeforeKill();
+       usePortForNodeName = this.conf.getUsePortForNodeName();
+       reservableNodesRatio = this.conf.getReservableNodes();
+ 
+@@ -1388,6 +1196,10 @@ private void initScheduler(Configuration conf) throws IOException {
+         schedulingThread.setName("FairSchedulerContinuousScheduling");
+         schedulingThread.setDaemon(true);
+       }
++
++      if (this.conf.getPreemptionEnabled()) {
++        createPreemptionThread();
++      }
+     }
+ 
+     allocsLoader.init(conf);
+@@ -1402,6 +1214,11 @@ private void initScheduler(Configuration conf) throws IOException {
+     }
+   }
+ 
++  @VisibleForTesting
++  protected void createPreemptionThread() {
++    preemptionThread = new FSPreemptionThread(this);
++  }
++
+   private void updateReservationThreshold() {
+     Resource newThreshold = Resources.multiply(
+         getIncrementResourceCapability(),
+@@ -1418,6 +1235,9 @@ private synchronized void startSchedulerThreads() {
+       Preconditions.checkNotNull(schedulingThread, "schedulingThread is null");
+       schedulingThread.start();
+     }
++    if (preemptionThread != null) {
++      preemptionThread.start();
++    }
+     allocsLoader.start();
+   }
+ 
+@@ -1446,6 +1266,10 @@ public void serviceStop() throws Exception {
+           schedulingThread.join(THREAD_JOIN_TIMEOUT_MS);
+         }
+       }
++      if (preemptionThread != null) {
++        preemptionThread.interrupt();
++        preemptionThread.join(THREAD_JOIN_TIMEOUT_MS);
++      }
+       if (allocsLoader != null) {
+         allocsLoader.stop();
+       }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/Schedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/Schedulable.java
+index 289887f..c9e398f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/Schedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/Schedulable.java
+@@ -55,50 +55,45 @@
+    * Name of job/queue, used for debugging as well as for breaking ties in
+    * scheduling order deterministically.
+    */
+-  public String getName();
++  String getName();
+ 
+   /**
+    * Maximum number of resources required by this Schedulable. This is defined as
+    * number of currently utilized resources + number of unlaunched resources (that
+    * are either not yet launched or need to be speculated).
+    */
+-  public Resource getDemand();
++  Resource getDemand();
+ 
+   /** Get the aggregate amount of resources consumed by the schedulable. */
+-  public Resource getResourceUsage();
++  Resource getResourceUsage();
+ 
+   /** Minimum Resource share assigned to the schedulable. */
+-  public Resource getMinShare();
++  Resource getMinShare();
+ 
+   /** Maximum Resource share assigned to the schedulable. */
+-  public Resource getMaxShare();
++  Resource getMaxShare();
+ 
+   /** Job/queue weight in fair sharing. */
+-  public ResourceWeights getWeights();
++  ResourceWeights getWeights();
+ 
+   /** Start time for jobs in FIFO queues; meaningless for QueueSchedulables.*/
+-  public long getStartTime();
++  long getStartTime();
+ 
+- /** Job priority for jobs in FIFO queues; meaningless for QueueSchedulables. */
+-  public Priority getPriority();
++  /** Job priority for jobs in FIFO queues; meaningless for QueueSchedulables. */
++  Priority getPriority();
+ 
+   /** Refresh the Schedulable's demand and those of its children if any. */
+-  public void updateDemand();
++  void updateDemand();
+ 
+   /**
+    * Assign a container on this node if possible, and return the amount of
+    * resources assigned.
+    */
+-  public Resource assignContainer(FSSchedulerNode node);
+-
+-  /**
+-   * Preempt a container from this Schedulable if possible.
+-   */
+-  public RMContainer preemptContainer();
++  Resource assignContainer(FSSchedulerNode node);
+ 
+   /** Get the fair share assigned to this Schedulable. */
+-  public Resource getFairShare();
++  Resource getFairShare();
+ 
+   /** Assign a fair share to this Schedulable. */
+-  public void setFairShare(Resource fairShare);
++  void setFairShare(Resource fairShare);
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerTestBase.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerTestBase.java
+index ffeb6c9..7545862 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerTestBase.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerTestBase.java
+@@ -17,6 +17,10 @@
+  */
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
+ 
++import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event
++    .NodeAddedSchedulerEvent;
+ import org.junit.Assert;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.when;
+@@ -69,9 +73,14 @@
+   private static final int SLEEP_DURATION = 10;
+   private static final int SLEEP_RETRIES = 1000;
+ 
++  /**
++   * The list of nodes added to the cluster using the {@link #addNode} method.
++   */
++  protected final List<RMNode> rmNodes = new ArrayList<>();
++
+   // Helper methods
+   protected Configuration createConfiguration() {
+-    Configuration conf = new YarnConfiguration();
++    conf = new YarnConfiguration();
+     conf.setClass(YarnConfiguration.RM_SCHEDULER, FairScheduler.class,
+         ResourceScheduler.class);
+     conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 0);
+@@ -273,4 +282,18 @@ protected void checkAppConsumption(FSAppAttempt app, Resource resource)
+     Assert.assertEquals(resource.getVirtualCores(),
+         app.getCurrentConsumption().getVirtualCores());
+   }
++
++  /**
++   * Add a node to the cluster and track the nodes in {@link #rmNodes}
++   * @param memory memory capacity of the node
++   * @param vcores cpu capacity of the node
++   */
++  protected void addNode(int memory, int vcores) {
++    int id = rmNodes.size() + 1;
++    RMNode node =
++        MockNodes.newNodeInfo(1, Resources.createResource(memory, vcores), id,
++            "127.0.0." + id);
++    scheduler.handle(new NodeAddedSchedulerEvent(node));
++    rmNodes.add(node);
++  }
+ }
+\ No newline at end of file
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerWithMockPreemption.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerWithMockPreemption.java
+new file mode 100644
+index 0000000..25780cd
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerWithMockPreemption.java
+@@ -0,0 +1,58 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import java.util.HashSet;
++import java.util.Set;
++
++public class FairSchedulerWithMockPreemption extends FairScheduler {
++  @Override
++  protected void createPreemptionThread() {
++    preemptionThread = new MockPreemptionThread(this);
++  }
++
++  static class MockPreemptionThread extends FSPreemptionThread {
++    private Set<FSAppAttempt> appsAdded = new HashSet<>();
++    private int totalAppsAdded = 0;
++
++    MockPreemptionThread(FairScheduler scheduler) {
++      super(scheduler);
++    }
++
++    @Override
++    public void run() {
++      while (!Thread.interrupted()) {
++        try {
++          FSAppAttempt app = context.getStarvedApps().take();
++          appsAdded.add(app);
++          totalAppsAdded++;
++        } catch (InterruptedException e) {
++          return;
++        }
++      }
++    }
++
++    int uniqueAppsAdded() {
++      return appsAdded.size();
++    }
++
++    int totalAppsAdded() {
++      return totalAppsAdded;
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FakeSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FakeSchedulable.java
+index 5a170cf..e802f42 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FakeSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FakeSchedulable.java
+@@ -86,11 +86,6 @@ public Resource assignContainer(FSSchedulerNode node) {
+   }
+ 
+   @Override
+-  public RMContainer preemptContainer() {
+-    return null;
+-  }
+-
+-  @Override
+   public Resource getFairShare() {
+     return this.fairShare;
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSAppStarvation.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSAppStarvation.java
+new file mode 100644
+index 0000000..a5b2d86
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSAppStarvation.java
+@@ -0,0 +1,256 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent;
++
++import org.junit.After;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.FileWriter;
++import java.io.IOException;
++import java.io.PrintWriter;
++
++/**
++ * Test class to verify identification of app starvation
++ */
++public class TestFSAppStarvation extends FairSchedulerTestBase {
++
++  private static final File ALLOC_FILE = new File(TEST_DIR, "test-QUEUES");
++
++  // Node Capacity = NODE_CAPACITY_MULTIPLE * (1 GB or 1 vcore)
++  private static final int NODE_CAPACITY_MULTIPLE = 4;
++  private static final String[] QUEUES =
++      {"no-preemption", "minshare", "fairshare.child", "drf.child"};
++
++  private FairSchedulerWithMockPreemption.MockPreemptionThread preemptionThread;
++
++  @Before
++  public void setup() {
++    createConfiguration();
++    conf.set(YarnConfiguration.RM_SCHEDULER,
++        FairSchedulerWithMockPreemption.class.getCanonicalName());
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE,
++        ALLOC_FILE.getAbsolutePath());
++    conf.setBoolean(FairSchedulerConfiguration.PREEMPTION, true);
++    conf.setFloat(FairSchedulerConfiguration.PREEMPTION_THRESHOLD, 0f);
++  }
++
++  @After
++  public void teardown() {
++    ALLOC_FILE.delete();
++    conf = null;
++    if (resourceManager != null) {
++      resourceManager.stop();
++      resourceManager = null;
++    }
++  }
++
++  /*
++   * Test to verify application starvation is computed only when preemption
++   * is enabled.
++   */
++  @Test
++  public void testPreemptionDisabled() throws Exception {
++    conf.setBoolean(FairSchedulerConfiguration.PREEMPTION, false);
++
++    setupClusterAndSubmitJobs();
++
++    assertNull("Found starved apps even when preemption is turned off",
++        scheduler.getContext().getStarvedApps());
++  }
++
++  /*
++   * Test to verify application starvation is computed correctly when
++   * preemption is turned on.
++   */
++  @Test
++  public void testPreemptionEnabled() throws Exception {
++    setupClusterAndSubmitJobs();
++
++    assertNotNull("FSContext does not have an FSStarvedApps instance",
++        scheduler.getContext().getStarvedApps());
++    assertEquals("Expecting 3 starved applications, one each for the "
++            + "minshare and fairshare queues",
++        3, preemptionThread.uniqueAppsAdded());
++
++    // Verify the apps get added again on a subsequent update
++    scheduler.update();
++    Thread.yield();
++
++    verifyLeafQueueStarvation();
++    assertTrue("Each app is marked as starved exactly once",
++        preemptionThread.totalAppsAdded() > preemptionThread.uniqueAppsAdded());
++  }
++
++  /*
++   * Test to verify app starvation is computed only when the cluster
++   * utilization threshold is over the preemption threshold.
++   */
++  @Test
++  public void testClusterUtilizationThreshold() throws Exception {
++    // Set preemption threshold to 1.1, so the utilization is always lower
++    conf.setFloat(FairSchedulerConfiguration.PREEMPTION_THRESHOLD, 1.1f);
++
++    setupClusterAndSubmitJobs();
++
++    assertNotNull("FSContext does not have an FSStarvedApps instance",
++        scheduler.getContext().getStarvedApps());
++    assertEquals("Found starved apps when preemption threshold is over 100%", 0,
++        preemptionThread.totalAppsAdded());
++  }
++
++  private void verifyLeafQueueStarvation() {
++    for (String q : QUEUES) {
++      if (!q.equals("no-preemption")) {
++        boolean isStarved =
++            scheduler.getQueueManager().getLeafQueue(q, false).isStarved();
++        assertTrue(isStarved);
++      }
++    }
++  }
++
++  private void setupClusterAndSubmitJobs() throws Exception {
++    setupStarvedCluster();
++    submitAppsToEachLeafQueue();
++    sendEnoughNodeUpdatesToAssignFully();
++
++    // Sleep to hit the preemption timeouts
++    Thread.sleep(10);
++
++    // Scheduler update to populate starved apps
++    scheduler.update();
++
++    // Wait for apps to be processed by MockPreemptionThread
++    Thread.yield();
++  }
++
++  /**
++   * Setup the cluster for starvation testing:
++   * 1. Create FS allocation file
++   * 2. Create and start MockRM
++   * 3. Add two nodes to the cluster
++   * 4. Submit an app that uses up all resources on the cluster
++   */
++  private void setupStarvedCluster() throws IOException {
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
++
++    // Default queue
++    out.println("<queue name=\"default\">");
++    out.println("</queue>");
++
++    // Queue with preemption disabled
++    out.println("<queue name=\"no-preemption\">");
++    out.println("<fairSharePreemptionThreshold>0" +
++        "</fairSharePreemptionThreshold>");
++    out.println("</queue>");
++
++    // Queue with minshare preemption enabled
++    out.println("<queue name=\"minshare\">");
++    out.println("<fairSharePreemptionThreshold>0" +
++        "</fairSharePreemptionThreshold>");
++    out.println("<minSharePreemptionTimeout>0" +
++        "</minSharePreemptionTimeout>");
++    out.println("<minResources>2048mb,2vcores</minResources>");
++    out.println("</queue>");
++
++    // FAIR queue with fairshare preemption enabled
++    out.println("<queue name=\"fairshare\">");
++    out.println("<fairSharePreemptionThreshold>1" +
++        "</fairSharePreemptionThreshold>");
++    out.println("<fairSharePreemptionTimeout>0" +
++        "</fairSharePreemptionTimeout>");
++    out.println("<schedulingPolicy>fair</schedulingPolicy>");
++    addChildQueue(out);
++    out.println("</queue>");
++
++    // DRF queue with fairshare preemption enabled
++    out.println("<queue name=\"drf\">");
++    out.println("<fairSharePreemptionThreshold>1" +
++        "</fairSharePreemptionThreshold>");
++    out.println("<fairSharePreemptionTimeout>0" +
++        "</fairSharePreemptionTimeout>");
++    out.println("<schedulingPolicy>drf</schedulingPolicy>");
++    addChildQueue(out);
++    out.println("</queue>");
++
++    out.println("</allocations>");
++    out.close();
++
++    assertTrue("Allocation file does not exist, not running the test",
++        ALLOC_FILE.exists());
++
++    resourceManager = new MockRM(conf);
++    resourceManager.start();
++    scheduler = (FairScheduler) resourceManager.getResourceScheduler();
++    preemptionThread = (FairSchedulerWithMockPreemption.MockPreemptionThread)
++        scheduler.preemptionThread;
++
++    // Create and add two nodes to the cluster
++    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
++    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
++
++    // Create an app that takes up all the resources on the cluster
++    ApplicationAttemptId app
++        = createSchedulingRequest(1024, 1, "root.default", "default", 8);
++
++    scheduler.update();
++    sendEnoughNodeUpdatesToAssignFully();
++
++    assertEquals(8, scheduler.getSchedulerApp(app).getLiveContainers().size());
++  }
++
++  private void addChildQueue(PrintWriter out) {
++    // Child queue under fairshare with same settings
++    out.println("<queue name=\"child\">");
++    out.println("<fairSharePreemptionThreshold>1" +
++        "</fairSharePreemptionThreshold>");
++    out.println("<fairSharePreemptionTimeout>0" +
++        "</fairSharePreemptionTimeout>");
++    out.println("</queue>");
++  }
++
++  private void submitAppsToEachLeafQueue() {
++    for (String queue : QUEUES) {
++      createSchedulingRequest(1024, 1, "root." + queue, "user", 1);
++    }
++    scheduler.update();
++  }
++
++  private void sendEnoughNodeUpdatesToAssignFully() {
++    for (RMNode node : rmNodes) {
++      NodeUpdateSchedulerEvent nodeUpdateSchedulerEvent =
++          new NodeUpdateSchedulerEvent(node);
++      for (int i = 0; i < NODE_CAPACITY_MULTIPLE; i++) {
++        scheduler.handle(nodeUpdateSchedulerEvent);
++      }
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSLeafQueue.java
+index 42b4671b..dc1fe53 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSLeafQueue.java
+@@ -77,6 +77,10 @@ public void teardown() {
+   @Test
+   public void testUpdateDemand() {
+     conf.set(FairSchedulerConfiguration.ASSIGN_MULTIPLE, "false");
++    // Set update interval to a large value so demand is not updated out of
++    // order. YARN-5264 changes this test upstream, and that is not affected
++    // by the value of update interval.
++    conf.setLong(FairSchedulerConfiguration.UPDATE_INTERVAL_MS, 60 * 1000);
+     resourceManager = new MockRM(conf);
+     resourceManager.start();
+     scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+@@ -112,19 +116,15 @@ public void test() throws Exception {
+     PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+     out.println("<?xml version=\"1.0\"?>");
+     out.println("<allocations>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<minResources>2048mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<minResources>2048mb,0vcores</minResources>");
+-    out.println("</queue>");
++    out.println("<queue name=\"queueA\"></queue>");
++    out.println("<queue name=\"queueB\"></queue>");
+     out.println("</allocations>");
+     out.close();
+ 
+     resourceManager = new MockRM(conf);
+     resourceManager.start();
+     scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+-    for(FSQueue queue: scheduler.getQueueManager().getQueues()) {
++    for (FSQueue queue : scheduler.getQueueManager().getQueues()) {
+       assertEquals(queue.getMetrics().getMaxApps(), Integer.MAX_VALUE);
+       assertEquals(queue.getMetrics().getSchedulingPolicy(),
+           SchedulingPolicy.DEFAULT_POLICY.getName());
+@@ -150,162 +150,6 @@ public void test() throws Exception {
+     scheduler.update();
+     Collection<FSLeafQueue> queues = scheduler.getQueueManager().getLeafQueues();
+     assertEquals(3, queues.size());
+-
+-    // Queue A should be above min share, B below.
+-    FSLeafQueue queueA =
+-        scheduler.getQueueManager().getLeafQueue("queueA", false);
+-    FSLeafQueue queueB =
+-        scheduler.getQueueManager().getLeafQueue("queueB", false);
+-    assertFalse(queueA.isStarvedForMinShare());
+-    assertTrue(queueB.isStarvedForMinShare());
+-
+-    // Node checks in again, should allocate for B
+-    scheduler.handle(nodeEvent2);
+-    // Now B should have min share ( = demand here)
+-    assertFalse(queueB.isStarvedForMinShare());
+-  }
+-
+-  @Test (timeout = 5000)
+-  public void testIsStarvedForFairShare() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.2</weight>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.8</weight>");
+-    out.println("<fairSharePreemptionThreshold>.4</fairSharePreemptionThreshold>");
+-    out.println("<queue name=\"queueB1\">");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB2\">");
+-    out.println("<fairSharePreemptionThreshold>.6</fairSharePreemptionThreshold>");
+-    out.println("</queue>");
+-    out.println("</queue>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    resourceManager = new MockRM(conf);
+-    resourceManager.start();
+-    scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+-
+-    // Add one big node (only care about aggregate capacity)
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(10 * 1024, 10), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    scheduler.update();
+-
+-    // Queue A wants 4 * 1024. Node update gives this all to A
+-    createSchedulingRequest(1 * 1024, "queueA", "user1", 4);
+-    scheduler.update();
+-    NodeUpdateSchedulerEvent nodeEvent2 = new NodeUpdateSchedulerEvent(node1);
+-    for (int i = 0; i < 4; i ++) {
+-      scheduler.handle(nodeEvent2);
+-    }
+-
+-    QueueManager queueMgr = scheduler.getQueueManager();
+-    FSLeafQueue queueA = queueMgr.getLeafQueue("queueA", false);
+-    assertEquals(4 * 1024, queueA.getResourceUsage().getMemory());
+-
+-    // Both queue B1 and queue B2 want 3 * 1024
+-    createSchedulingRequest(1 * 1024, "queueB.queueB1", "user1", 3);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB2", "user1", 3);
+-    scheduler.update();
+-    for (int i = 0; i < 4; i ++) {
+-      scheduler.handle(nodeEvent2);
+-    }
+-
+-    FSLeafQueue queueB1 = queueMgr.getLeafQueue("queueB.queueB1", false);
+-    FSLeafQueue queueB2 = queueMgr.getLeafQueue("queueB.queueB2", false);
+-    assertEquals(2 * 1024, queueB1.getResourceUsage().getMemory());
+-    assertEquals(2 * 1024, queueB2.getResourceUsage().getMemory());
+-
+-    // For queue B1, the fairSharePreemptionThreshold is 0.4, and the fair share
+-    // threshold is 1.6 * 1024
+-    assertFalse(queueB1.isStarvedForFairShare());
+-
+-    // For queue B2, the fairSharePreemptionThreshold is 0.6, and the fair share
+-    // threshold is 2.4 * 1024
+-    assertTrue(queueB2.isStarvedForFairShare());
+-
+-    // Node checks in again
+-    scheduler.handle(nodeEvent2);
+-    scheduler.handle(nodeEvent2);
+-    assertEquals(3 * 1024, queueB1.getResourceUsage().getMemory());
+-    assertEquals(3 * 1024, queueB2.getResourceUsage().getMemory());
+-
+-    // Both queue B1 and queue B2 usages go to 3 * 1024
+-    assertFalse(queueB1.isStarvedForFairShare());
+-    assertFalse(queueB2.isStarvedForFairShare());
+-  }
+-
+-  @Test (timeout = 5000)
+-  public void testIsStarvedForFairShareDRF() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.5</weight>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.5</weight>");
+-    out.println("</queue>");
+-    out.println("<defaultFairSharePreemptionThreshold>1</defaultFairSharePreemptionThreshold>");
+-    out.println("<defaultQueueSchedulingPolicy>drf</defaultQueueSchedulingPolicy>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    resourceManager = new MockRM(conf);
+-    resourceManager.start();
+-    scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+-
+-    // Add one big node (only care about aggregate capacity)
+-    RMNode node1 =
+-            MockNodes.newNodeInfo(1, Resources.createResource(10 * 1024, 10), 1,
+-                    "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    scheduler.update();
+-
+-    // Queue A wants 7 * 1024, 1. Node update gives this all to A
+-    createSchedulingRequest(7 * 1024, 1, "queueA", "user1", 1);
+-    scheduler.update();
+-    NodeUpdateSchedulerEvent nodeEvent2 = new NodeUpdateSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent2);
+-
+-    QueueManager queueMgr = scheduler.getQueueManager();
+-    FSLeafQueue queueA = queueMgr.getLeafQueue("queueA", false);
+-    assertEquals(7 * 1024, queueA.getResourceUsage().getMemory());
+-    assertEquals(1, queueA.getResourceUsage().getVirtualCores());
+-
+-    // Queue B has 3 reqs :
+-    // 1) 2 * 1024, 5 .. which will be granted
+-    // 2) 1 * 1024, 1 .. which will be granted
+-    // 3) 1 * 1024, 1 .. which wont
+-    createSchedulingRequest(2 * 1024, 5, "queueB", "user1", 1);
+-    createSchedulingRequest(1 * 1024, 2, "queueB", "user1", 2);
+-    scheduler.update();
+-    for (int i = 0; i < 3; i ++) {
+-      scheduler.handle(nodeEvent2);
+-    }
+-
+-    FSLeafQueue queueB = queueMgr.getLeafQueue("queueB", false);
+-    assertEquals(3 * 1024, queueB.getResourceUsage().getMemory());
+-    assertEquals(6, queueB.getResourceUsage().getVirtualCores());
+-
+-    scheduler.update();
+-
+-    // Verify that Queue us not starved for fair share..
+-    // Since the Starvation logic now uses DRF when the policy = drf, The
+-    // Queue should not be starved
+-    assertFalse(queueB.isStarvedForFairShare());
+   }
+ 
+   @Test
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 4f579b2..11b5f9e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -2292,1032 +2292,6 @@ public void testConfigureRootQueue() throws Exception {
+     assertEquals(0.5f, root.getFairSharePreemptionThreshold(), 0.01);
+   }
+ 
+-  @Test (timeout = 5000)
+-  /**
+-   * Make sure containers are chosen to be preempted in the correct order.
+-   */
+-  public void testChoiceOfPreemptedContainers() throws Exception {
+-    conf.setLong(FairSchedulerConfiguration.PREEMPTION_INTERVAL, 5000);
+-    conf.setLong(FairSchedulerConfiguration.WAIT_TIME_BEFORE_KILL, 10000);
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE + ".allocation.file", ALLOC_FILE);
+-    conf.set(FairSchedulerConfiguration.USER_AS_DEFAULT_QUEUE, "false");
+-    
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-    
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("</queue>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Create two nodes
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(4 * 1024, 4), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    RMNode node2 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(4 * 1024, 4), 2,
+-            "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node2);
+-    scheduler.handle(nodeEvent2);
+-
+-    // Queue A and B each request two applications
+-    ApplicationAttemptId app1 =
+-        createSchedulingRequest(1 * 1024, 1, "queueA", "user1", 1, 1);
+-    createSchedulingRequestExistingApplication(1 * 1024, 1, 2, app1);
+-    ApplicationAttemptId app2 =
+-        createSchedulingRequest(1 * 1024, 1, "queueA", "user1", 1, 3);
+-    createSchedulingRequestExistingApplication(1 * 1024, 1, 4, app2);
+-
+-    ApplicationAttemptId app3 =
+-        createSchedulingRequest(1 * 1024, 1, "queueB", "user1", 1, 1);
+-    createSchedulingRequestExistingApplication(1 * 1024, 1, 2, app3);
+-    ApplicationAttemptId app4 =
+-        createSchedulingRequest(1 * 1024, 1, "queueB", "user1", 1, 3);
+-    createSchedulingRequestExistingApplication(1 * 1024, 1, 4, app4);
+-
+-    scheduler.update();
+-
+-    scheduler.getQueueManager().getLeafQueue("queueA", true)
+-        .setPolicy(SchedulingPolicy.parse("fifo"));
+-    scheduler.getQueueManager().getLeafQueue("queueB", true)
+-        .setPolicy(SchedulingPolicy.parse("fair"));
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-    NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-    for (int i = 0; i < 4; i++) {
+-      scheduler.handle(nodeUpdate1);
+-      scheduler.handle(nodeUpdate2);
+-    }
+-
+-    assertEquals(2, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app4).getLiveContainers().size());
+-
+-    // Now new requests arrive from queueC and default
+-    createSchedulingRequest(1 * 1024, 1, "queueC", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, 1, "queueC", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, 1, "default", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, 1, "default", "user1", 1, 1);
+-    scheduler.update();
+-
+-    // We should be able to claw back one container from queueA and queueB each.
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    assertEquals(2, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-
+-    // First verify we are adding containers to preemption list for the app.
+-    // For queueA (fifo), app2 is selected.
+-    // For queueB (fair), app4 is selected.
+-    assertTrue("App2 should have container to be preempted",
+-        !Collections.disjoint(
+-            scheduler.getSchedulerApp(app2).getLiveContainers(),
+-            scheduler.getSchedulerApp(app2).getPreemptionContainers()));
+-    assertTrue("App4 should have container to be preempted",
+-        !Collections.disjoint(
+-            scheduler.getSchedulerApp(app2).getLiveContainers(),
+-            scheduler.getSchedulerApp(app2).getPreemptionContainers()));
+-
+-    // Pretend 15 seconds have passed
+-    clock.tickSec(15);
+-
+-    // Trigger a kill by insisting we want containers back
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-
+-    // At this point the containers should have been killed (since we are not simulating AM)
+-    assertEquals(1, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(1, scheduler.getSchedulerApp(app4).getLiveContainers().size());
+-    // Inside each app, containers are sorted according to their priorities.
+-    // Containers with priority 4 are preempted for app2 and app4.
+-    Set<RMContainer> set = new HashSet<RMContainer>();
+-    for (RMContainer container :
+-        scheduler.getSchedulerApp(app2).getLiveContainers()) {
+-      if (container.getAllocatedPriority().getPriority() == 4) {
+-        set.add(container);
+-      }
+-    }
+-    for (RMContainer container :
+-        scheduler.getSchedulerApp(app4).getLiveContainers()) {
+-      if (container.getAllocatedPriority().getPriority() == 4) {
+-        set.add(container);
+-      }
+-    }
+-    assertTrue("Containers with priority=4 in app2 and app4 should be " +
+-        "preempted.", set.isEmpty());
+-
+-    // Trigger a kill by insisting we want containers back
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-
+-    // Pretend 15 seconds have passed
+-    clock.tickSec(15);
+-
+-    // We should be able to claw back another container from A and B each.
+-    // For queueA (fifo), continue preempting from app2.
+-    // For queueB (fair), even app4 has a lowest priority container with p=4, it
+-    // still preempts from app3 as app3 is most over fair share.
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-
+-    assertEquals(2, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(0, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(1, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-    assertEquals(1, scheduler.getSchedulerApp(app4).getLiveContainers().size());
+-
+-    // Now A and B are below fair share, so preemption shouldn't do anything
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    assertTrue("App1 should have no container to be preempted",
+-        scheduler.getSchedulerApp(app1).getPreemptionContainers().isEmpty());
+-    assertTrue("App2 should have no container to be preempted",
+-        scheduler.getSchedulerApp(app2).getPreemptionContainers().isEmpty());
+-    assertTrue("App3 should have no container to be preempted",
+-        scheduler.getSchedulerApp(app3).getPreemptionContainers().isEmpty());
+-    assertTrue("App4 should have no container to be preempted",
+-        scheduler.getSchedulerApp(app4).getPreemptionContainers().isEmpty());
+-  }
+-
+-  @Test
+-  public void testPreemptionIsNotDelayedToNextRound() throws Exception {
+-    conf.setLong(FairSchedulerConfiguration.PREEMPTION_INTERVAL, 5000);
+-    conf.setLong(FairSchedulerConfiguration.WAIT_TIME_BEFORE_KILL, 10000);
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    conf.set(FairSchedulerConfiguration.USER_AS_DEFAULT_QUEUE, "false");
+-
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>8</weight>");
+-    out.println("<queue name=\"queueA1\" />");
+-    out.println("<queue name=\"queueA2\" />");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>2</weight>");
+-    out.println("</queue>");
+-    out.println("<defaultFairSharePreemptionTimeout>10</defaultFairSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Add a node of 8G
+-    RMNode node1 = MockNodes.newNodeInfo(1,
+-        Resources.createResource(8 * 1024, 8), 1, "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    // Run apps in queueA.A1 and queueB
+-    ApplicationAttemptId app1 = createSchedulingRequest(1 * 1024, 1,
+-        "queueA.queueA1", "user1", 7, 1);
+-    // createSchedulingRequestExistingApplication(1 * 1024, 1, 2, app1);
+-    ApplicationAttemptId app2 = createSchedulingRequest(1 * 1024, 1, "queueB",
+-        "user2", 1, 1);
+-
+-    scheduler.update();
+-
+-    NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-    for (int i = 0; i < 8; i++) {
+-      scheduler.handle(nodeUpdate1);
+-    }
+-
+-    // verify if the apps got the containers they requested
+-    assertEquals(7, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(1, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-
+-    // Now submit an app in queueA.queueA2
+-    ApplicationAttemptId app3 = createSchedulingRequest(1 * 1024, 1,
+-        "queueA.queueA2", "user3", 7, 1);
+-    scheduler.update();
+-
+-    // Let 11 sec pass
+-    clock.tickSec(11);
+-
+-    scheduler.update();
+-    Resource toPreempt = scheduler.resourceDeficit(scheduler.getQueueManager()
+-            .getLeafQueue("queueA.queueA2", false), clock.getTime());
+-    assertEquals(3277, toPreempt.getMemory());
+-
+-    // verify if the 3 containers required by queueA2 are preempted in the same
+-    // round
+-    scheduler.preemptResources(toPreempt);
+-    assertEquals(3, scheduler.getSchedulerApp(app1).getPreemptionContainers()
+-        .size());
+-  }
+-
+-  @Test (timeout = 5000)
+-  /**
+-   * Tests the timing of decision to preempt tasks.
+-   */
+-  public void testPreemptionDecision() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueD\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<defaultMinSharePreemptionTimeout>5</defaultMinSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionTimeout>10</defaultFairSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Create four nodes
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 2), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    RMNode node2 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 2), 2,
+-            "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node2);
+-    scheduler.handle(nodeEvent2);
+-
+-    RMNode node3 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 2), 3,
+-            "127.0.0.3");
+-    NodeAddedSchedulerEvent nodeEvent3 = new NodeAddedSchedulerEvent(node3);
+-    scheduler.handle(nodeEvent3);
+-
+-    // Queue A and B each request three containers
+-    ApplicationAttemptId app1 =
+-        createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 1);
+-    ApplicationAttemptId app2 =
+-        createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 2);
+-    ApplicationAttemptId app3 =
+-        createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 3);
+-
+-    ApplicationAttemptId app4 =
+-        createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 1);
+-    ApplicationAttemptId app5 =
+-        createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 2);
+-    ApplicationAttemptId app6 =
+-        createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 3);
+-
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    for (int i = 0; i < 2; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-    }
+-
+-    // Now new requests arrive from queues C and D
+-    ApplicationAttemptId app7 =
+-        createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 1);
+-    ApplicationAttemptId app8 =
+-        createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 2);
+-    ApplicationAttemptId app9 =
+-        createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 3);
+-
+-    ApplicationAttemptId app10 =
+-        createSchedulingRequest(1 * 1024, "queueD", "user1", 1, 1);
+-    ApplicationAttemptId app11 =
+-        createSchedulingRequest(1 * 1024, "queueD", "user1", 1, 2);
+-    ApplicationAttemptId app12 =
+-        createSchedulingRequest(1 * 1024, "queueD", "user1", 1, 3);
+-
+-    scheduler.update();
+-
+-    FSLeafQueue schedC =
+-        scheduler.getQueueManager().getLeafQueue("queueC", true);
+-    FSLeafQueue schedD =
+-        scheduler.getQueueManager().getLeafQueue("queueD", true);
+-
+-    assertTrue(Resources.equals(
+-        Resources.none(), scheduler.resourceDeficit(schedC, clock.getTime())));
+-    assertTrue(Resources.equals(
+-        Resources.none(), scheduler.resourceDeficit(schedD, clock.getTime())));
+-    // After minSharePreemptionTime has passed, they should want to preempt min
+-    // share.
+-    clock.tickSec(6);
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(schedC, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(schedD, clock.getTime()).getMemory());
+-
+-    // After fairSharePreemptionTime has passed, they should want to preempt
+-    // fair share.
+-    scheduler.update();
+-    clock.tickSec(6);
+-    assertEquals(
+-        1536 , scheduler.resourceDeficit(schedC, clock.getTime()).getMemory());
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(schedD, clock.getTime()).getMemory());
+-  }
+-
+-  @Test
+-/**
+- * Tests the timing of decision to preempt tasks.
+- */
+-  public void testPreemptionDecisionWithDRF() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,1vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,2vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,3vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueD\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,2vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<defaultMinSharePreemptionTimeout>5</defaultMinSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionTimeout>10</defaultFairSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("<defaultQueueSchedulingPolicy>drf</defaultQueueSchedulingPolicy>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Create four nodes
+-    RMNode node1 =
+-            MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 4), 1,
+-                    "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    RMNode node2 =
+-            MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 4), 2,
+-                    "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node2);
+-    scheduler.handle(nodeEvent2);
+-
+-    RMNode node3 =
+-            MockNodes.newNodeInfo(1, Resources.createResource(2 * 1024, 4), 3,
+-                    "127.0.0.3");
+-    NodeAddedSchedulerEvent nodeEvent3 = new NodeAddedSchedulerEvent(node3);
+-    scheduler.handle(nodeEvent3);
+-
+-    // Queue A and B each request three containers
+-    ApplicationAttemptId app1 =
+-            createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 1);
+-    ApplicationAttemptId app2 =
+-            createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 2);
+-    ApplicationAttemptId app3 =
+-            createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 3);
+-
+-    ApplicationAttemptId app4 =
+-            createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 1);
+-    ApplicationAttemptId app5 =
+-            createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 2);
+-    ApplicationAttemptId app6 =
+-            createSchedulingRequest(1 * 1024, "queueB", "user1", 1, 3);
+-
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    for (int i = 0; i < 2; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-    }
+-
+-    // Now new requests arrive from queues C and D
+-    ApplicationAttemptId app7 =
+-            createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 1);
+-    ApplicationAttemptId app8 =
+-            createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 2);
+-    ApplicationAttemptId app9 =
+-            createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 3);
+-
+-    ApplicationAttemptId app10 =
+-            createSchedulingRequest(1 * 1024, "queueD", "user1", 2, 1);
+-    ApplicationAttemptId app11 =
+-            createSchedulingRequest(1 * 1024, "queueD", "user1", 2, 2);
+-    ApplicationAttemptId app12 =
+-            createSchedulingRequest(1 * 1024, "queueD", "user1", 2, 3);
+-
+-    scheduler.update();
+-
+-    FSLeafQueue schedC =
+-            scheduler.getQueueManager().getLeafQueue("queueC", true);
+-    FSLeafQueue schedD =
+-            scheduler.getQueueManager().getLeafQueue("queueD", true);
+-
+-    assertTrue(Resources.equals(
+-            Resources.none(), scheduler.resourceDeficit(schedC, clock.getTime())));
+-    assertTrue(Resources.equals(
+-            Resources.none(), scheduler.resourceDeficit(schedD, clock.getTime())));
+-
+-    // Test :
+-    // 1) whether componentWise min works as expected.
+-    // 2) DRF calculator is used
+-
+-    // After minSharePreemptionTime has passed, they should want to preempt min
+-    // share.
+-    clock.tickSec(6);
+-    Resource res = scheduler.resourceDeficit(schedC, clock.getTime());
+-    assertEquals(1024, res.getMemory());
+-    // Demand = 3
+-    assertEquals(3, res.getVirtualCores());
+-
+-    res = scheduler.resourceDeficit(schedD, clock.getTime());
+-    assertEquals(1024, res.getMemory());
+-    // Demand = 6, but min share = 2
+-    assertEquals(2, res.getVirtualCores());
+-
+-    // After fairSharePreemptionTime has passed, they should want to preempt
+-    // fair share.
+-    scheduler.update();
+-    clock.tickSec(6);
+-    res = scheduler.resourceDeficit(schedC, clock.getTime());
+-    assertEquals(1536, res.getMemory());
+-    assertEquals(3, res.getVirtualCores());
+-
+-    res = scheduler.resourceDeficit(schedD, clock.getTime());
+-    assertEquals(1536, res.getMemory());
+-    // Demand = 6, but fair share = 3
+-    assertEquals(3, res.getVirtualCores());
+-  }
+-
+-  @Test
+-  /**
+-   * Tests the various timing of decision to preempt tasks.
+-   */
+-  public void testPreemptionDecisionWithVariousTimeout() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>1</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>2</weight>");
+-    out.println("<minSharePreemptionTimeout>10</minSharePreemptionTimeout>");
+-    out.println("<fairSharePreemptionTimeout>25</fairSharePreemptionTimeout>");
+-    out.println("<queue name=\"queueB1\">");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("<minSharePreemptionTimeout>5</minSharePreemptionTimeout>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB2\">");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("<fairSharePreemptionTimeout>20</fairSharePreemptionTimeout>");
+-    out.println("</queue>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>1</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.print("<defaultMinSharePreemptionTimeout>15</defaultMinSharePreemptionTimeout>");
+-    out.print("<defaultFairSharePreemptionTimeout>30</defaultFairSharePreemptionTimeout>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Check the min/fair share preemption timeout for each queue
+-    QueueManager queueMgr = scheduler.getQueueManager();
+-    assertEquals(30000, queueMgr.getQueue("root")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(30000, queueMgr.getQueue("default")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(30000, queueMgr.getQueue("queueA")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(25000, queueMgr.getQueue("queueB")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(25000, queueMgr.getQueue("queueB.queueB1")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(20000, queueMgr.getQueue("queueB.queueB2")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(30000, queueMgr.getQueue("queueC")
+-        .getFairSharePreemptionTimeout());
+-    assertEquals(15000, queueMgr.getQueue("root")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(15000, queueMgr.getQueue("default")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(15000, queueMgr.getQueue("queueA")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(10000, queueMgr.getQueue("queueB")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(5000, queueMgr.getQueue("queueB.queueB1")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(10000, queueMgr.getQueue("queueB.queueB2")
+-        .getMinSharePreemptionTimeout());
+-    assertEquals(15000, queueMgr.getQueue("queueC")
+-        .getMinSharePreemptionTimeout());
+-
+-    // Create one big node
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(6 * 1024, 6), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    // Queue A takes all resources
+-    for (int i = 0; i < 6; i ++) {
+-      createSchedulingRequest(1 * 1024, "queueA", "user1", 1, 1);
+-    }
+-
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-    for (int i = 0; i < 6; i++) {
+-      scheduler.handle(nodeUpdate1);
+-    }
+-
+-    // Now new requests arrive from queues B1, B2 and C
+-    createSchedulingRequest(1 * 1024, "queueB.queueB1", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB1", "user1", 1, 2);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB1", "user1", 1, 3);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB2", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB2", "user1", 1, 2);
+-    createSchedulingRequest(1 * 1024, "queueB.queueB2", "user1", 1, 3);
+-    createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 1);
+-    createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 2);
+-    createSchedulingRequest(1 * 1024, "queueC", "user1", 1, 3);
+-
+-    scheduler.update();
+-
+-    FSLeafQueue queueB1 = queueMgr.getLeafQueue("queueB.queueB1", true);
+-    FSLeafQueue queueB2 = queueMgr.getLeafQueue("queueB.queueB2", true);
+-    FSLeafQueue queueC = queueMgr.getLeafQueue("queueC", true);
+-
+-    assertTrue(Resources.equals(
+-        Resources.none(), scheduler.resourceDeficit(queueB1, clock.getTime())));
+-    assertTrue(Resources.equals(
+-        Resources.none(), scheduler.resourceDeficit(queueB2, clock.getTime())));
+-    assertTrue(Resources.equals(
+-        Resources.none(), scheduler.resourceDeficit(queueC, clock.getTime())));
+-
+-    // After 5 seconds, queueB1 wants to preempt min share
+-    scheduler.update();
+-    clock.tickSec(6);
+-    assertEquals(
+-       1024, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        0, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        0, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-
+-    // After 10 seconds, queueB2 wants to preempt min share
+-    scheduler.update();
+-    clock.tickSec(5);
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        0, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-
+-    // After 15 seconds, queueC wants to preempt min share
+-    scheduler.update();
+-    clock.tickSec(5);
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-
+-    // After 20 seconds, queueB2 should want to preempt fair share
+-    scheduler.update();
+-    clock.tickSec(5);
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-
+-    // After 25 seconds, queueB1 should want to preempt fair share
+-    scheduler.update();
+-    clock.tickSec(5);
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        1024, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-
+-    // After 30 seconds, queueC should want to preempt fair share
+-    scheduler.update();
+-    clock.tickSec(5);
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueB1, clock.getTime()).getMemory());
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueB2, clock.getTime()).getMemory());
+-    assertEquals(
+-        1536, scheduler.resourceDeficit(queueC, clock.getTime()).getMemory());
+-  }
+-
+-  @Test
+-  /**
+-   * Tests the decision to preempt tasks respect to non-preemptable queues
+-   * 1, Queues as follow:
+-   *   queueA(non-preemptable)
+-   *   queueB(preemptable)
+-   *   parentQueue(non-preemptable)
+-   *     --queueC(preemptable)
+-   *   queueD(preemptable)
+-   * 2, Submit request to queueA, queueB, queueC, and all of them are over MinShare
+-   * 3, Now all resource are occupied
+-   * 4, Submit request to queueD, and need to preempt resource from other queues
+-   * 5, Only preemptable queue(queueB) would be preempted.
+-   */
+-  public void testPreemptionDecisionWithNonPreemptableQueue() throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"parentQueue\">");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueD\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>2048mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<defaultMinSharePreemptionTimeout>5</defaultMinSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionTimeout>10</defaultFairSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Create four nodes(3G each)
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    RMNode node2 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 2,
+-            "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node2);
+-    scheduler.handle(nodeEvent2);
+-
+-    RMNode node3 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 3,
+-            "127.0.0.3");
+-    NodeAddedSchedulerEvent nodeEvent3 = new NodeAddedSchedulerEvent(node3);
+-    scheduler.handle(nodeEvent3);
+-
+-    RMNode node4 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 4,
+-            "127.0.0.4");
+-    NodeAddedSchedulerEvent nodeEvent4 = new NodeAddedSchedulerEvent(node4);
+-    scheduler.handle(nodeEvent4);
+-
+-    // Submit apps to queueA, queueB, queueC,
+-    // now all resource of the cluster is occupied
+-    ApplicationAttemptId app1 =
+-        createSchedulingRequest(1 * 1024, "queueA", "user1", 4, 1);
+-    ApplicationAttemptId app2 =
+-        createSchedulingRequest(1 * 1024, "queueB", "user1", 4, 2);
+-    ApplicationAttemptId app3 =
+-        createSchedulingRequest(1 * 1024, "parentQueue.queueC", "user1", 4, 3);
+-
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    for (int i = 0; i < 3; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate4 = new NodeUpdateSchedulerEvent(node4);
+-      scheduler.handle(nodeUpdate4);
+-    }
+-
+-    assertEquals(4, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-
+-    // Now new requests arrive from queues D
+-    ApplicationAttemptId app4 =
+-        createSchedulingRequest(1 * 1024, "queueD", "user1", 4, 1);
+-    scheduler.update();
+-    FSLeafQueue schedD =
+-        scheduler.getQueueManager().getLeafQueue("queueD", true);
+-
+-    // After minSharePreemptionTime has passed, 2G resource should preempted from
+-    // queueB to queueD
+-    clock.tickSec(6);
+-    assertEquals(2048,
+-        scheduler.resourceDeficit(schedD, clock.getTime()).getMemory());
+-
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    // now only app2 is selected to be preempted
+-    assertTrue("App2 should have container to be preempted",
+-        !Collections.disjoint(
+-            scheduler.getSchedulerApp(app2).getLiveContainers(),
+-            scheduler.getSchedulerApp(app2).getPreemptionContainers()));
+-    assertTrue("App1 should not have container to be preempted",
+-        Collections.disjoint(
+-            scheduler.getSchedulerApp(app1).getLiveContainers(),
+-            scheduler.getSchedulerApp(app1).getPreemptionContainers()));
+-    assertTrue("App3 should not have container to be preempted",
+-        Collections.disjoint(
+-            scheduler.getSchedulerApp(app3).getLiveContainers(),
+-            scheduler.getSchedulerApp(app3).getPreemptionContainers()));
+-    // Pretend 20 seconds have passed
+-    clock.tickSec(20);
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    for (int i = 0; i < 3; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate4 = new NodeUpdateSchedulerEvent(node4);
+-      scheduler.handle(nodeUpdate4);
+-    }
+-    // after preemption
+-    assertEquals(4, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-    assertEquals(2, scheduler.getSchedulerApp(app4).getLiveContainers().size());
+-  }
+-
+-  @Test
+-  /**
+-   * Tests the decision to preempt tasks when allowPreemptionFrom is set false on
+-   * all queues.
+-   * Then none of them would be preempted actually.
+-   * 1, Queues as follow:
+-   *   queueA(non-preemptable)
+-   *   queueB(non-preemptable)
+-   *   parentQueue(non-preemptable)
+-   *     --queueC(preemptable)
+-   *   parentQueue(preemptable)
+-   *     --queueD(non-preemptable)
+-   * 2, Submit request to queueB, queueC, queueD, and all of them are over MinShare
+-   * 3, Now all resource are occupied
+-   * 4, Submit request to queueA, and need to preempt resource from other queues
+-   * 5, None of queues would be preempted.
+-   */
+-  public void testPreemptionDecisionWhenPreemptionDisabledOnAllQueues()
+-      throws Exception {
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>2048mb,0vcores</minResources>");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"parentQueue1\">");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("<queue name=\"queueC\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"parentQueue2\">");
+-    out.println("<queue name=\"queueD\">");
+-    out.println("<weight>.25</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("<allowPreemptionFrom>false</allowPreemptionFrom>");
+-    out.println("</queue>");
+-    out.println("</queue>");
+-    out.println("<defaultMinSharePreemptionTimeout>5</defaultMinSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionTimeout>10</defaultFairSharePreemptionTimeout>");
+-    out.println("<defaultFairSharePreemptionThreshold>.5</defaultFairSharePreemptionThreshold>");
+-    out.println("</allocations>");
+-    out.close();
+-
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    // Create four nodes(3G each)
+-    RMNode node1 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 1,
+-            "127.0.0.1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
+-
+-    RMNode node2 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 2,
+-            "127.0.0.2");
+-    NodeAddedSchedulerEvent nodeEvent2 = new NodeAddedSchedulerEvent(node2);
+-    scheduler.handle(nodeEvent2);
+-
+-    RMNode node3 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 3,
+-            "127.0.0.3");
+-    NodeAddedSchedulerEvent nodeEvent3 = new NodeAddedSchedulerEvent(node3);
+-    scheduler.handle(nodeEvent3);
+-
+-    RMNode node4 =
+-        MockNodes.newNodeInfo(1, Resources.createResource(3 * 1024, 3), 4,
+-            "127.0.0.4");
+-    NodeAddedSchedulerEvent nodeEvent4 = new NodeAddedSchedulerEvent(node4);
+-    scheduler.handle(nodeEvent4);
+-
+-    // Submit apps to queueB, queueC, queueD
+-    // now all resource of the cluster is occupied
+-
+-    ApplicationAttemptId app1 =
+-        createSchedulingRequest(1 * 1024, "queueB", "user1", 4, 1);
+-    ApplicationAttemptId app2 =
+-        createSchedulingRequest(1 * 1024, "parentQueue1.queueC", "user1", 4, 2);
+-    ApplicationAttemptId app3 =
+-        createSchedulingRequest(1 * 1024, "parentQueue2.queueD", "user1", 4, 3);
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    for (int i = 0; i < 3; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate4 = new NodeUpdateSchedulerEvent(node4);
+-      scheduler.handle(nodeUpdate4);
+-    }
+-
+-    assertEquals(4, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-
+-    // Now new requests arrive from queues A
+-    ApplicationAttemptId app4 =
+-        createSchedulingRequest(1 * 1024, "queueA", "user1", 4, 1);
+-    scheduler.update();
+-    FSLeafQueue schedA =
+-        scheduler.getQueueManager().getLeafQueue("queueA", true);
+-
+-    // After minSharePreemptionTime has passed, resource deficit is 2G
+-    clock.tickSec(6);
+-    assertEquals(2048,
+-        scheduler.resourceDeficit(schedA, clock.getTime()).getMemory());
+-
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    // now none app is selected to be preempted
+-    assertTrue("App1 should have container to be preempted",
+-        Collections.disjoint(
+-            scheduler.getSchedulerApp(app1).getLiveContainers(),
+-            scheduler.getSchedulerApp(app1).getPreemptionContainers()));
+-    assertTrue("App2 should not have container to be preempted",
+-        Collections.disjoint(
+-            scheduler.getSchedulerApp(app2).getLiveContainers(),
+-            scheduler.getSchedulerApp(app2).getPreemptionContainers()));
+-    assertTrue("App3 should not have container to be preempted",
+-        Collections.disjoint(
+-            scheduler.getSchedulerApp(app3).getLiveContainers(),
+-            scheduler.getSchedulerApp(app3).getPreemptionContainers()));
+-    // Pretend 20 seconds have passed
+-    clock.tickSec(20);
+-    scheduler.preemptResources(Resources.createResource(2 * 1024));
+-    for (int i = 0; i < 3; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate2 = new NodeUpdateSchedulerEvent(node2);
+-      scheduler.handle(nodeUpdate2);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate3 = new NodeUpdateSchedulerEvent(node3);
+-      scheduler.handle(nodeUpdate3);
+-
+-      NodeUpdateSchedulerEvent nodeUpdate4 = new NodeUpdateSchedulerEvent(node4);
+-      scheduler.handle(nodeUpdate4);
+-    }
+-    // after preemption
+-    assertEquals(4, scheduler.getSchedulerApp(app1).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app2).getLiveContainers().size());
+-    assertEquals(4, scheduler.getSchedulerApp(app3).getLiveContainers().size());
+-    assertEquals(0, scheduler.getSchedulerApp(app4).getLiveContainers().size());
+-  }
+-
+   @Test
+   public void testBackwardsCompatiblePreemptionConfiguration() throws Exception {
+     conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+@@ -5646,90 +4620,6 @@ public void testDefaultRuleInitializesProperlyWhenPolicyNotConfigured()
+     }
+   }
+     
+-  @Test(timeout=5000)
+-  public void testRecoverRequestAfterPreemption() throws Exception {
+-    conf.setLong(FairSchedulerConfiguration.WAIT_TIME_BEFORE_KILL, 10);
+-    
+-    ControlledClock clock = new ControlledClock();
+-    scheduler.setClock(clock);
+-    scheduler.init(conf);
+-    scheduler.start();
+-    scheduler.reinitialize(conf, resourceManager.getRMContext());
+-
+-    Priority priority = Priority.newInstance(20);
+-    String host = "127.0.0.1";
+-    int GB = 1024;
+-
+-    // Create Node and raised Node Added event
+-    RMNode node = MockNodes.newNodeInfo(1,
+-        Resources.createResource(16 * 1024, 4), 0, host);
+-    NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
+-    scheduler.handle(nodeEvent);
+-
+-    // Create 3 container requests and place it in ask
+-    List<ResourceRequest> ask = new ArrayList<ResourceRequest>();
+-    ResourceRequest nodeLocalRequest = createResourceRequest(GB, 1, host,
+-        priority.getPriority(), 1, true);
+-    ResourceRequest rackLocalRequest = createResourceRequest(GB, 1,
+-        node.getRackName(), priority.getPriority(), 1, true);
+-    ResourceRequest offRackRequest = createResourceRequest(GB, 1,
+-        ResourceRequest.ANY, priority.getPriority(), 1, true);
+-    ask.add(nodeLocalRequest);
+-    ask.add(rackLocalRequest);
+-    ask.add(offRackRequest);
+-
+-    // Create Request and update
+-    ApplicationAttemptId appAttemptId = createSchedulingRequest("queueA",
+-        "user1", ask);
+-    scheduler.update();
+-
+-    // Sufficient node check-ins to fully schedule containers
+-    NodeUpdateSchedulerEvent nodeUpdate = new NodeUpdateSchedulerEvent(node);
+-    scheduler.handle(nodeUpdate);
+-
+-    assertEquals(1, scheduler.getSchedulerApp(appAttemptId).getLiveContainers()
+-        .size());
+-    FSAppAttempt app = scheduler.getSchedulerApp(appAttemptId);
+-
+-    // ResourceRequest will be empty once NodeUpdate is completed
+-    Assert.assertNull(app.getResourceRequest(priority, host));
+-
+-    ContainerId containerId1 = ContainerId.newContainerId(appAttemptId, 1);
+-    RMContainer rmContainer = app.getRMContainer(containerId1);
+-
+-    // Create a preempt event and register for preemption
+-    scheduler.warnOrKillContainer(rmContainer);
+-    
+-    // Wait for few clock ticks
+-    clock.tickSec(5);
+-
+-    // preempt now
+-    scheduler.warnOrKillContainer(rmContainer);
+-
+-    // Trigger container rescheduled event
+-    scheduler.handle(new ContainerRescheduledEvent(rmContainer));
+-
+-    List<ResourceRequest> requests = rmContainer.getResourceRequests();
+-    // Once recovered, resource request will be present again in app
+-    Assert.assertEquals(3, requests.size());
+-    for (ResourceRequest request : requests) {
+-      Assert.assertEquals(1,
+-          app.getResourceRequest(priority, request.getResourceName())
+-              .getNumContainers());
+-    }
+-
+-    // Send node heartbeat
+-    scheduler.update();
+-    scheduler.handle(nodeUpdate);
+-
+-    List<Container> containers = scheduler.allocate(appAttemptId,
+-        Collections.<ResourceRequest> emptyList(),
+-        Collections.<ContainerId> emptyList(), null, null).getContainers();
+-
+-    // Now with updated ResourceRequest, a container is allocated for AM.
+-    Assert.assertTrue(containers.size() == 1);
+-  }
+-  
+   @SuppressWarnings("resource")
+   @Test
+   public void testBlacklistNodes() throws Exception {
+@@ -5845,14 +4735,15 @@ public void testMoveRunnableApp() throws Exception {
+     ApplicationAttemptId appAttId =
+         createSchedulingRequest(1024, 1, "queue1", "user1", 3);
+     ApplicationId appId = appAttId.getApplicationId();
++    scheduler.update();
++
+     RMNode node = MockNodes.newNodeInfo(1, Resources.createResource(1024));
+     NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
+     NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node);
+     scheduler.handle(nodeEvent);
+     scheduler.handle(updateEvent);
+-    
++
+     assertEquals(Resource.newInstance(1024, 1), oldQueue.getResourceUsage());
+-    scheduler.update();
+     assertEquals(Resource.newInstance(3072, 3), oldQueue.getDemand());
+     
+     scheduler.moveApplication(appId, "queue2");
+@@ -5948,6 +4839,8 @@ public void testMoveWouldViolateMaxResourcesConstraints() throws Exception {
+ 
+     ApplicationAttemptId appAttId =
+         createSchedulingRequest(1024, 1, "queue1", "user1", 3);
++    scheduler.update();
++
+     RMNode node = MockNodes.newNodeInfo(1, Resources.createResource(2048, 2));
+     NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
+     NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+index a3527e8..36ee685 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairSchedulerPreemption.java
+@@ -17,177 +17,259 @@
+  */
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
+ 
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.yarn.api.records.Resource;
+-import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeAddedSchedulerEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent;
+-
+-import org.apache.hadoop.yarn.util.ControlledClock;
+-import org.apache.hadoop.yarn.util.resource.Resources;
+ import org.junit.After;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
+ 
+ import java.io.File;
+ import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.util.Arrays;
++import java.util.Collection;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-
++/**
++ * Tests to verify fairshare and minshare preemption, using parameterization.
++ */
++@RunWith(Parameterized.class)
+ public class TestFairSchedulerPreemption extends FairSchedulerTestBase {
+-  private final static String ALLOC_FILE = new File(TEST_DIR,
+-      TestFairSchedulerPreemption.class.getName() + ".xml").getAbsolutePath();
++  private static final File ALLOC_FILE = new File(TEST_DIR, "test-queues");
+ 
+-  private ControlledClock clock;
++  // Node Capacity = NODE_CAPACITY_MULTIPLE * (1 GB or 1 vcore)
++  private static final int NODE_CAPACITY_MULTIPLE = 4;
+ 
+-  private static class StubbedFairScheduler extends FairScheduler {
+-    public int lastPreemptMemory = -1;
++  private final boolean fairsharePreemption;
+ 
+-    @Override
+-    protected void preemptResources(Resource toPreempt) {
+-      lastPreemptMemory = toPreempt.getMemory();
+-    }
++  // App that takes up the entire cluster
++  private FSAppAttempt greedyApp;
+ 
+-    public void resetLastPreemptResources() {
+-      lastPreemptMemory = -1;
+-    }
++  // Starving app that is expected to instigate preemption
++  private FSAppAttempt starvingApp;
++
++  @Parameterized.Parameters
++  public static Collection<Boolean[]> getParameters() {
++    return Arrays.asList(new Boolean[][] {
++        {true}, {false}});
+   }
+ 
+-  @Override
+-  protected Configuration createConfiguration() {
+-    Configuration conf = super.createConfiguration();
+-    conf.setClass(YarnConfiguration.RM_SCHEDULER, StubbedFairScheduler.class,
+-        ResourceScheduler.class);
+-    conf.setBoolean(FairSchedulerConfiguration.PREEMPTION, true);
+-    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
+-    return conf;
++  public TestFairSchedulerPreemption(Boolean fairshare) throws IOException {
++    fairsharePreemption = fairshare;
++    writeAllocFile();
+   }
+ 
+   @Before
+-  public void setup() throws IOException {
+-    conf = createConfiguration();
+-    clock = new ControlledClock();
++  public void setup() {
++    createConfiguration();
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE,
++        ALLOC_FILE.getAbsolutePath());
++    conf.setBoolean(FairSchedulerConfiguration.PREEMPTION, true);
++    conf.setFloat(FairSchedulerConfiguration.PREEMPTION_THRESHOLD, 0f);
++    conf.setInt(FairSchedulerConfiguration.WAIT_TIME_BEFORE_KILL, 0);
+   }
+ 
+   @After
+   public void teardown() {
++    ALLOC_FILE.delete();
++    conf = null;
+     if (resourceManager != null) {
+       resourceManager.stop();
+       resourceManager = null;
+     }
+-    conf = null;
+   }
+ 
+-  private void startResourceManager(float utilizationThreshold) {
+-    conf.setFloat(FairSchedulerConfiguration.PREEMPTION_THRESHOLD,
+-        utilizationThreshold);
+-    resourceManager = new MockRM(conf);
+-    resourceManager.start();
++  private void writeAllocFile() throws IOException {
++    /*
++     * Queue hierarchy:
++     * root
++     * |--- preemptable
++     *      |--- child-1
++     *      |--- child-2
++     * |--- nonpreemptible
++     *      |--- child-1
++     *      |--- child-2
++     */
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
+ 
+-    assertTrue(
+-        resourceManager.getResourceScheduler() instanceof StubbedFairScheduler);
+-    scheduler = (FairScheduler)resourceManager.getResourceScheduler();
++    out.println("<queue name=\"preemptable\">");
++    writePreemptionParams(out);
+ 
+-    scheduler.setClock(clock);
+-    scheduler.updateInterval = 60 * 1000;
+-  }
++    // Child-1
++    out.println("<queue name=\"child-1\">");
++    writeResourceParams(out);
++    out.println("</queue>");
+ 
+-  private void registerNodeAndSubmitApp(
+-      int memory, int vcores, int appContainers, int appMemory) {
+-    RMNode node1 = MockNodes.newNodeInfo(
+-        1, Resources.createResource(memory, vcores), 1, "node1");
+-    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
+-    scheduler.handle(nodeEvent1);
++    // Child-2
++    out.println("<queue name=\"child-2\">");
++    writeResourceParams(out);
++    out.println("</queue>");
+ 
+-    assertEquals("Incorrect amount of resources in the cluster",
+-        memory, scheduler.rootMetrics.getAvailableMB());
+-    assertEquals("Incorrect amount of resources in the cluster",
+-        vcores, scheduler.rootMetrics.getAvailableVirtualCores());
++    out.println("</queue>"); // end of preemptable queue
+ 
+-    createSchedulingRequest(appMemory, "queueA", "user1", appContainers);
+-    scheduler.update();
+-    // Sufficient node check-ins to fully schedule containers
+-    for (int i = 0; i < 3; i++) {
+-      NodeUpdateSchedulerEvent nodeUpdate1 = new NodeUpdateSchedulerEvent(node1);
+-      scheduler.handle(nodeUpdate1);
+-    }
+-    assertEquals("app1's request is not met",
+-        memory - appContainers * appMemory,
+-        scheduler.rootMetrics.getAvailableMB());
+-  }
++    // Queue with preemption disallowed
++    out.println("<queue name=\"nonpreemptable\">");
++    out.println("<allowPreemptionFrom>false" +
++        "</allowPreemptionFrom>");
++    writePreemptionParams(out);
+ 
+-  @Test
+-  public void testPreemptionWithFreeResources() throws Exception {
+-    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
+-    out.println("<?xml version=\"1.0\"?>");
+-    out.println("<allocations>");
+-    out.println("<queue name=\"default\">");
+-    out.println("<maxResources>0mb,0vcores</maxResources>");
++    // Child-1
++    out.println("<queue name=\"child-1\">");
++    writeResourceParams(out);
+     out.println("</queue>");
+-    out.println("<queue name=\"queueA\">");
+-    out.println("<weight>1</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
+-    out.println("</queue>");
+-    out.println("<queue name=\"queueB\">");
+-    out.println("<weight>1</weight>");
+-    out.println("<minResources>1024mb,0vcores</minResources>");
++
++    // Child-2
++    out.println("<queue name=\"child-2\">");
++    writeResourceParams(out);
+     out.println("</queue>");
+-    out.print("<defaultMinSharePreemptionTimeout>5</defaultMinSharePreemptionTimeout>");
+-    out.print("<fairSharePreemptionTimeout>10</fairSharePreemptionTimeout>");
++
++    out.println("</queue>"); // end of nonpreemptable queue
++
+     out.println("</allocations>");
+     out.close();
+ 
+-    startResourceManager(0f);
+-    // Create node with 4GB memory and 4 vcores
+-    registerNodeAndSubmitApp(4 * 1024, 4, 2, 1024);
++    assertTrue("Allocation file does not exist, not running the test",
++        ALLOC_FILE.exists());
++  }
+ 
+-    // Verify submitting another request triggers preemption
+-    createSchedulingRequest(1024, "queueB", "user1", 1, 1);
+-    scheduler.update();
+-    clock.tickSec(6);
++  private void writePreemptionParams(PrintWriter out) {
++    if (fairsharePreemption) {
++      out.println("<fairSharePreemptionThreshold>1" +
++          "</fairSharePreemptionThreshold>");
++      out.println("<fairSharePreemptionTimeout>0" +
++          "</fairSharePreemptionTimeout>");
++    } else {
++      out.println("<minSharePreemptionTimeout>0" +
++          "</minSharePreemptionTimeout>");
++    }
++  }
+ 
+-    ((StubbedFairScheduler) scheduler).resetLastPreemptResources();
+-    scheduler.preemptTasksIfNecessary();
+-    assertEquals("preemptResources() should have been called", 1024,
+-        ((StubbedFairScheduler) scheduler).lastPreemptMemory);
++  private void writeResourceParams(PrintWriter out) {
++    if (!fairsharePreemption) {
++      out.println("<minResources>4096mb,4vcores</minResources>");
++    }
++  }
+ 
+-    resourceManager.stop();
++  private void setupCluster() throws IOException {
++    resourceManager = new MockRM(conf);
++    resourceManager.start();
++    scheduler = (FairScheduler) resourceManager.getResourceScheduler();
+ 
+-    startResourceManager(0.8f);
+-    // Create node with 4GB memory and 4 vcores
+-    registerNodeAndSubmitApp(4 * 1024, 4, 3, 1024);
++    // Create and add two nodes to the cluster
++    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
++    addNode(NODE_CAPACITY_MULTIPLE * 1024, NODE_CAPACITY_MULTIPLE);
++  }
+ 
+-    // Verify submitting another request doesn't trigger preemption
+-    createSchedulingRequest(1024, "queueB", "user1", 1, 1);
+-    scheduler.update();
+-    clock.tickSec(6);
++  private void sendEnoughNodeUpdatesToAssignFully() {
++    for (RMNode node : rmNodes) {
++      NodeUpdateSchedulerEvent nodeUpdateSchedulerEvent =
++          new NodeUpdateSchedulerEvent(node);
++      for (int i = 0; i < NODE_CAPACITY_MULTIPLE; i++) {
++        scheduler.handle(nodeUpdateSchedulerEvent);
++      }
++    }
++  }
+ 
+-    ((StubbedFairScheduler) scheduler).resetLastPreemptResources();
+-    scheduler.preemptTasksIfNecessary();
+-    assertEquals("preemptResources() should not have been called", -1,
+-        ((StubbedFairScheduler) scheduler).lastPreemptMemory);
++  /**
++   * Submit application to {@code queue1} and take over the entire cluster.
++   * Submit application with larger containers to {@code queue2} that
++   * requires preemption from the first application.
++   *
++   * @param queue1 first queue
++   * @param queue2 second queue
++   * @throws InterruptedException if interrupted while waiting
++   */
++  private void submitApps(String queue1, String queue2)
++      throws InterruptedException {
++    // Create an app that takes up all the resources on the cluster
++    ApplicationAttemptId appAttemptId1
++        = createSchedulingRequest(1024, 1, queue1, "default",
++        NODE_CAPACITY_MULTIPLE * rmNodes.size());
++    greedyApp = scheduler.getSchedulerApp(appAttemptId1);
++    scheduler.update();
++    sendEnoughNodeUpdatesToAssignFully();
++    assertEquals(8, greedyApp.getLiveContainers().size());
+ 
+-    resourceManager.stop();
++    // Create an app that takes up all the resources on the cluster
++    ApplicationAttemptId appAttemptId2
++        = createSchedulingRequest(2048, 2, queue2, "default",
++        NODE_CAPACITY_MULTIPLE * rmNodes.size() / 2);
++    starvingApp = scheduler.getSchedulerApp(appAttemptId2);
+ 
+-    startResourceManager(0.7f);
+-    // Create node with 4GB memory and 4 vcores
+-    registerNodeAndSubmitApp(4 * 1024, 4, 3, 1024);
++    // Sleep long enough to pass
++    Thread.sleep(10);
+ 
+-    // Verify submitting another request triggers preemption
+-    createSchedulingRequest(1024, "queueB", "user1", 1, 1);
+     scheduler.update();
+-    clock.tickSec(6);
++  }
++
++  private void verifyPreemption() throws InterruptedException {
++    // Sleep long enough for four containers to be preempted. Note that the
++    // starved app must be queued four times for containers to be preempted.
++    for (int i = 0; i < 10000; i++) {
++      if (greedyApp.getLiveContainers().size() == 4) {
++        break;
++      }
++      Thread.sleep(10);
++    }
++
++    // Verify the right amount of containers are preempted from greedyApp
++    assertEquals(4, greedyApp.getLiveContainers().size());
+ 
+-    ((StubbedFairScheduler) scheduler).resetLastPreemptResources();
+-    scheduler.preemptTasksIfNecessary();
+-    assertEquals("preemptResources() should have been called", 1024,
+-        ((StubbedFairScheduler) scheduler).lastPreemptMemory);
++    sendEnoughNodeUpdatesToAssignFully();
++
++    // Verify the preempted containers are assigned to starvingApp
++    assertEquals(2, starvingApp.getLiveContainers().size());
++  }
++
++  private void verifyNoPreemption() throws InterruptedException {
++    // Sleep long enough to ensure not even one container is preempted.
++    for (int i = 0; i < 600; i++) {
++      if (greedyApp.getLiveContainers().size() != 8) {
++        break;
++      }
++      Thread.sleep(10);
++    }
++    assertEquals(8, greedyApp.getLiveContainers().size());
++  }
++
++  @Test
++  public void testPreemptionWithinSameLeafQueue() throws Exception {
++    setupCluster();
++    String queue = "root.preemptable.child-1";
++    submitApps(queue, queue);
++    if (fairsharePreemption) {
++      verifyPreemption();
++    } else {
++      verifyNoPreemption();
++    }
++  }
++
++  @Test
++  public void testPreemptionBetweenTwoSiblingLeafQueues() throws Exception {
++    setupCluster();
++    submitApps("root.preemptable.child-1", "root.preemptable.child-2");
++    verifyPreemption();
++  }
++
++  @Test
++  public void testPreemptionBetweenNonSiblingQueues() throws Exception {
++    setupCluster();
++    submitApps("root.preemptable.child-1", "root.nonpreemptable.child-1");
++    verifyPreemption();
++  }
++
++  @Test
++  public void testNoPreemptionFromDisallowedQueue() throws Exception {
++    setupCluster();
++    submitApps("root.nonpreemptable.child-1", "root.preemptable.child-1");
++    verifyNoPreemption();
+   }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestQueueManagerRealScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestQueueManagerRealScheduler.java
+new file mode 100644
+index 0000000..5736f75
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestQueueManagerRealScheduler.java
+@@ -0,0 +1,128 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.FileWriter;
++import java.io.IOException;
++import java.io.PrintWriter;
++
++import static org.junit.Assert.assertEquals;
++
++/**
++ * QueueManager tests that require a real scheduler
++ */
++public class TestQueueManagerRealScheduler extends FairSchedulerTestBase {
++  private final static File ALLOC_FILE = new File(TEST_DIR, "test-queue-mgr");
++
++  @Before
++  public void setup() throws IOException {
++    createConfiguration();
++    writeAllocFile(30, 40);
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE,
++        ALLOC_FILE.getAbsolutePath());
++
++    resourceManager = new MockRM(conf);
++    resourceManager.start();
++    scheduler = (FairScheduler) resourceManager.getResourceScheduler();
++  }
++
++  @After
++  public void teardown() {
++    ALLOC_FILE.deleteOnExit();
++    if (resourceManager != null) {
++      resourceManager.stop();
++      resourceManager = null;
++    }
++  }
++
++  private void writeAllocFile(int defaultFairShareTimeout,
++      int fairShareTimeout) throws IOException {
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
++    out.println("<queue name=\"default\">");
++    out.println("</queue>");
++    out.println("<queue name=\"queueA\">");
++    out.println("</queue>");
++    out.println("<queue name=\"queueB\">");
++    out.println("<queue name=\"queueB1\">");
++    out.println("<minSharePreemptionTimeout>5</minSharePreemptionTimeout>");
++    out.println("</queue>");
++    out.println("<queue name=\"queueB2\">");
++    out.println("</queue>");
++    out.println("</queue>");
++    out.println("<queue name=\"queueC\">");
++    out.println("</queue>");
++    out.println("<defaultMinSharePreemptionTimeout>15"
++        + "</defaultMinSharePreemptionTimeout>");
++    out.println("<defaultFairSharePreemptionTimeout>" +
++        + defaultFairShareTimeout + "</defaultFairSharePreemptionTimeout>");
++    out.println("<fairSharePreemptionTimeout>"
++        + fairShareTimeout + "</fairSharePreemptionTimeout>");
++    out.println("</allocations>");
++    out.close();
++  }
++
++  @Test
++  public void testBackwardsCompatiblePreemptionConfiguration()
++      throws IOException {
++    // Check the min/fair share preemption timeout for each queue
++    QueueManager queueMgr = scheduler.getQueueManager();
++    assertEquals(30000, queueMgr.getQueue("root")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("default")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("queueA")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("queueB")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("queueB.queueB1")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("queueB.queueB2")
++        .getFairSharePreemptionTimeout());
++    assertEquals(30000, queueMgr.getQueue("queueC")
++        .getFairSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("root")
++        .getMinSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("default")
++        .getMinSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("queueA")
++        .getMinSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("queueB")
++        .getMinSharePreemptionTimeout());
++    assertEquals(5000, queueMgr.getQueue("queueB.queueB1")
++        .getMinSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("queueB.queueB2")
++        .getMinSharePreemptionTimeout());
++    assertEquals(15000, queueMgr.getQueue("queueC")
++        .getMinSharePreemptionTimeout());
++
++    // Lower the fairshare preemption timeouts and verify it is picked
++    // correctly.
++    writeAllocFile(25, 30);
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++    assertEquals(25000, queueMgr.getQueue("root")
++        .getFairSharePreemptionTimeout());
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestSchedulingPolicy.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestSchedulingPolicy.java
+index dea2dd1..57c7301 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestSchedulingPolicy.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestSchedulingPolicy.java
+@@ -330,11 +330,6 @@ public Resource assignContainer(FSSchedulerNode node) {
+       }
+ 
+       @Override
+-      public RMContainer preemptContainer() {
+-        throw new UnsupportedOperationException();
+-      }
+-
+-      @Override
+       public Resource getFairShare() {
+         throw new UnsupportedOperationException();
+       }
+-- 
+1.7.9.5
+

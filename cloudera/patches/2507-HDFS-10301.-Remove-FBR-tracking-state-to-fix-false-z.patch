@@ -1,0 +1,617 @@
+From 6793a280e335cb008c2577f7079ed8fc9a9cb91c Mon Sep 17 00:00:00 2001
+From: Vinitha Reddy Gankidi <vigankidi@linkedin.com>
+Date: Fri, 14 Oct 2016 10:37:44 -0700
+Subject: [PATCH 2507/2848] HDFS-10301. Remove FBR tracking state to fix false
+ zombie storage detection for interleaving block
+ reports. Contributed by Vinitha Gankidi.
+
+(cherry picked from commit 391ce535a739dc92cb90017d759217265a4fd969)
+(cherry picked from commit 863e1020c072d2f38249f1bcb22cb3517997575a)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+
+Change-Id: I20a2bae25120a303210fc1278875fe24e04d3b69
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |   81 ++++++--------------
+ .../server/blockmanagement/DatanodeDescriptor.java |   52 +------------
+ .../blockmanagement/DatanodeStorageInfo.java       |   11 ---
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |    4 +-
+ .../server/blockmanagement/TestBlockManager.java   |   28 ++++---
+ .../TestNameNodePrunesMissingStorages.java         |   70 +++++++++++++++--
+ .../hdfs/server/datanode/BlockReportTestBase.java  |   50 ++++++++++++
+ 7 files changed, 154 insertions(+), 142 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index ecad940..0711032 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -49,6 +49,7 @@
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileEncryptionInfo;
+ import org.apache.hadoop.hdfs.AddBlockFlag;
+ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -61,7 +62,6 @@
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+-import org.apache.hadoop.fs.FileEncryptionInfo;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+@@ -106,6 +106,7 @@
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
++
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -1231,6 +1232,8 @@ void removeBlocksAssociatedTo(final DatanodeStorageInfo storageInfo) {
+       invalidateBlocks.remove(node, block);
+     }
+     namesystem.checkSafeMode();
++    LOG.info("Removed blocks associated with storage {} from DataNode {}",
++        storageInfo, node);
+   }
+ 
+   /**
+@@ -1999,8 +2002,8 @@ public String toString() {
+    */
+   public boolean processReport(final DatanodeID nodeID,
+       final DatanodeStorage storage,
+-      final BlockListAsLongs newReport, BlockReportContext context,
+-      boolean lastStorageInRpc) throws IOException {
++      final BlockListAsLongs newReport,
++      BlockReportContext context) throws IOException {
+     namesystem.writeLock();
+     final long startTime = Time.monotonicNow(); //after acquiring write lock
+     final long endTime;
+@@ -2054,32 +2057,6 @@ public boolean processReport(final DatanodeID nodeID,
+       }
+       
+       storageInfo.receivedBlockReport();
+-      if (context != null) {
+-        storageInfo.setLastBlockReportId(context.getReportId());
+-        if (lastStorageInRpc) {
+-          int rpcsSeen = node.updateBlockReportContext(context);
+-          if (rpcsSeen >= context.getTotalRpcs()) {
+-            long leaseId = blockReportLeaseManager.removeLease(node);
+-            BlockManagerFaultInjector.getInstance().
+-                removeBlockReportLease(node, leaseId);
+-            List<DatanodeStorageInfo> zombies = node.removeZombieStorages();
+-            if (zombies.isEmpty()) {
+-              LOG.debug("processReport 0x{}: no zombie storages found.",
+-                  Long.toHexString(context.getReportId()));
+-            } else {
+-              for (DatanodeStorageInfo zombie : zombies) {
+-                removeZombieReplicas(context, zombie);
+-              }
+-            }
+-            node.clearBlockReportContext();
+-          } else {
+-            LOG.debug("processReport 0x{}: {} more RPCs remaining in this " +
+-                    "report.", Long.toHexString(context.getReportId()),
+-                (context.getTotalRpcs() - rpcsSeen)
+-            );
+-          }
+-        }
+-      }
+     } finally {
+       endTime = Time.monotonicNow();
+       namesystem.writeUnlock();
+@@ -2104,33 +2081,25 @@ public boolean processReport(final DatanodeID nodeID,
+     return !node.hasStaleStorages();
+   }
+ 
+-  private void removeZombieReplicas(BlockReportContext context,
+-      DatanodeStorageInfo zombie) {
+-    LOG.warn("processReport 0x{}: removing zombie storage {}, which no " +
+-             "longer exists on the DataNode.",
+-              Long.toHexString(context.getReportId()), zombie.getStorageID());
+-    assert(namesystem.hasWriteLock());
+-    Iterator<BlockInfo> iter = zombie.getBlockIterator();
+-    int prevBlocks = zombie.numBlocks();
+-    while (iter.hasNext()) {
+-      BlockInfo block = iter.next();
+-      // We assume that a block can be on only one storage in a DataNode.
+-      // That's why we pass in the DatanodeDescriptor rather than the
+-      // DatanodeStorageInfo.
+-      // TODO: remove this assumption in case we want to put a block on
+-      // more than one storage on a datanode (and because it's a difficult
+-      // assumption to really enforce)
+-      // DatanodeStorageInfo must be removed using the iterator to avoid
+-      // ConcurrentModificationException in the underlying storage
+-      iter.remove();
+-      removeStoredBlock(block, zombie.getDatanodeDescriptor());
+-      invalidateBlocks.remove(zombie.getDatanodeDescriptor(), block);
+-    }
+-    assert(zombie.numBlocks() == 0);
+-    LOG.warn("processReport 0x{}: removed {} replicas from storage {}, " +
+-            "which no longer exists on the DataNode.",
+-            Long.toHexString(context.getReportId()), prevBlocks,
+-            zombie.getStorageID());
++  public void removeBRLeaseIfNeeded(final DatanodeID nodeID,
++      final BlockReportContext context) throws IOException {
++    namesystem.writeLock();
++    DatanodeDescriptor node;
++    try {
++      node = datanodeManager.getDatanode(nodeID);
++      if (context != null) {
++        if (context.getTotalRpcs() == context.getCurRpc() + 1) {
++          long leaseId = this.getBlockReportLeaseManager().removeLease(node);
++          BlockManagerFaultInjector.getInstance().
++              removeBlockReportLease(node, leaseId);
++        }
++        LOG.debug("Processing RPC with index {} out of total {} RPCs in "
++                + "processReport 0x{}", context.getCurRpc(),
++            context.getTotalRpcs(), Long.toHexString(context.getReportId()));
++      }
++    } finally {
++      namesystem.writeUnlock();
++    }
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+index 877a1d8..44633c2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+@@ -18,7 +18,6 @@
+ package org.apache.hadoop.hdfs.server.blockmanagement;
+ 
+ import java.util.ArrayList;
+-import java.util.BitSet;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -31,7 +30,6 @@
+ import java.util.Set;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.collect.ImmutableList;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+@@ -42,7 +40,6 @@
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.namenode.CachedBlock;
+-import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage.State;
+ import org.apache.hadoop.hdfs.server.protocol.StorageReport;
+@@ -54,8 +51,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import com.google.common.annotations.VisibleForTesting;
+-
+ /**
+  * This class extends the DatanodeInfo class with ephemeral information (eg
+  * health, capacity, what blocks are associated with the Datanode) that is
+@@ -69,8 +64,6 @@
+   public static final DatanodeDescriptor[] EMPTY_ARRAY = {};
+ 
+   private static final int BLOCKS_SCHEDULED_ROLL_INTERVAL = 600*1000; //10min
+-  private static final List<DatanodeStorageInfo> EMPTY_STORAGE_INFO_LIST =
+-      ImmutableList.of();
+ 
+   /** Block and targets pair */
+   @InterfaceAudience.Private
+@@ -155,10 +148,6 @@ public Type getType() {
+   private final LeavingServiceStatus leavingServiceStatus =
+       new LeavingServiceStatus();
+ 
+-  private long curBlockReportId = 0;
+-
+-  private BitSet curBlockReportRpcsSeen = null;
+-
+   private final Map<String, DatanodeStorageInfo> storageMap =
+       new HashMap<>();
+ 
+@@ -255,20 +244,6 @@ public DatanodeDescriptor(DatanodeID nodeID,
+     updateHeartbeatState(StorageReport.EMPTY_ARRAY, 0L, 0L, 0, 0, null);
+   }
+ 
+-  public int updateBlockReportContext(BlockReportContext context) {
+-    if (curBlockReportId != context.getReportId()) {
+-      curBlockReportId = context.getReportId();
+-      curBlockReportRpcsSeen = new BitSet(context.getTotalRpcs());
+-    }
+-    curBlockReportRpcsSeen.set(context.getCurRpc());
+-    return curBlockReportRpcsSeen.cardinality();
+-  }
+-
+-  public void clearBlockReportContext() {
+-    curBlockReportId = 0;
+-    curBlockReportRpcsSeen = null;
+-  }
+-
+   public CachedBlocksList getPendingCached() {
+     return pendingCached;
+   }
+@@ -334,32 +309,7 @@ boolean hasStaleStorages() {
+     }
+   }
+ 
+-  List<DatanodeStorageInfo> removeZombieStorages() {
+-    List<DatanodeStorageInfo> zombies = null;
+-    synchronized (storageMap) {
+-      Iterator<Map.Entry<String, DatanodeStorageInfo>> iter =
+-          storageMap.entrySet().iterator();
+-      while (iter.hasNext()) {
+-        Map.Entry<String, DatanodeStorageInfo> entry = iter.next();
+-        DatanodeStorageInfo storageInfo = entry.getValue();
+-        if (storageInfo.getLastBlockReportId() != curBlockReportId) {
+-          LOG.info("{} had lastBlockReportId 0x{} but curBlockReportId = 0x{}",
+-              storageInfo.getStorageID(),
+-              Long.toHexString(storageInfo.getLastBlockReportId()),
+-              Long.toHexString(curBlockReportId));
+-          iter.remove();
+-          if (zombies == null) {
+-            zombies = new LinkedList<DatanodeStorageInfo>();
+-          }
+-          zombies.add(storageInfo);
+-        }
+-        storageInfo.setLastBlockReportId(0);
+-      }
+-    }
+-    return zombies == null ? EMPTY_STORAGE_INFO_LIST : zombies;
+-  }
+-
+- public void resetBlocks() {
++  public void resetBlocks() {
+     setCapacity(0);
+     setRemaining(0);
+     setBlockPoolUsed(0);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
+index 6f51003..5b2c3f9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeStorageInfo.java
+@@ -91,9 +91,6 @@ public void updateFromStorage(DatanodeStorage storage) {
+ 
+   private final FoldedTreeSet<BlockInfo> blocks = new FoldedTreeSet<>();
+ 
+-  // The ID of the last full block report which updated this storage.
+-  private long lastBlockReportId = 0;
+-
+   /** The number of block reports received */
+   private int blockReportCount = 0;
+ 
+@@ -158,14 +155,6 @@ public void setUtilizationForTesting(long capacity, long dfsUsed,
+     this.blockPoolUsed = blockPoolUsed;
+   }
+ 
+-  long getLastBlockReportId() {
+-    return lastBlockReportId;
+-  }
+-
+-  void setLastBlockReportId(long lastBlockReportId) {
+-    this.lastBlockReportId = lastBlockReportId;
+-  }
+-
+   State getState() {
+     return this.state;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index 0202e21..4149bd1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -1200,11 +1200,13 @@ public DatanodeCommand blockReport(final DatanodeRegistration nodeReg,
+         @Override
+         public Boolean call() throws IOException {
+           return bm.processReport(nodeReg, reports[index].getStorage(),
+-              blocks, context, (index == reports.length - 1));
++              blocks, context);
+         }
+       });
+       metrics.incrStorageBlockReportOps();
+     }
++    bm.removeBRLeaseIfNeeded(nodeReg, context);
++
+     BlockManagerFaultInjector.getInstance().
+         incomingBlockReportRpc(nodeReg, context);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+index 106a140..5715371 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+@@ -687,12 +687,12 @@ public void testSafeModeIBR() throws Exception {
+     reset(node);
+     
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-        BlockListAsLongs.EMPTY, null, false);
++        BlockListAsLongs.EMPTY, null);
+     assertEquals(1, ds.getBlockReportCount());
+     // send block report again, should NOT be processed
+     reset(node);
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-        BlockListAsLongs.EMPTY, null, false);
++        BlockListAsLongs.EMPTY, null);
+     assertEquals(1, ds.getBlockReportCount());
+ 
+     // re-register as if node restarted, should update existing node
+@@ -703,7 +703,7 @@ public void testSafeModeIBR() throws Exception {
+     // send block report, should be processed after restart
+     reset(node);
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-                     BlockListAsLongs.EMPTY, null, false);
++                     BlockListAsLongs.EMPTY, null);
+     // Reinitialize as registration with empty storage list pruned
+     // node.storageMap.
+     ds = node.getStorageInfos()[0];
+@@ -732,7 +732,7 @@ public void testSafeModeIBRAfterIncremental() throws Exception {
+     reset(node);
+     doReturn(1).when(node).numBlocks();
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-        BlockListAsLongs.EMPTY, null, false);
++        BlockListAsLongs.EMPTY, null);
+     assertEquals(1, ds.getBlockReportCount());
+   }
+ 
+@@ -806,8 +806,8 @@ public void testSafeModeIBRBeforeFirstFullBR() throws Exception {
+     assertEquals(0, ds.getBlockReportCount());
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+         builder.build(),
+-        new BlockReportContext(1, 0, System.nanoTime(), 0, true), false);
+-        assertEquals(1, ds.getBlockReportCount());
++        new BlockReportContext(1, 0, System.nanoTime(), 0, true));
++    assertEquals(1, ds.getBlockReportCount());
+ 
+     // verify the storage info is correct
+     assertTrue(bm.getStoredBlock(new Block(receivedBlockId)).findStorageInfo
+@@ -844,9 +844,9 @@ public void testFullBR() throws Exception {
+     // Make sure it's the first full report
+     assertEquals(0, ds.getBlockReportCount());
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-                     generateReport(blocks),
+-                     new BlockReportContext(1, 0, System.nanoTime(), 0, false),
+-                     false);
++        generateReport(blocks),
++        new BlockReportContext(1, 0, System.nanoTime(), 0, false)
++        );
+     assertEquals(1, ds.getBlockReportCount());
+     // verify the storage info is correct
+     for (BlockInfo block : blocks) {
+@@ -855,9 +855,8 @@ public void testFullBR() throws Exception {
+ 
+     // Send unsorted report
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-                     generateReport(blocks),
+-                     new BlockReportContext(1, 0, System.nanoTime(), 0, false),
+-                     false);
++        generateReport(blocks),
++        new BlockReportContext(1, 0, System.nanoTime(), 0, false));
+     assertEquals(2, ds.getBlockReportCount());
+     // verify the storage info is correct
+     for (BlockInfo block : blocks) {
+@@ -867,9 +866,8 @@ public void testFullBR() throws Exception {
+     // Sort list and send a sorted report
+     Collections.sort(blocks);
+     bm.processReport(node, new DatanodeStorage(ds.getStorageID()),
+-                     generateReport(blocks),
+-                     new BlockReportContext(1, 0, System.nanoTime(), 0, true),
+-                     false);
++        generateReport(blocks),
++        new BlockReportContext(1, 0, System.nanoTime(), 0, true));
+     assertEquals(3, ds.getBlockReportCount());
+     // verify the storage info is correct
+     for (BlockInfo block : blocks) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNameNodePrunesMissingStorages.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNameNodePrunesMissingStorages.java
+index 02bcfa1..fe97cbc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNameNodePrunesMissingStorages.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestNameNodePrunesMissingStorages.java
+@@ -19,23 +19,22 @@
+ package org.apache.hadoop.hdfs.server.blockmanagement;
+ 
+ import com.google.common.base.Supplier;
++import java.util.ArrayList;
++import java.util.Collection;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
+-import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+-import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
+ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi.FsVolumeReferences;
+ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+@@ -46,7 +45,6 @@
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+-import java.io.BufferedOutputStream;
+ import java.io.BufferedReader;
+ import java.io.BufferedWriter;
+ import java.io.File;
+@@ -55,13 +53,11 @@
+ import java.io.IOException;
+ import java.io.OutputStreamWriter;
+ import java.io.Writer;
+-import java.util.Arrays;
+-import java.util.EnumSet;
+ import java.util.Iterator;
+-import java.util.List;
+ import java.util.UUID;
+ 
+ import static org.hamcrest.core.Is.is;
++import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertNotNull;
+@@ -158,6 +154,8 @@ public void testStorageWithBlocksIsNotPruned() throws IOException {
+   public void testRemovingStorageDoesNotProduceZombies() throws Exception {
+     Configuration conf = new HdfsConfiguration();
+     conf.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY, 1);
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,
++        1000);
+     final int NUM_STORAGES_PER_DN = 2;
+     final MiniDFSCluster cluster = new MiniDFSCluster
+         .Builder(conf).numDataNodes(3)
+@@ -256,7 +254,7 @@ public Boolean get() {
+           assertEquals(NUM_STORAGES_PER_DN - 1, infos.length);
+           return true;
+         }
+-      }, 10, 30000);
++      }, 1000, 30000);
+     } finally {
+       if (cluster != null) {
+         cluster.shutdown();
+@@ -361,4 +359,60 @@ public Boolean get() {
+       cluster.shutdown();
+     }
+   }
++
++  @Test(timeout=300000)
++  public void testNameNodePrunesUnreportedStorages() throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    // Create a cluster with one datanode with two storages
++    MiniDFSCluster cluster = new MiniDFSCluster
++        .Builder(conf).numDataNodes(1)
++        .storagesPerDatanode(2)
++        .build();
++    // Create two files to ensure each storage has a block
++    DFSTestUtil.createFile(cluster.getFileSystem(), new Path("file1"),
++        102400, 102400, 102400, (short)1,
++        0x1BAD5EE);
++    DFSTestUtil.createFile(cluster.getFileSystem(), new Path("file2"),
++        102400, 102400, 102400, (short)1,
++        0x1BAD5EED);
++    // Get the datanode storages and data directories
++    DataNode dn = cluster.getDataNodes().get(0);
++    BlockManager bm = cluster.getNameNode().getNamesystem().getBlockManager();
++    DatanodeDescriptor dnDescriptor = bm.getDatanodeManager().
++        getDatanode(cluster.getDataNodes().get(0).getDatanodeUuid());
++    DatanodeStorageInfo[] dnStoragesInfosBeforeRestart =
++        dnDescriptor.getStorageInfos();
++    Collection<String> oldDirs =  new ArrayList<String>(dn.getConf().
++        getTrimmedStringCollection(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY));
++    // Keep the first data directory and remove the second.
++    String newDirs = oldDirs.iterator().next();
++    conf.set(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY, newDirs);
++    // Restart the datanode with the new conf
++    cluster.stopDataNode(0);
++    cluster.startDataNodes(conf, 1, false, null, null);
++    dn = cluster.getDataNodes().get(0);
++    cluster.waitActive();
++    // Assert that the dnDescriptor has both the storages after restart
++    assertArrayEquals(dnStoragesInfosBeforeRestart,
++        dnDescriptor.getStorageInfos());
++    // Assert that the removed storage is marked as FAILED
++    // when DN heartbeats to the NN
++    int numFailedStoragesWithBlocks = 0;
++    DatanodeStorageInfo failedStorageInfo = null;
++    for (DatanodeStorageInfo dnStorageInfo: dnDescriptor.getStorageInfos()) {
++      if (dnStorageInfo.areBlocksOnFailedStorage()) {
++        numFailedStoragesWithBlocks++;
++        failedStorageInfo = dnStorageInfo;
++      }
++    }
++    assertEquals(1, numFailedStoragesWithBlocks);
++    // Heartbeat manager removes the blocks associated with this failed storage
++    bm.getDatanodeManager().getHeartbeatManager().heartbeatCheck();
++    assertTrue(!failedStorageInfo.areBlocksOnFailedStorage());
++    // pruneStorageMap removes the unreported storage
++    cluster.triggerHeartbeats();
++    // Assert that the unreported storage is pruned
++    assertEquals(DataNode.getStorageLocations(dn.getConf()).size(),
++        dnDescriptor.getStorageInfos().length);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/BlockReportTestBase.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/BlockReportTestBase.java
+index 21af963..3cfde77 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/BlockReportTestBase.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/BlockReportTestBase.java
+@@ -29,7 +29,12 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
+@@ -51,7 +56,10 @@
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStorageInfo;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
+@@ -648,6 +656,48 @@ protected Object passThrough(InvocationOnMock invocation)
+     DFSTestUtil.readFile(fs, filePath);
+   }
+ 
++  // See HDFS-10301
++  @Test(timeout = 300000)
++  public void testInterleavedBlockReports()
++      throws IOException, ExecutionException, InterruptedException {
++    int numConcurrentBlockReports = 3;
++    DataNode dn = cluster.getDataNodes().get(DN_N0);
++    final String poolId = cluster.getNamesystem().getBlockPoolId();
++    LOG.info("Block pool id: " + poolId);
++    final DatanodeRegistration dnR = dn.getDNRegistrationForBP(poolId);
++    final StorageBlockReport[] reports =
++        getBlockReports(dn, poolId, true, true);
++
++    // Get the list of storage ids associated with the datanode
++    // before the test
++    BlockManager bm = cluster.getNameNode().getNamesystem().getBlockManager();
++    final DatanodeDescriptor dnDescriptor =
++        bm.getDatanodeManager().getDatanode(dn.getDatanodeId());
++    DatanodeStorageInfo[] storageInfos = dnDescriptor.getStorageInfos();
++
++    // Send the block report concurrently using
++    // numThreads=numConcurrentBlockReports
++    ExecutorService executorService =
++        Executors.newFixedThreadPool(numConcurrentBlockReports);
++    List<Future<Void>> futureList = new ArrayList<>(numConcurrentBlockReports);
++    for (int i = 0; i < numConcurrentBlockReports; i++) {
++      futureList.add(executorService.submit(new Callable<Void>() {
++        @Override
++        public Void call() throws IOException {
++          sendBlockReports(dnR, poolId, reports);
++          return null;
++        }
++      }));
++    }
++    for (Future<Void> future : futureList) {
++      future.get();
++    }
++    executorService.shutdown();
++
++    // Verify that the storages match before and after the test
++    Assert.assertArrayEquals(storageInfos, dnDescriptor.getStorageInfos());
++  }
++
+   private void waitForTempReplica(Block bl, int DN_N1) throws IOException {
+     final boolean tooLongWait = false;
+     final int TIMEOUT = 40000;
+-- 
+1.7.9.5
+

@@ -1,0 +1,159 @@
+From 0670ee4fed8bd5fa54e2976ba7cd1ab2d8541d53 Mon Sep 17 00:00:00 2001
+From: Konstantin V Shvachko <shv@apache.org>
+Date: Fri, 30 Mar 2018 16:29:31 -0700
+Subject: [PATCH 2819/2848] HDFS-12299. Race Between update pipeline and DN
+ Re-Registration. Contributed by Brahma Reddy
+ Battula.
+
+(cherry picked from commit 5a83ffa396089972e23c533eca33c9cba231c45a)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+
+Change-Id: I32e6b64dce26666f510da474fb72732c275c4e1c
+---
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   15 ++++++
+ .../BlockInfoUnderConstruction.java                |    5 +-
+ .../TestClientProtocolForPipelineRecovery.java     |   50 ++++++++++++++++++++
+ .../server/namenode/ha/TestRetryCacheWithHA.java   |    9 +++-
+ 4 files changed, 76 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index a896b66..0a5997c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -1628,6 +1628,21 @@ private boolean setupPipelineForAppendOrRecovery() throws IOException {
+       return false; // do not sleep, continue processing
+     }
+ 
++    void updateBlockGS(final long newGS) {
++      block.setGenerationStamp(newGS);
++    }
++
++    /** update pipeline at the namenode */
++    @VisibleForTesting
++    public void updatePipeline(long newGS) throws IOException {
++      final ExtendedBlock oldBlock = block.getCurrentBlock();
++      // the new GS has been propagated to all DN, it should be ok to update the
++      // local block state
++      updateBlockGS(newGS);
++      dfsClient.namenode.updatePipeline(dfsClient.clientName, oldBlock,
++          block.getCurrentBlock(), nodes, storageIDs);
++    }
++
+     DatanodeInfo[] getExcludedNodes() {
+       return excludedNodes.getAllPresent(excludedNodes.asMap().keySet())
+           .keySet().toArray(new DatanodeInfo[0]);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+index 8267597..5b23d09 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+@@ -190,8 +190,9 @@ public void setExpectedLocations(DatanodeStorageInfo[] targets) {
+     int numLocations = targets == null ? 0 : targets.length;
+     this.replicas = new ArrayList<ReplicaUnderConstruction>(numLocations);
+     for(int i = 0; i < numLocations; i++)
+-      replicas.add(
+-        new ReplicaUnderConstruction(this, targets[i], ReplicaState.RBW));
++      if (targets[i] != null) {
++        replicas.add(new ReplicaUnderConstruction(this, targets[i], ReplicaState.RBW));
++      }
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
+index a484f24..687391e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestClientProtocolForPipelineRecovery.java
+@@ -34,6 +34,9 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DataNodeFaultInjector;
+ import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+@@ -565,4 +568,51 @@ public void failPipeline(ReplicaInPipelineInterface replicaInfo,
+       cluster.shutdown();
+     }
+   }
++
++  @Test
++  public void testUpdatePipeLineAfterDNReg()throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
++      cluster.waitActive();
++      FileSystem fileSys = cluster.getFileSystem();
++
++      Path file = new Path("/testUpdatePipeLineAfterDNReg");
++      FSDataOutputStream out = fileSys.create(file);
++      out.write(1);
++      out.hflush();
++      //Get the First DN and disable the heartbeats and then put in Deadstate
++      DFSOutputStream dfsOut = (DFSOutputStream) out.getWrappedStream();
++      DatanodeInfo[] pipeline = dfsOut.getPipeline();
++      DataNode dn1 = cluster.getDataNode(pipeline[0].getIpcPort());
++      dn1.setHeartbeatsDisabledForTests(true);
++      DatanodeDescriptor dn1Desc = cluster.getNamesystem(0).getBlockManager()
++          .getDatanodeManager().getDatanode(dn1.getDatanodeId());
++      cluster.setDataNodeDead(dn1Desc);
++      //Re-register the DeadNode
++      DatanodeProtocolClientSideTranslatorPB dnp =
++          new DatanodeProtocolClientSideTranslatorPB(
++          cluster.getNameNode().getNameNodeAddress(), conf);
++      dnp.registerDatanode(
++          dn1.getDNRegistrationForBP(cluster.getNamesystem().getBlockPoolId()));
++      DFSOutputStream dfsO = (DFSOutputStream) out.getWrappedStream();
++      String clientName = ((DistributedFileSystem) fileSys).getClient()
++          .getClientName();
++      NamenodeProtocols namenode = cluster.getNameNodeRpc();
++      //Update the genstamp and call updatepipeline
++      LocatedBlock newBlock = namenode
++          .updateBlockForPipeline(dfsO.getBlock(), clientName);
++      dfsO.getStreamer()
++          .updatePipeline(newBlock.getBlock().getGenerationStamp());
++      newBlock = namenode.updateBlockForPipeline(dfsO.getBlock(), clientName);
++      //Should not throw any error Pipeline should be success
++      dfsO.getStreamer()
++          .updatePipeline(newBlock.getBlock().getGenerationStamp());
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+index a1b0e10..a62a517 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+@@ -72,6 +72,7 @@
+ import org.apache.hadoop.hdfs.protocol.CacheDirectiveEntry;
+ import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoUnderConstruction;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.server.namenode.INodeFile;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotTestHelper;
+@@ -733,7 +734,13 @@ void invoke() throws Exception {
+       DatanodeInfo[] newNodes = new DatanodeInfo[2];
+       newNodes[0] = nodes[0];
+       newNodes[1] = nodes[1];
+-      String[] storageIDs = {"s0", "s1"};
++      final DatanodeManager dm = cluster.getNamesystem(0).getBlockManager()
++          .getDatanodeManager();
++      final String storageID1 = dm.getDatanode(newNodes[0]).getStorageInfos()[0]
++          .getStorageID();
++      final String storageID2 = dm.getDatanode(newNodes[1]).getStorageInfos()[0]
++          .getStorageID();
++      String[] storageIDs = {storageID1, storageID2};
+       
+       client.getNamenode().updatePipeline(client.getClientName(), oldBlock,
+           newBlock, newNodes, storageIDs);
+-- 
+1.7.9.5
+

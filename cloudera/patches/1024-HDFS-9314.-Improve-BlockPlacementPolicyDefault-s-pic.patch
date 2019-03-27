@@ -1,0 +1,302 @@
+From 80794608a50fb10ea3d6f8de489a29a8cf8e31ad Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Fri, 4 Dec 2015 09:49:43 -0800
+Subject: [PATCH 1024/2848] HDFS-9314. Improve BlockPlacementPolicyDefault's
+ picking of excess replicas. Contributed by Xiao
+ Chen.
+
+(cherry picked from commit 4c631e8c732c6456b91a9b9d865a0e0e85417137)
+
+Change-Id: Ia498717b1015a6fc07056009b57a7535613b3f96
+---
+ .../BlockPlacementPolicyDefault.java               |   44 +++++++----
+ .../BlockPlacementPolicyWithNodeGroup.java         |    3 +-
+ .../blockmanagement/TestReplicationPolicy.java     |   82 ++++++++++++++++----
+ .../TestReplicationPolicyWithNodeGroup.java        |    6 +-
+ .../hdfs/server/namenode/ha/TestDNFencing.java     |   14 ++--
+ 5 files changed, 110 insertions(+), 39 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index 136d03e..4858bb5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -879,8 +879,7 @@ public BlockPlacementStatus verifyBlockPlacement(DatanodeInfo[] locs,
+   /**
+    * Decide whether deleting the specified replica of the block still makes
+    * the block conform to the configured block placement policy.
+-   * @param replicationFactor The required number of replicas for this block
+-   * @param moreThanone The replica locations of this block that are present
++   * @param moreThanOne The replica locations of this block that are present
+    *                    on more than one unique racks.
+    * @param exactlyOne Replica locations of this block that  are present
+    *                    on exactly one unique racks.
+@@ -890,9 +889,11 @@ public BlockPlacementStatus verifyBlockPlacement(DatanodeInfo[] locs,
+    * @return the replica that is the best candidate for deletion
+    */
+   @VisibleForTesting
+-  public DatanodeStorageInfo chooseReplicaToDelete(short replicationFactor,
+-      Collection<DatanodeStorageInfo> moreThanone, Collection<DatanodeStorageInfo> exactlyOne,
+-      final List<StorageType> excessTypes) {
++  public DatanodeStorageInfo chooseReplicaToDelete(
++      Collection<DatanodeStorageInfo> moreThanOne,
++      Collection<DatanodeStorageInfo> exactlyOne,
++      final List<StorageType> excessTypes,
++      Map<String, List<DatanodeStorageInfo>> rackMap) {
+     long oldestHeartbeat =
+       now() - heartbeatInterval * tolerateHeartbeatMultiplier;
+     DatanodeStorageInfo oldestHeartbeatStorage = null;
+@@ -901,7 +902,8 @@ public DatanodeStorageInfo chooseReplicaToDelete(short replicationFactor,
+ 
+     // Pick the node with the oldest heartbeat or with the least free space,
+     // if all hearbeats are within the tolerable heartbeat interval
+-    for(DatanodeStorageInfo storage : pickupReplicaSet(moreThanone, exactlyOne)) {
++    for(DatanodeStorageInfo storage : pickupReplicaSet(moreThanOne,
++        exactlyOne, rackMap)) {
+       if (!excessTypes.contains(storage.getStorageType())) {
+         continue;
+       }
+@@ -966,9 +968,8 @@ public DatanodeStorageInfo chooseReplicaToDelete(short replicationFactor,
+           moreThanOne, excessTypes)) {
+         cur = delNodeHintStorage;
+       } else { // regular excessive replica removal
+-        cur =
+-            chooseReplicaToDelete((short) expectedNumOfReplicas, moreThanOne, exactlyOne,
+-                excessTypes);
++        cur = chooseReplicaToDelete(moreThanOne, exactlyOne, excessTypes,
++            rackMap);
+       }
+       firstOne = false;
+       if (cur == null) {
+@@ -1010,12 +1011,29 @@ static boolean useDelHint(boolean isFirst, DatanodeStorageInfo delHint,
+    * Pick up replica node set for deleting replica as over-replicated. 
+    * First set contains replica nodes on rack with more than one
+    * replica while second set contains remaining replica nodes.
+-   * So pick up first set if not empty. If first is empty, then pick second.
++   * If only 1 rack, pick all. If 2 racks, pick all that have more than
++   * 1 replicas on the same rack; if no such replicas, pick all.
++   * If 3 or more racks, pick all.
+    */
+   protected Collection<DatanodeStorageInfo> pickupReplicaSet(
+-      Collection<DatanodeStorageInfo> first,
+-      Collection<DatanodeStorageInfo> second) {
+-    return first.isEmpty() ? second : first;
++      Collection<DatanodeStorageInfo> moreThanOne,
++      Collection<DatanodeStorageInfo> exactlyOne,
++      Map<String, List<DatanodeStorageInfo>> rackMap) {
++    Collection<DatanodeStorageInfo> ret = new ArrayList<>();
++    if (rackMap.size() == 2) {
++      for (List<DatanodeStorageInfo> dsi : rackMap.values()) {
++        if (dsi.size() >= 2) {
++          ret.addAll(dsi);
++        }
++      }
++    }
++    if (ret.isEmpty()) {
++      // Return all replicas if rackMap.size() != 2
++      // or rackMap.size() == 2 but no shared replicas on any rack
++      ret.addAll(moreThanOne);
++      ret.addAll(exactlyOne);
++    }
++    return ret;
+   }
+   
+   @VisibleForTesting
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+index 8626053..c3150f5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+@@ -304,7 +304,8 @@ private int addDependentNodesToExcludedNodes(DatanodeDescriptor chosenNode,
+   @Override
+   public Collection<DatanodeStorageInfo> pickupReplicaSet(
+       Collection<DatanodeStorageInfo> first,
+-      Collection<DatanodeStorageInfo> second) {
++      Collection<DatanodeStorageInfo> second,
++      Map<String, List<DatanodeStorageInfo>> rackMap) {
+     // If no replica within same rack, return directly.
+     if (first.isEmpty()) {
+       return second;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 9d51215..d906ca2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -1029,22 +1029,22 @@ public void testChooseReplicaToDelete() throws Exception {
+       // test returning null
+       excessTypes.add(StorageType.SSD);
+       assertNull(((BlockPlacementPolicyDefault) replicator)
+-          .chooseReplicaToDelete((short) 3, first, second, excessTypes));
++          .chooseReplicaToDelete(first, second, excessTypes, rackMap));
+     }
+     excessTypes.add(StorageType.DEFAULT);
+     DatanodeStorageInfo chosen = ((BlockPlacementPolicyDefault) replicator)
+-        .chooseReplicaToDelete((short) 3, first, second, excessTypes);
+-    // Within first set, storages[1] with less free space
+-    assertEquals(chosen, storages[1]);
++        .chooseReplicaToDelete(first, second, excessTypes, rackMap);
++    // Within all storages, storages[5] with least free space
++    assertEquals(chosen, storages[5]);
+ 
+     replicator.adjustSetsWithChosenReplica(rackMap, first, second, chosen);
+-    assertEquals(0, first.size());
+-    assertEquals(3, second.size());
+-    // Within second set, storages[5] with less free space
++    assertEquals(2, first.size());
++    assertEquals(1, second.size());
++    // Within first set, storages[1] with less free space
+     excessTypes.add(StorageType.DEFAULT);
+     chosen = ((BlockPlacementPolicyDefault) replicator).chooseReplicaToDelete(
+-        (short)2, first, second, excessTypes);
+-    assertEquals(chosen, storages[5]);
++        first, second, excessTypes, rackMap);
++    assertEquals(chosen, storages[1]);
+   }
+ 
+   @Test
+@@ -1089,17 +1089,15 @@ public void testChooseReplicasToDelete() throws Exception {
+         excessTypes, storages[3].getDatanodeDescriptor(), null);
+     assertTrue(excessReplicas.contains(excessStorage));
+ 
+-
+     // The block was initially created on excessSSD(rack r1),
+     // storages[4](rack r3) and storages[5](rack r3) with
+-    // ONESSD_STORAGE_POLICY_NAME storage policy.
++    // ONESSD_STORAGE_POLICY_NAME storage policy. Replication factor = 3.
+     // Right after balancer moves the block from storages[5] to
+     // storages[3](rack r2), the application changes the storage policy from
+     // ONESSD_STORAGE_POLICY_NAME to HOT_STORAGE_POLICY_ID. In this case,
+-    // no replica can be chosen as the excessive replica as
+-    // chooseReplicasToDelete only considers storages[4] and storages[5] that
+-    // are the same rack. But neither's storage type is SSD.
+-    // TODO BlockPlacementPolicyDefault should be able to delete excessSSD.
++    // we should be able to delete excessSSD since the remaining
++    // storages ({storages[3]}, {storages[4], storages[5]})
++    // are on different racks (r2, r3).
+     nonExcess.clear();
+     nonExcess.add(excessSSD);
+     nonExcess.add(storages[3]);
+@@ -1110,7 +1108,59 @@ public void testChooseReplicasToDelete() throws Exception {
+     excessReplicas = replicator.chooseReplicasToDelete(nonExcess, 3,
+         excessTypes, storages[3].getDatanodeDescriptor(),
+         storages[5].getDatanodeDescriptor());
+-    assertTrue(excessReplicas.size() == 0);
++    assertEquals(1, excessReplicas.size());
++    assertTrue(excessReplicas.contains(excessSSD));
++
++    // Similar to above, but after policy change and before deletion,
++    // the replicas are located on excessSSD(rack r1), storages[1](rack r1),
++    // storages[2](rack r2) and storages[3](rack r2). Replication factor = 3.
++    // In this case, we should be able to delete excessSSD since the remaining
++    // storages ({storages[1]} , {storages[2], storages[3]})
++    // are on different racks (r1, r2).
++    nonExcess.clear();
++    nonExcess.add(excessSSD);
++    nonExcess.add(storages[1]);
++    nonExcess.add(storages[2]);
++    nonExcess.add(storages[3]);
++    excessTypes = storagePolicy.chooseExcess((short) 3,
++        DatanodeStorageInfo.toStorageTypes(nonExcess));
++    excessReplicas = replicator.chooseReplicasToDelete(nonExcess, 3,
++        excessTypes, storages[1].getDatanodeDescriptor(),
++        storages[3].getDatanodeDescriptor());
++    assertEquals(1, excessReplicas.size());
++    assertTrue(excessReplicas.contains(excessSSD));
++
++    // Similar to above, but after policy change and before deletion,
++    // the replicas are located on excessSSD(rack r1), storages[2](rack r2)
++    // Replication factor = 1. We should be able to delete excessSSD.
++    nonExcess.clear();
++    nonExcess.add(excessSSD);
++    nonExcess.add(storages[2]);
++    excessTypes = storagePolicy.chooseExcess((short) 1,
++        DatanodeStorageInfo.toStorageTypes(nonExcess));
++    excessReplicas = replicator.chooseReplicasToDelete(nonExcess, 1,
++        excessTypes, storages[2].getDatanodeDescriptor(), null);
++    assertEquals(1, excessReplicas.size());
++    assertTrue(excessReplicas.contains(excessSSD));
++
++    // The block was initially created on excessSSD(rack r1),
++    // storages[4](rack r3) and storages[5](rack r3) with
++    // ONESSD_STORAGE_POLICY_NAME storage policy. Replication factor = 2.
++    // In this case, no replica can be chosen as the excessive replica by
++    // chooseReplicasToDelete because if the SSD storage is deleted,
++    // the remaining storages[4] and storages[5] are the same rack (r3),
++    // violating block placement policy (i.e. the number of racks >= 2).
++    // TODO BlockPlacementPolicyDefault should be able to rebalance the replicas
++    // and then delete excessSSD.
++    nonExcess.clear();
++    nonExcess.add(excessSSD);
++    nonExcess.add(storages[4]);
++    nonExcess.add(storages[5]);
++    excessTypes = storagePolicy.chooseExcess((short) 2,
++        DatanodeStorageInfo.toStorageTypes(nonExcess));
++    excessReplicas = replicator.chooseReplicasToDelete(nonExcess, 2,
++        excessTypes, null, null);
++    assertEquals(0, excessReplicas.size());
+   }
+ 
+  @Test
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicyWithNodeGroup.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicyWithNodeGroup.java
+index 28ef8a4..b946c22 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicyWithNodeGroup.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicyWithNodeGroup.java
+@@ -616,7 +616,7 @@ public void testChooseReplicaToDelete() throws Exception {
+     List<StorageType> excessTypes = new ArrayList<StorageType>();
+     excessTypes.add(StorageType.DEFAULT);
+     DatanodeStorageInfo chosen = ((BlockPlacementPolicyDefault) replicator)
+-        .chooseReplicaToDelete((short) 3, first, second, excessTypes);
++        .chooseReplicaToDelete(first, second, excessTypes, rackMap);
+     // Within first set {dataNodes[0], dataNodes[1], dataNodes[2]}, 
+     // dataNodes[0] and dataNodes[1] are in the same nodegroup, 
+     // but dataNodes[1] is chosen as less free space
+@@ -629,7 +629,7 @@ public void testChooseReplicaToDelete() throws Exception {
+     // as less free space
+     excessTypes.add(StorageType.DEFAULT);
+     chosen = ((BlockPlacementPolicyDefault) replicator).chooseReplicaToDelete(
+-        (short) 2, first, second, excessTypes);
++        first, second, excessTypes, rackMap);
+     assertEquals(chosen, storages[2]);
+ 
+     replicator.adjustSetsWithChosenReplica(rackMap, first, second, chosen);
+@@ -638,7 +638,7 @@ public void testChooseReplicaToDelete() throws Exception {
+     // Within second set, dataNodes[5] with less free space
+     excessTypes.add(StorageType.DEFAULT);
+     chosen = ((BlockPlacementPolicyDefault) replicator).chooseReplicaToDelete(
+-        (short) 1, first, second, excessTypes);
++        first, second, excessTypes, rackMap);
+     assertEquals(chosen, storages[5]);
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencing.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencing.java
+index 0c6d5ae..e915828 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencing.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencing.java
+@@ -23,6 +23,7 @@
+ import java.io.PrintWriter;
+ import java.util.Collection;
+ import java.util.List;
++import java.util.Map;
+ import java.util.concurrent.CountDownLatch;
+ 
+ import com.google.common.base.Supplier;
+@@ -629,12 +630,13 @@ public RandomDeleterPolicy() {
+     }
+ 
+     @Override
+-    public DatanodeStorageInfo chooseReplicaToDelete(short replicationFactor,
+-        Collection<DatanodeStorageInfo> first, Collection<DatanodeStorageInfo> second,
+-        List<StorageType> excessTypes) {
+-      
+-      Collection<DatanodeStorageInfo> chooseFrom = !first.isEmpty() ? first : second;
+-
++    public DatanodeStorageInfo chooseReplicaToDelete(
++        Collection<DatanodeStorageInfo> moreThanOne,
++        Collection<DatanodeStorageInfo> exactlyOne,
++        List<StorageType> excessTypes,
++        Map<String, List<DatanodeStorageInfo>> rackMap) {
++      Collection<DatanodeStorageInfo> chooseFrom = !moreThanOne.isEmpty() ?
++          moreThanOne : exactlyOne;
+       List<DatanodeStorageInfo> l = Lists.newArrayList(chooseFrom);
+       return l.get(DFSUtil.getRandom().nextInt(l.size()));
+     }
+-- 
+1.7.9.5
+

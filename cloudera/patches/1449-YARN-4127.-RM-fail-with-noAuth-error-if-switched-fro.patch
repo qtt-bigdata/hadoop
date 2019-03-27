@@ -1,0 +1,214 @@
+From 7b065bac267210b503eafc69d30c0131bc510118 Mon Sep 17 00:00:00 2001
+From: Jian He <jianhe@apache.org>
+Date: Tue, 3 Nov 2015 15:33:13 -0800
+Subject: [PATCH 1449/2848] YARN-4127. RM fail with noAuth error if switched
+ from failover mode to non-failover mode.
+ Contributed by Varun Saxena
+
+(cherry picked from commit 7029fc356f234ee055ec3d42a140c4cde36c8a53)
+
+Conflicts:
+	hadoop-yarn-project/CHANGES.txt
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+
+Change-Id: I7cd96f0e74c15e4553d6e10353da8d8dc63518a9
+---
+ .../resourcemanager/recovery/ZKRMStateStore.java   |   40 ++++++----
+ .../recovery/TestZKRMStateStore.java               |   77 ++++++++++++++++++--
+ 2 files changed, 97 insertions(+), 20 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+index f333ae4..21830d1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+@@ -300,8 +300,9 @@ public synchronized void startInternal() throws Exception {
+     // ensure root dirs exist
+     createRootDirRecursively(znodeWorkingPath);
+     createRootDir(zkRootNodePath);
++    setRootNodeAcls();
++    deleteFencingNodePath();
+     if (HAUtil.isHAEnabled(getConfig())){
+-      fence();
+       verifyActiveStatusThread = new VerifyActiveStatusThread();
+       verifyActiveStatusThread.start();
+     }
+@@ -346,31 +347,41 @@ private void logRootNodeAcls(String prefix) throws Exception {
+     LOG.debug(builder.toString());
+   }
+ 
+-  private synchronized void fence() throws Exception {
+-    if (LOG.isTraceEnabled()) {
+-      logRootNodeAcls("Before fencing\n");
+-    }
+-
++  private void deleteFencingNodePath() throws Exception {
+     new ZKAction<Void>() {
+       @Override
+       public Void run() throws KeeperException, InterruptedException {
+-        zkClient.setACL(zkRootNodePath, zkRootNodeAcl, -1);
++        try {
++          zkClient.multi(Collections.singletonList(deleteFencingNodePathOp));
++        } catch (KeeperException.NoNodeException nne) {
++          LOG.info("Fencing node " + fencingNodePath +
++              " doesn't exist to delete");
++        }
+         return null;
+       }
+     }.runWithRetries();
++  }
+ 
+-    // delete fencingnodepath
++  private void setAcl(final String zkPath, final List<ACL> acl)
++      throws Exception {
+     new ZKAction<Void>() {
+       @Override
+       public Void run() throws KeeperException, InterruptedException {
+-        try {
+-          zkClient.multi(Collections.singletonList(deleteFencingNodePathOp));
+-        } catch (KeeperException.NoNodeException nne) {
+-          LOG.info("Fencing node " + fencingNodePath + " doesn't exist to delete");
+-        }
++        zkClient.setACL(zkPath, acl, -1);
+         return null;
+       }
+     }.runWithRetries();
++  }
++
++  private void setRootNodeAcls() throws Exception {
++    if (LOG.isTraceEnabled()) {
++      logRootNodeAcls("Before fencing\n");
++    }
++    if (HAUtil.isHAEnabled(getConfig())) {
++      setAcl(zkRootNodePath, zkRootNodeAcl);
++    } else {
++      setAcl(zkRootNodePath, zkAcl);
++    }
+ 
+     if (LOG.isTraceEnabled()) {
+       logRootNodeAcls("After fencing\n");
+@@ -1028,7 +1039,8 @@ public void setDataWithRetries(final String path, final byte[] data,
+     }.runWithRetries();
+   }
+ 
+-  private List<ACL> getACLWithRetries(
++  @VisibleForTesting
++  List<ACL> getACLWithRetries(
+       final String path, final Stat stat) throws Exception {
+     return new ZKAction<List<ACL>>() {
+       @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+index dd43f04..75b39f4 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+@@ -42,8 +42,6 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+-import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+-import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+@@ -52,12 +50,9 @@
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.server.records.Version;
+ import org.apache.hadoop.yarn.server.records.impl.pb.VersionPBImpl;
++import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMZKUtils;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationStateData;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+-import org.apache.hadoop.yarn.util.ConverterUtils;
+-import org.apache.zookeeper.KeeperException;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationAttemptStateData;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationStateData;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+@@ -67,8 +62,11 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.security.ClientToAMTokenSecretManagerInRM;
+ import org.apache.hadoop.yarn.util.ConverterUtils;
++import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.ZooDefs.Perms;
+ import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.CreateMode;
++import org.apache.zookeeper.data.ACL;
+ import org.apache.zookeeper.data.Stat;
+ import org.junit.Assert;
+ import org.junit.Test;
+@@ -193,6 +191,73 @@ private Configuration createHARMConf(
+     return conf;
+   }
+ 
++  private static boolean verifyZKACL(String id, String scheme, int perm,
++      List<ACL> acls) {
++    for (ACL acl : acls) {
++      if (acl.getId().getScheme().equals(scheme) &&
++          acl.getId().getId().startsWith(id) &&
++          acl.getPerms() == perm) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  /**
++   * Test if RM can successfully start in HA disabled mode if it was previously
++   * running in HA enabled mode. And then start it in HA mode after running it
++   * with HA disabled. NoAuth Exception should not be sent by zookeeper and RM
++   * should start successfully.
++   */
++  @Test
++  public void testZKRootPathAcls() throws Exception {
++    StateChangeRequestInfo req = new StateChangeRequestInfo(
++        HAServiceProtocol.RequestSource.REQUEST_BY_USER);
++    String rootPath =
++        YarnConfiguration.DEFAULT_ZK_RM_STATE_STORE_PARENT_PATH + "/" +
++            ZKRMStateStore.ROOT_ZNODE_NAME;
++
++    // Start RM with HA enabled
++    Configuration conf = createHARMConf("rm1,rm2", "rm1", 1234);
++    conf.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
++    ResourceManager rm = new MockRM(conf);
++    rm.start();
++    rm.getRMContext().getRMAdminService().transitionToActive(req);
++    Stat stat = new Stat();
++    List<ACL> acls = ((ZKRMStateStore)rm.getRMContext().getStateStore()).
++        getACLWithRetries(rootPath, stat);
++    assertEquals(acls.size(), 2);
++    // CREATE and DELETE permissions for root node based on RM ID
++    verifyZKACL("digest", "localhost", Perms.CREATE | Perms.DELETE, acls);
++    verifyZKACL(
++        "world", "anyone", Perms.ALL ^ (Perms.CREATE | Perms.DELETE), acls);
++    rm.close();
++
++    // Now start RM with HA disabled. NoAuth Exception should not be thrown.
++    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, false);
++    rm = new MockRM(conf);
++    rm.start();
++    rm.getRMContext().getRMAdminService().transitionToActive(req);
++    acls = ((ZKRMStateStore)rm.getRMContext().getStateStore()).
++        getACLWithRetries(rootPath, stat);
++    assertEquals(acls.size(), 1);
++    verifyZKACL("world", "anyone", Perms.ALL, acls);
++    rm.close();
++
++    // Start RM with HA enabled.
++    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED, true);
++    rm = new MockRM(conf);
++    rm.start();
++    rm.getRMContext().getRMAdminService().transitionToActive(req);
++    acls = ((ZKRMStateStore)rm.getRMContext().getStateStore()).
++        getACLWithRetries(rootPath, stat);
++    assertEquals(acls.size(), 2);
++    verifyZKACL("digest", "localhost", Perms.CREATE | Perms.DELETE, acls);
++    verifyZKACL(
++        "world", "anyone", Perms.ALL ^ (Perms.CREATE | Perms.DELETE), acls);
++    rm.close();
++  }
++
+   @SuppressWarnings("unchecked")
+   @Test
+   public void testFencing() throws Exception {
+-- 
+1.7.9.5
+

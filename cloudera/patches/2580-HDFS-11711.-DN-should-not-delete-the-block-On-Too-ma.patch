@@ -1,0 +1,170 @@
+From c6afc3fb8e794a2da6dabdb5cbad82b5fcb49d7c Mon Sep 17 00:00:00 2001
+From: Brahma Reddy Battula <brahma@apache.org>
+Date: Wed, 7 Jun 2017 16:24:50 +0800
+Subject: [PATCH 2580/2848] HDFS-11711. DN should not delete the block On "Too
+ many open files" Exception. Contributed by Brahma
+ Reddy Battula.
+
+(cherry picked from commit fca08f8362f0332b064f28c2625fd535004ef85d)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeMetrics.java
+
+Change-Id: I76add9034cb353df65fa6ea36551a6c641e26e68
+---
+ .../hadoop/hdfs/server/datanode/BlockSender.java   |   12 ++++
+ .../server/datanode/DataNodeFaultInjector.java     |    4 ++
+ .../hdfs/server/datanode/TestDataNodeMetrics.java  |   62 ++++++++++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+index 9e31b0b..a0a4775 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+@@ -34,6 +34,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.hadoop.fs.ChecksumException;
++import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.datatransfer.PacketHeader;
+@@ -293,6 +294,7 @@
+         LengthInputStream metaIn = null;
+         boolean keepMetaInOpen = false;
+         try {
++          DataNodeFaultInjector.get().throwTooManyOpenFiles();
+           metaIn = datanode.data.getMetaDataInputStream(block);
+           if (!corruptChecksumOk || metaIn != null) {
+             if (metaIn == null) {
+@@ -321,6 +323,16 @@
+           } else {
+             LOG.warn("Could not find metadata file for " + block);
+           }
++        } catch (FileNotFoundException e) {
++          if ((e.getMessage() != null) && !(e.getMessage()
++              .contains("Too many open files"))) {
++            // The replica is on its volume map but not on disk
++            datanode
++                .notifyNamenodeDeletedBlock(block, replica.getStorageUuid());
++            datanode.data.invalidate(block.getBlockPoolId(),
++                new Block[] {block.getLocalBlock()});
++          }
++          throw e;
+         } finally {
+           if (!keepMetaInOpen) {
+             IOUtils.closeStream(metaIn);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+index 931c124..c271124 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+@@ -21,6 +21,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
+ 
+ /**
+@@ -58,4 +59,7 @@ public void failMirrorConnection() throws IOException { }
+ 
+   public void failPipeline(ReplicaInPipelineInterface replicaInfo,
+       String mirrorAddr) throws IOException { }
++
++  public void throwTooManyOpenFiles() throws FileNotFoundException {
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeMetrics.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeMetrics.java
+index 89ea914..3060353 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeMetrics.java
+@@ -24,10 +24,13 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ import java.io.Closeable;
++import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
++import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.List;
+ import java.util.Map;
+@@ -47,6 +50,8 @@
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.metrics2.MetricsRecordBuilder;
+ import org.apache.hadoop.test.GenericTestUtils;
+@@ -302,4 +307,61 @@ public Boolean get() {
+     }
+   }
+ 
++  @Test
++  public void testDNShouldNotDeleteBlockONTooManyOpenFiles()
++      throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 1L);
++    conf.setLong(DFSConfigKeys.DFS_CLIENT_RETRY_WINDOW_BASE, 1);
++    DataNodeFaultInjector oldInjector = DataNodeFaultInjector.get();
++    MiniDFSCluster cluster =
++        new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
++    final DataNodeFaultInjector injector =
++        Mockito.mock(DataNodeFaultInjector.class);
++    try {
++      // wait until the cluster is up
++      cluster.waitActive();
++      DistributedFileSystem fs = cluster.getFileSystem();
++      Path p = new Path("/testShouldThrowTMP");
++      DFSTestUtil.writeFile(fs, p, new String("testdata"));
++      //Before DN throws too many open files
++      verifyBlockLocations(fs, p, 1);
++      Mockito.doThrow(new FileNotFoundException("Too many open files")).
++          when(injector).
++          throwTooManyOpenFiles();
++      DataNodeFaultInjector.set(injector);
++      ExtendedBlock b =
++          fs.getClient().getLocatedBlocks(p.toString(), 0).get(0).getBlock();
++      try {
++        new BlockSender(b, 0, -1, false, true, true,
++            cluster.getDataNodes().get(0), null,
++            CachingStrategy.newDefaultStrategy());
++        fail("Must throw FileNotFoundException");
++      } catch (FileNotFoundException fe) {
++        assertTrue("Should throw too many open files",
++            fe.getMessage().contains("Too many open files"));
++      }
++      cluster.triggerHeartbeats(); // IBR delete ack
++      //After DN throws too many open files
++      assertTrue(cluster.getDataNodes().get(0).getFSDataset().isValidBlock(b));
++      verifyBlockLocations(fs, p, 1);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      DataNodeFaultInjector.set(oldInjector);
++    }
++  }
++
++  private void verifyBlockLocations(DistributedFileSystem fs, Path p,
++      final int expected)
++      throws IOException, TimeoutException, InterruptedException {
++    final LocatedBlock lb =
++        fs.getClient().getLocatedBlocks(p.toString(), 0).get(0);
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++      @Override public Boolean get() {
++        return lb.getLocations().length == expected;
++      }
++    }, 1000, 6000);
++  }
+ }
+-- 
+1.7.9.5
+

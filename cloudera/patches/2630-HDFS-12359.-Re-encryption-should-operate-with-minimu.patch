@@ -1,0 +1,389 @@
+From 6da16223b689f40916d896ff897ef373893c7463 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Tue, 5 Sep 2017 10:07:40 -0700
+Subject: [PATCH 2630/2848] HDFS-12359. Re-encryption should operate with
+ minimum KMS ACL requirements.
+
+(cherry picked from commit 0ba8ff4b77db11fb68111f20fb077cffddd24f17)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirEncryptionZoneOp.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+
+Change-Id: I7855062527ccba299dd34bc32356e6adad930ad4
+---
+ .../server/namenode/EncryptionZoneManager.java     |    9 +-
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |  100 +++++++++++---------
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   53 +++++++----
+ .../hdfs/server/namenode/TestReencryption.java     |    4 +-
+ .../server/namenode/TestReencryptionWithKMS.java   |   91 ++++++++++++++++++
+ 5 files changed, 185 insertions(+), 72 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryptionWithKMS.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+index 05f13c8..5b64aa4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+@@ -599,13 +599,14 @@ private boolean pathResolvesToId(final long zoneId, final String zonePath)
+    * Re-encrypts the given encryption zone path. If the given path is not the
+    * root of an encryption zone, an exception is thrown.
+    */
+-  XAttr reencryptEncryptionZone(final INodesInPath zoneIIP,
++  List<XAttr> reencryptEncryptionZone(final INodesInPath zoneIIP,
+       final String keyVersionName) throws IOException {
+     assert dir.hasWriteLock();
+     if (reencryptionHandler == null) {
+       throw new IOException("No key provider configured, re-encryption "
+           + "operation is rejected");
+     }
++    final List<XAttr> xAttrs = Lists.newArrayListWithCapacity(1);
+     final INode inode = zoneIIP.getLastINode();
+     final String zoneName = zoneIIP.getPath();
+     checkEncryptionZoneRoot(inode, zoneName);
+@@ -615,9 +616,11 @@ XAttr reencryptEncryptionZone(final INodesInPath zoneIIP,
+     }
+     LOG.info("Zone {}({}) is submitted for re-encryption.", zoneName,
+         inode.getId());
+-    XAttr ret = dir.updateReencryptionSubmitted(zoneIIP, keyVersionName);
++    final XAttr xattr = dir
++        .updateReencryptionSubmitted(zoneIIP, keyVersionName);
++    xAttrs.add(xattr);
+     reencryptionHandler.notifyNewSubmission();
+-    return ret;
++    return xAttrs;
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index f3fca89..00e0477 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -26,6 +26,7 @@
+ import java.io.Closeable;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.security.GeneralSecurityException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -40,8 +41,9 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.crypto.CipherSuite;
+ import org.apache.hadoop.crypto.CryptoProtocolVersion;
+-import org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
+ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.CryptoExtension;
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.EncryptedKeyVersion;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.FileAlreadyExistsException;
+ import org.apache.hadoop.fs.FileEncryptionInfo;
+@@ -2999,34 +3001,15 @@ EncryptionZone getEZForPath(INodesInPath iip) {
+     }
+   }
+ 
+-  void reencryptEncryptionZone(final String zone, final String keyVersionName,
+-      final boolean logRetryCache) throws IOException {
+-    final List<XAttr> xAttrs = Lists.newArrayListWithCapacity(1);
+-    writeLock();
+-    try {
+-      final INodesInPath iip = getINodesInPath4Write(zone);
+-      final XAttr xattr = ezManager
+-          .reencryptEncryptionZone(iip, keyVersionName);
+-      xAttrs.add(xattr);
+-    } finally {
+-      writeUnlock();
+-    }
+-    getFSNamesystem().getEditLog().logSetXAttrs(zone, xAttrs, logRetryCache);
++  List<XAttr> reencryptEncryptionZone(final INodesInPath iip,
++      final String keyVersionName) throws IOException {
++    assert keyVersionName != null;
++    return ezManager.reencryptEncryptionZone(iip, keyVersionName);
+   }
+ 
+-  void cancelReencryptEncryptionZone(final String zone,
+-      final boolean logRetryCache) throws IOException {
+-    final List<XAttr> xattrs;
+-    writeLock();
+-    try {
+-      final INodesInPath iip = getINodesInPath4Write(zone);
+-      xattrs = ezManager.cancelReencryptEncryptionZone(iip);
+-    } finally {
+-      writeUnlock();
+-    }
+-    if (xattrs != null && !xattrs.isEmpty()) {
+-      getFSNamesystem().getEditLog().logSetXAttrs(zone, xattrs, logRetryCache);
+-    }
++  List<XAttr> cancelReencryptEncryptionZone(final INodesInPath iip)
++      throws IOException {
++    return ezManager.cancelReencryptEncryptionZone(iip);
+   }
+ 
+   BatchedListEntries<ZoneReencryptionStatus> listReencryptionStatus(
+@@ -3267,33 +3250,56 @@ FileEncryptionInfo getFileEncryptionInfo(INode inode, int snapshotId,
+   }
+ 
+   /**
+-   * Get the last key version name for the given EZ. This will contact
+-   * the KMS to getKeyVersions.
+-   * @param zone the encryption zone
+-   * @param pc the permission checker
+-   * @return the last element from the list of keyVersionNames returned by KMS.
+-   * @throws IOException
++   * Get the current key version name for the given EZ. This will first drain
++   * the provider's local cache, then generate a new edek.
++   * <p>
++   * The encryption key version of the newly generated edek will be used as
++   * the target key version of this re-encryption - meaning all edeks'
++   * keyVersion are compared with it, and only sent to the KMS for re-encryption
++   * when the version is different.
++   * <p>
++   * Note: KeyProvider has a getCurrentKey interface, but that is under
++   * a different ACL. HDFS should not try to operate on additional ACLs, but
++   * rather use the generate ACL it already has.
++   */
++  String getCurrentKeyVersion(final String zone) throws IOException {
++    assert getProvider() != null;
++    assert !hasReadLock();
++    final String keyName = getKeyNameForZone(zone);
++    if (keyName == null) {
++      throw new IOException(zone + " is not an encryption zone.");
++    }
++    // drain the local cache of the key provider.
++    // Do not invalidateCache on the server, since that's the responsibility
++    // when rolling the key version.
++    if (getProvider() instanceof CryptoExtension) {
++      ((CryptoExtension) getProvider()).drain(keyName);
++    }
++    final EncryptedKeyVersion edek;
++    try {
++      edek = getProvider().generateEncryptedKey(keyName);
++    } catch (GeneralSecurityException gse) {
++      throw new IOException(gse);
++    }
++    Preconditions.checkNotNull(edek);
++    return edek.getEncryptionKeyVersionName();
++  }
++
++  /**
++   * Resolve the zone to an inode, find the encryption zone info associated with
++   * that inode, and return the key name. Does not contact the KMS.
+    */
+-  KeyVersion getLatestKeyVersion(final String zone,
+-      final FSPermissionChecker pc) throws IOException {
+-    final EncryptionZone ez;
++  String getKeyNameForZone(final String zone) throws IOException {
+     assert getProvider() != null;
++    final INodesInPath iip;
+     readLock();
+     try {
+-      final INodesInPath iip = getINodesInPath(zone, true);
+-      if (iip.getLastINode() == null) {
+-        throw new FileNotFoundException(zone + " does not exist.");
+-      }
+-      ezManager.checkEncryptionZoneRoot(iip.getLastINode(), iip.getPath());
+-      ez = getEZForPath(iip);
++      iip = getINodesInPath(zone, false);
++      ezManager.checkEncryptionZoneRoot(iip.getLastINode(), zone);
++      return ezManager.getKeyName(iip);
+     } finally {
+       readUnlock();
+     }
+-    // Contact KMS out of locks.
+-    KeyVersion currKv = getProvider().getCurrentKey(ez.getKeyName());
+-    Preconditions.checkNotNull(currKv,
+-        "No current key versions for key name " + ez.getKeyName());
+-    return currKv;
+   }
+ 
+   void setXAttrs(final String src, final List<XAttr> xAttrs,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index c691790..79dc4c1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -9418,30 +9418,43 @@ private void reencryptEncryptionZoneInt(final String zone,
+       throw new IOException("No key provider configured, re-encryption "
+           + "operation is rejected");
+     }
+-    FSPermissionChecker pc = getPermissionChecker();
+-    // get keyVersionName out of the lock. This keyVersionName will be used
+-    // as the target keyVersion for the entire re-encryption.
+-    // This means all edek's keyVersion will be compared with this one, and
+-    // kms is only contacted if the edek's keyVersion is different.
+-    final KeyVersion kv = dir.getLatestKeyVersion(zone, pc);
+-    provider.invalidateCache(kv.getName());
++    String keyVersionName = null;
++    if (action == ReencryptAction.START) {
++      // get zone's latest key version name out of the lock.
++      keyVersionName = dir.getCurrentKeyVersion(zone);
++      if (keyVersionName == null) {
++        throw new IOException("Failed to get key version name for " + zone);
++      }
++    }
+     writeLock();
+     try {
+       checkSuperuserPrivilege();
+       checkOperation(OperationCategory.WRITE);
+-      checkNameNodeSafeMode(
+-          "NameNode in safemode, cannot " + action + " re-encryption on zone "
+-              + zone);
+-      switch (action) {
+-      case START:
+-        dir.reencryptEncryptionZone(zone, kv.getVersionName(), logRetryCache);
+-        break;
+-      case CANCEL:
+-        dir.cancelReencryptEncryptionZone(zone, logRetryCache);
+-        break;
+-      default:
+-        throw new IOException(
+-            "Re-encryption action " + action + " is not supported");
++      checkNameNodeSafeMode("NameNode in safemode, cannot " + action
++          + " re-encryption on zone " + zone);
++      List<XAttr> xattrs;
++      dir.writeLock();
++      try {
++        final INodesInPath iip = dir.getINodesInPath(zone, false);
++        if (iip.getLastINode() == null) {
++          throw new FileNotFoundException(zone + " does not exist.");
++        }
++        switch (action) {
++        case START:
++          xattrs = dir.reencryptEncryptionZone(iip, keyVersionName);
++          break;
++        case CANCEL:
++          xattrs = dir.cancelReencryptEncryptionZone(iip);
++          break;
++        default:
++          throw new IOException(
++              "Re-encryption action " + action + " is not supported");
++        }
++      } finally {
++        dir.writeUnlock();
++      }
++      if (xattrs != null && !xattrs.isEmpty()) {
++        getEditLog().logSetXAttrs(zone, xattrs, logRetryCache);
+       }
+     } finally {
+       writeUnlock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryption.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryption.java
+index f4cc062..1376a1c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryption.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryption.java
+@@ -103,7 +103,7 @@
+   private static final EnumSet<CreateEncryptionZoneFlag> NO_TRASH =
+       EnumSet.of(CreateEncryptionZoneFlag.NO_TRASH);
+ 
+-  private String getKeyProviderURI() {
++  protected String getKeyProviderURI() {
+     return JavaKeyStoreProvider.SCHEME_NAME + "://file" + new Path(
+         testRootDir.toString(), "test.jks").toUri();
+   }
+@@ -149,7 +149,7 @@ public void setup() throws Exception {
+     GenericTestUtils.setLogLevel(ReencryptionUpdater.LOG, Level.TRACE);
+   }
+ 
+-  private void setProvider() {
++  protected void setProvider() {
+     // Need to set the client's KeyProvider to the NN's for JKS,
+     // else the updates do not get flushed properly
+     fs.getClient()
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryptionWithKMS.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryptionWithKMS.java
+new file mode 100644
+index 0000000..af9c381
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestReencryptionWithKMS.java
+@@ -0,0 +1,91 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.crypto.key.kms.KMSClientProvider;
++import org.apache.hadoop.crypto.key.kms.server.KMSACLs;
++import org.apache.hadoop.crypto.key.kms.server.KMSConfiguration;
++import org.apache.hadoop.crypto.key.kms.server.KMSWebApp;
++import org.apache.hadoop.crypto.key.kms.server.MiniKMS;
++import org.apache.hadoop.fs.Path;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.FileWriter;
++import java.io.Writer;
++import java.util.UUID;
++
++import static org.junit.Assert.assertTrue;
++
++/**
++ * Test class for re-encryption with minikms.
++ */
++public class TestReencryptionWithKMS extends TestReencryption{
++
++  private MiniKMS miniKMS;
++  private String kmsDir;
++
++  @Override
++  protected String getKeyProviderURI() {
++    return KMSClientProvider.SCHEME_NAME + "://" +
++        miniKMS.getKMSUrl().toExternalForm().replace("://", "@");
++  }
++
++  @Before
++  public void setup() throws Exception {
++    kmsDir = "target/test-classes/" + UUID.randomUUID().toString();
++    final File dir = new File(kmsDir);
++    assertTrue(dir.mkdirs());
++    MiniKMS.Builder miniKMSBuilder = new MiniKMS.Builder();
++    miniKMS = miniKMSBuilder.setKmsConfDir(dir).build();
++    miniKMS.start();
++    super.setup();
++  }
++
++  @After
++  public void teardown() {
++    super.teardown();
++    if (miniKMS != null) {
++      miniKMS.stop();
++    }
++  }
++
++  @Override
++  protected void setProvider() {
++  }
++
++  @Test
++  public void testReencryptionKMSACLs() throws Exception {
++    final Path aclPath = new Path(kmsDir, KMSConfiguration.KMS_ACLS_XML);
++    final Configuration acl = new Configuration(false);
++    acl.addResource(aclPath);
++    // should not require any of the get ACLs.
++    acl.set(KMSACLs.Type.GET.getBlacklistConfigKey(), "*");
++    acl.set(KMSACLs.Type.GET_KEYS.getBlacklistConfigKey(), "*");
++    final File kmsAcl = new File(aclPath.toString());
++    assertTrue(kmsAcl.exists());
++    try (Writer writer = new FileWriter(kmsAcl)) {
++      acl.writeXml(writer);
++    }
++    KMSWebApp.getACLs().run();
++    testReencryptionBasic();
++  }
++}
+-- 
+1.7.9.5
+

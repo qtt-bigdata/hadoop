@@ -1,0 +1,196 @@
+From cf9d5d0fec834b90ab99a89cf1c74f0ae0dac373 Mon Sep 17 00:00:00 2001
+From: Chris Nauroth <cnauroth@apache.org>
+Date: Mon, 9 Jan 2017 15:48:30 -0800
+Subject: [PATCH 2242/2848] HADOOP-13908. S3Guard: Existing tables may not be
+ initialized correctly in DynamoDBMetadataStore.
+ Contributed by Mingliang Liu.
+
+(cherry picked from commit a5cc315dbef15e8f708663d45800fdc957797cf2)
+
+Change-Id: Ib2032f6237e7f6601e943d858ee2f028962613b9
+---
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |   83 ++++++++++++--------
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |   27 ++++++-
+ 2 files changed, 73 insertions(+), 37 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index 643a439..61b2b4c 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -191,10 +191,7 @@ public void initialize(FileSystem fs) throws IOException {
+     // use the bucket as the DynamoDB table name if not specified in config
+     tableName = conf.getTrimmed(S3GUARD_DDB_TABLE_NAME_KEY, bucket);
+ 
+-    // create the table unless it's explicitly told not to do so
+-    if (conf.getBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, false)) {
+-      createTable();
+-    }
++    initTable();
+   }
+ 
+   /**
+@@ -231,7 +228,7 @@ void initialize(Configuration config) throws IOException {
+     dynamoDB = new DynamoDB(dynamoDBClient);
+     //region = dynamoDBClient.getEndpointPrefix();
+ 
+-    createTable();
++    initTable();
+   }
+ 
+   @Override
+@@ -512,46 +509,64 @@ public String toString() {
+   /**
+    * Create a table if it does not exist and wait for it to become active.
+    *
+-   * If a table with the intended name already exists, then it logs the
+-   * {@link ResourceInUseException} and uses that table. The DynamoDB table
+-   * creation API is asynchronous.  This method wait for the table to become
+-   * active after sending the creation request, so overall, this method is
+-   * synchronous, and the table is guaranteed to exist after this method
+-   * returns successfully.
++   * If a table with the intended name already exists, then it uses that table.
++   * Otherwise, it will automatically create the table if the config
++   * {@link org.apache.hadoop.fs.s3a.Constants#S3GUARD_DDB_TABLE_CREATE_KEY} is
++   * enabled. The DynamoDB table creation API is asynchronous.  This method wait
++   * for the table to become active after sending the creation request, so
++   * overall, this method is synchronous, and the table is guaranteed to exist
++   * after this method returns successfully.
++   *
++   * @throws IOException if table does not exist and auto-creation is disabled;
++   * or any other I/O exception occurred.
+    */
+   @VisibleForTesting
+-  void createTable() throws IOException {
++  void initTable() throws IOException {
+     final ProvisionedThroughput capacity = new ProvisionedThroughput(
+         conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
+             S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
+         conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY,
+             S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT));
+ 
++    table = dynamoDB.getTable(tableName);
+     try {
+-      LOG.info("Creating DynamoDB table {} in region {}", tableName, region);
+-      table = dynamoDB.createTable(new CreateTableRequest()
+-          .withTableName(tableName)
+-          .withKeySchema(keySchema())
+-          .withAttributeDefinitions(attributeDefinitions())
+-          .withProvisionedThroughput(capacity));
+-    } catch (ResourceInUseException e) {
+-      LOG.info("ResourceInUseException while creating DynamoDB table {} in "
+-              + "region {}.  This may indicate that the table was created by "
+-              + "another concurrent thread or process.",
+-          tableName, region);
+-      table = dynamoDB.getTable(tableName);
+-    }
++      try {
++        table.describe();
++        LOG.debug("Using existing DynamoDB table {} in region {}",
++            tableName, region);
++      } catch (ResourceNotFoundException rnfe) {
++        if (conf.getBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, false)) {
++          try {
++            LOG.info("Creating non-existent DynamoDB table {} in region {}",
++                tableName, region);
++            dynamoDB.createTable(new CreateTableRequest()
++                .withTableName(tableName)
++                .withKeySchema(keySchema())
++                .withAttributeDefinitions(attributeDefinitions())
++                .withProvisionedThroughput(capacity));
++          } catch (ResourceInUseException e) {
++            LOG.debug("ResourceInUseException while creating DynamoDB table {} "
++                    + "in region {}.  This may indicate that the table was "
++                    + "created by another concurrent thread or process.",
++                tableName, region);
++          }
++        } else {
++          throw new IOException("DynamoDB table '" + tableName + "' does not "
++              + "exist in region " + region + "; auto-creation is turned off");
++        }
++      }
+ 
+-    try {
+-      table.waitForActive();
+-    } catch (InterruptedException e) {
+-      LOG.warn("Interrupted while waiting for DynamoDB table {} active",
+-          tableName, e);
+-      Thread.currentThread().interrupt();
+-      throw new InterruptedIOException("DynamoDB table '" + tableName + "'" +
+-          " is not active yet in region " + region);
++      try {
++        table.waitForActive();
++      } catch (InterruptedException e) {
++        LOG.warn("Interrupted while waiting for DynamoDB table {} active",
++            tableName, e);
++        Thread.currentThread().interrupt();
++        throw new InterruptedIOException("DynamoDB table '" + tableName + "'" +
++            " is not active yet in region " + region);
++      }
+     } catch (AmazonClientException e) {
+-      throw translateException("createTable", (String) null, e);
++      throw translateException("initTable", (String) null, e);
+     }
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index f88137b..fe38c12 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -214,7 +214,6 @@ public void testInitialize() throws IOException {
+   public void testInitializeWithConfiguration() throws IOException {
+     final String tableName = "testInitializeWithConfiguration";
+     final Configuration conf = new Configuration();
+-    String a = conf.get(Constants.S3GUARD_DDB_ENDPOINT_KEY);
+     try {
+       DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore();
+       ddbms.initialize(conf);
+@@ -234,6 +233,7 @@ public void testInitializeWithConfiguration() throws IOException {
+     // config credentials
+     conf.set(Constants.ACCESS_KEY, "dummy-access-key");
+     conf.set(Constants.SECRET_KEY, "dummy-secret-key");
++    conf.setBoolean(Constants.S3GUARD_DDB_TABLE_CREATE_KEY, true);
+     try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+       ddbms.initialize(conf);
+       verifyTableInitialized(tableName);
+@@ -312,15 +312,36 @@ private void doTestBatchWrite(int numDelete, int numPut) throws IOException {
+   }
+ 
+   @Test
+-  public void testCreateExistingTable() throws IOException {
++  public void testInitExistingTable() throws IOException {
+     final DynamoDBMetadataStore ddbms = createContract().getMetadataStore();
+     verifyTableInitialized(BUCKET);
+     // create existing table
+-    ddbms.createTable();
++    ddbms.initTable();
+     verifyTableInitialized(BUCKET);
+   }
+ 
+   /**
++   * Test that initTable fails with IOException when table does not exist and
++   * table auto-creation is disabled.
++   */
++  @Test
++  public void testFailNonexistentTable() throws IOException {
++    final String tableName = "testFailNonexistentTable";
++    final DynamoDBMSContract contract = createContract();
++    final S3AFileSystem s3afs = contract.getFileSystem();
++    final Configuration conf = s3afs.getConf();
++    conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY, tableName);
++    conf.unset(Constants.S3GUARD_DDB_TABLE_CREATE_KEY);
++    try {
++      final DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore();
++      ddbms.initialize(s3afs);
++      fail("Should have failed as table does not exist and table auto-creation "
++          + "is disabled");
++    } catch (IOException ignored) {
++    }
++  }
++
++  /**
+    * Test cases about root directory as it is not in the DynamoDB table.
+    */
+   @Test
+-- 
+1.7.9.5
+

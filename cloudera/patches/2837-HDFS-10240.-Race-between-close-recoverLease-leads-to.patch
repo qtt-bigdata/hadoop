@@ -1,0 +1,199 @@
+From ed2ce3b162e1fcc2daf9fd8adb1efaa1d8bb030a Mon Sep 17 00:00:00 2001
+From: Wei-Chiu Chuang <weichiu@apache.org>
+Date: Thu, 16 Aug 2018 16:29:38 -0700
+Subject: [PATCH 2837/2848] HDFS-10240. Race between close/recoverLease leads
+ to missing block. Contributed by Jinglun,
+ zhouyingchao and Wei-Chiu Chuang.
+
+(cherry picked from commit 865650052b07c8a20d51306202354ac770ed36d5)
+(cherry picked from commit bd46906bd80c86d8f4f9f3138d95dc7ea3247cac)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
+
+(cherry picked from commit 1cd04c420ccfef94ca309ac45d70da27cedc80a2)
+
+==C5_APPROVED_BUGFIX==
+
+Change-Id: I4d52eaea99d0840ba5bb9901cb6396b295434911
+---
+ .../hdfs/server/blockmanagement/BlockInfo.java     |    4 ++
+ .../hdfs/server/blockmanagement/BlockManager.java  |    4 ++
+ .../hdfs/server/datanode/BPServiceActor.java       |    3 +-
+ .../hadoop/hdfs/server/datanode/DataNode.java      |   10 +++
+ .../org/apache/hadoop/hdfs/TestLeaseRecovery2.java |   65 ++++++++++++++++++++
+ .../hdfs/server/datanode/DataNodeTestUtils.java    |    3 +
+ 6 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
+index 3eb8913..d00b951 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
+@@ -233,6 +233,10 @@ public boolean isComplete() {
+     return getBlockUCState().equals(BlockUCState.COMPLETE);
+   }
+ 
++  public boolean isUnderRecovery() {
++    return getBlockUCState().equals(BlockUCState.UNDER_RECOVERY);
++  }
++
+   /**
+    * Convert a complete block to an under construction block.
+    * @return BlockInfoUnderConstruction -  an under construction block.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 9c05e50..6f1f4f4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -712,6 +712,10 @@ public boolean commitOrCompleteLastBlock(BlockCollection bc,
+       return false; // no blocks in file yet
+     if(lastBlock.isComplete())
+       return false; // already completed (e.g. by syncBlock)
++    if(lastBlock.isUnderRecovery()) {
++      throw new IOException("Commit or complete block " + commitBlock +
++          ", whereas it is under recovery.");
++    }
+     
+     final boolean b = commitBlock((BlockInfoUnderConstruction)lastBlock, commitBlock);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
+index eab84e9..3d8e151 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPServiceActor.java
+@@ -546,7 +546,8 @@ private void offerService() throws Exception {
+             }
+           }
+         }
+-        if (ibrManager.sendImmediately() || sendHeartbeat) {
++        if (!dn.areIBRDisabledForTests() &&
++            (ibrManager.sendImmediately()|| sendHeartbeat)) {
+           ibrManager.sendIBRs(bpNamenode, bpRegistration,
+               bpos.getBlockPoolId(), dn.getMetrics());
+         }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index 3cd585d..bd7c781 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -312,6 +312,7 @@ public static InetSocketAddress createSocketAddr(String target) {
+   ThreadGroup threadGroup = null;
+   private DNConf dnConf;
+   private volatile boolean heartbeatsDisabledForTests = false;
++  private volatile boolean ibrDisabledForTests = false;
+   private volatile boolean cacheReportsDisabledForTests = false;
+   private DataStorage storage = null;
+ 
+@@ -1236,6 +1237,15 @@ boolean areHeartbeatsDisabledForTests() {
+   }
+ 
+   @VisibleForTesting
++  void setIBRDisabledForTest(boolean disabled) {
++    this.ibrDisabledForTests = disabled;
++  }
++
++  @VisibleForTesting
++  boolean areIBRDisabledForTests() {
++    return this.ibrDisabledForTests;
++  }
++
+   void setCacheReportsDisabledForTest(boolean disabled) {
+     this.cacheReportsDisabledForTests = disabled;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
+index 81b16a2..9f38413 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery2.java
+@@ -25,6 +25,7 @@
+ import static org.mockito.Mockito.spy;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+@@ -165,6 +166,70 @@ public void testImmediateRecoveryOfLease() throws Exception {
+   }
+ 
+   @Test
++  public void testCloseWhileRecoverLease() throws Exception {
++    // test recoverLease
++    // set the soft limit to be 1 hour but recoverLease should
++    // close the file immediately
++    cluster.setLeasePeriod(LONG_LEASE_PERIOD, LONG_LEASE_PERIOD);
++    int size = AppendTestUtil.nextInt(FILE_SIZE);
++    String filestr = "/testCloseWhileRecoverLease";
++
++    AppendTestUtil.LOG.info("filestr=" + filestr);
++    Path filepath = new Path(filestr);
++    FSDataOutputStream stm = dfs.create(filepath, true, BUF_SIZE,
++        REPLICATION_NUM, BLOCK_SIZE);
++    assertTrue(dfs.dfs.exists(filestr));
++
++    // hflush file
++    AppendTestUtil.LOG.info("hflush");
++    stm.hflush();
++
++    // Pause DN block report.
++    // Let client recover lease, and then close the file, and then let DN
++    // report blocks.
++    ArrayList<DataNode> dataNodes = cluster.getDataNodes();
++    for (DataNode dn: dataNodes) {
++      DataNodeTestUtils.setHeartbeatsDisabledForTests(dn, false);
++    }
++
++    LOG.info("pause IBR");
++    for (DataNode dn: dataNodes) {
++      DataNodeTestUtils.pauseIBR(dn);
++    }
++
++    AppendTestUtil.LOG.info("size=" + size);
++    stm.write(buffer, 0, size);
++
++    // hflush file
++    AppendTestUtil.LOG.info("hflush");
++    stm.hflush();
++
++    LOG.info("recover lease");
++    dfs.recoverLease(filepath);
++    try {
++      stm.close();
++      fail("close() should fail because the file is under recovery.");
++    } catch (IOException ioe) {
++      GenericTestUtils.assertExceptionContains(
++          "whereas it is under recovery", ioe);
++    }
++
++    for (DataNode dn: dataNodes) {
++      DataNodeTestUtils.setHeartbeatsDisabledForTests(dn, false);
++    }
++
++    LOG.info("trigger heartbeats");
++    // resume DN block report
++    for (DataNode dn: dataNodes) {
++      DataNodeTestUtils.triggerHeartbeat(dn);
++    }
++
++    stm.close();
++    assertEquals(cluster.getNamesystem().getBlockManager().
++        getMissingBlocksCount(), 0);
++  }
++
++  @Test
+   public void testLeaseRecoverByAnotherUser() throws Exception {
+     byte [] actual = new byte[FILE_SIZE];
+     cluster.setLeasePeriod(SHORT_LEASE_PERIOD, LONG_LEASE_PERIOD);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
+index 2ee8ff5..c95fe75 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
+@@ -81,6 +81,9 @@ public static void triggerBlockReport(DataNode dn) throws IOException {
+     }
+   }
+ 
++  public static void pauseIBR(DataNode dn) {
++    dn.setIBRDisabledForTest(true);
++  }
+   public static InterDatanodeProtocol createInterDatanodeProtocolProxy(
+       DataNode dn, DatanodeID datanodeid, final Configuration conf,
+       boolean connectToDnViaHostname) throws IOException {
+-- 
+1.7.9.5
+

@@ -1,0 +1,263 @@
+From b25baa43a712fc073216715403049bad99e4b94e Mon Sep 17 00:00:00 2001
+From: John Zhuge <john.zhuge@gmail.com>
+Date: Fri, 16 Sep 2016 10:02:31 -0700
+Subject: [PATCH 1864/2848] HDFS-7420. Delegate permission checks to
+ FSDirectory. Contributed by Haohui Mai.
+
+(cherry picked from commit b395f58e850e70bcb9273d86510276ce28962a85)
+
+Change-Id: I64d6783daffb1c06a5fd2559fede5f7efb02766c
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |   84 +++++++++++++++++++-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   37 +++------
+ .../server/namenode/TestFSPermissionChecker.java   |    2 +-
+ 3 files changed, 93 insertions(+), 30 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 84b29b8..d6e62ce 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -53,6 +53,7 @@
+ import org.apache.hadoop.fs.XAttrSetFlag;
+ import org.apache.hadoop.fs.permission.AclEntry;
+ import org.apache.hadoop.fs.permission.AclStatus;
++import org.apache.hadoop.fs.permission.FsAction;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+@@ -97,6 +98,7 @@
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.Lists;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.UserGroupInformation;
+ 
+ /**
+  * Both FSDirectory and FSNamesystem manage the state of the namespace.
+@@ -154,6 +156,8 @@ private static INodeDirectory createRoot(FSNamesystem namesystem) {
+   private final ReentrantReadWriteLock dirLock;
+ 
+   private final boolean isPermissionEnabled;
++  private final String fsOwnerShortUserName;
++  private final String supergroup;
+ 
+   // utility methods to acquire and release read lock and write lock
+   void readLock() {
+@@ -197,13 +201,19 @@ public int getWriteHoldCount() {
+    */
+   private final NameCache<ByteArray> nameCache;
+ 
+-  FSDirectory(FSNamesystem ns, Configuration conf) {
++  FSDirectory(FSNamesystem ns, Configuration conf) throws IOException {
+     this.dirLock = new ReentrantReadWriteLock(true); // fair
+     rootDir = createRoot(ns);
+     inodeMap = INodeMap.newInstance(rootDir);
+     this.isPermissionEnabled = conf.getBoolean(
+       DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,
+       DFSConfigKeys.DFS_PERMISSIONS_ENABLED_DEFAULT);
++    this.fsOwnerShortUserName =
++      UserGroupInformation.getCurrentUser().getShortUserName();
++    this.supergroup = conf.get(
++      DFSConfigKeys.DFS_PERMISSIONS_SUPERUSERGROUP_KEY,
++      DFSConfigKeys.DFS_PERMISSIONS_SUPERUSERGROUP_DEFAULT);
++
+     int configuredLimit = conf.getInt(
+         DFSConfigKeys.DFS_LIST_LIMIT, DFSConfigKeys.DFS_LIST_LIMIT_DEFAULT);
+     this.lsLimit = configuredLimit>0 ?
+@@ -3420,4 +3430,76 @@ INodesInPath getINodesInPath4Write(String src, boolean resolveLink)
+     }
+     return inodesInPath;
+   }
++
++  FSPermissionChecker getPermissionChecker()
++    throws AccessControlException {
++    try {
++      return new FSPermissionChecker(fsOwnerShortUserName, supergroup,
++          NameNode.getRemoteUser());
++    } catch (IOException ioe) {
++      throw new AccessControlException(ioe);
++    }
++  }
++
++  void checkOwner(FSPermissionChecker pc, String path)
++      throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, true, null, null, null, null);
++  }
++
++  void checkPathAccess(FSPermissionChecker pc, String path,
++                       FsAction access)
++      throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, false, null, null, access, null);
++  }
++  void checkParentAccess(
++      FSPermissionChecker pc, String path, FsAction access)
++      throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, false, null, access, null, null);
++  }
++
++  void checkAncestorAccess(
++      FSPermissionChecker pc, String path, FsAction access)
++      throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, false, access, null, null, null);
++  }
++
++  void checkTraverse(FSPermissionChecker pc, String path)
++      throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, false, null, null, null, null);
++  }
++
++  /**
++   * Check whether current user have permissions to access the path. For more
++   * details of the parameters, see
++   * {@link FSPermissionChecker#checkPermission}.
++   */
++  private void checkPermission(
++    FSPermissionChecker pc, String path, boolean doCheckOwner,
++    FsAction ancestorAccess, FsAction parentAccess, FsAction access,
++    FsAction subAccess)
++    throws AccessControlException, UnresolvedLinkException {
++    checkPermission(pc, path, doCheckOwner, ancestorAccess,
++        parentAccess, access, subAccess, false, true);
++  }
++
++  /**
++   * Check whether current user have permissions to access the path. For more
++   * details of the parameters, see
++   * {@link FSPermissionChecker#checkPermission}.
++   */
++  void checkPermission(
++      FSPermissionChecker pc, String path, boolean doCheckOwner,
++      FsAction ancestorAccess, FsAction parentAccess, FsAction access,
++      FsAction subAccess, boolean ignoreEmptyDir, boolean resolveLink)
++      throws AccessControlException, UnresolvedLinkException {
++    if (!pc.isSuperUser()) {
++      readLock();
++      try {
++        pc.checkPermission(path, this, doCheckOwner, ancestorAccess,
++            parentAccess, access, subAccess, ignoreEmptyDir, resolveLink);
++      } finally {
++        readUnlock();
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index fd89151..fd056a1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -408,7 +408,6 @@ private void logAuditEvent(boolean succeeded,
+   static int BLOCK_DELETION_INCREMENT = 1000;
+   private final boolean isPermissionEnabled;
+   private final UserGroupInformation fsOwner;
+-  private final String fsOwnerShortUserName;
+   private final String supergroup;
+   private final boolean standbyShouldCheckpoint;
+   
+@@ -842,7 +841,6 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+                           DFS_STORAGE_POLICY_ENABLED_DEFAULT);
+ 
+       this.fsOwner = UserGroupInformation.getCurrentUser();
+-      this.fsOwnerShortUserName = fsOwner.getShortUserName();
+       this.supergroup = conf.get(DFS_PERMISSIONS_SUPERUSERGROUP_KEY, 
+                                  DFS_PERMISSIONS_SUPERUSERGROUP_DEFAULT);
+       this.isPermissionEnabled = conf.getBoolean(DFS_PERMISSIONS_ENABLED_KEY,
+@@ -4060,11 +4058,7 @@ private boolean deleteInt(String src, boolean recursive, boolean logRetryCache)
+     
+   FSPermissionChecker getPermissionChecker()
+       throws AccessControlException {
+-    try {
+-      return new FSPermissionChecker(fsOwnerShortUserName, supergroup, getRemoteUser());
+-    } catch (IOException ioe) {
+-      throw new AccessControlException(ioe);
+-    }
++    return dir.getPermissionChecker();
+   }
+   
+   /**
+@@ -6544,13 +6538,13 @@ PermissionStatus createFsOwnerPermissions(FsPermission permission) {
+ 
+   private void checkOwner(FSPermissionChecker pc, String path)
+       throws AccessControlException, UnresolvedLinkException {
+-    checkPermission(pc, path, true, null, null, null, null);
++    dir.checkOwner(pc, path);
+   }
+ 
+   private void checkPathAccess(FSPermissionChecker pc,
+       String path, FsAction access) throws AccessControlException,
+       UnresolvedLinkException {
+-    checkPermission(pc, path, false, null, null, access, null);
++    dir.checkPathAccess(pc, path, access);
+   }
+ 
+   private void checkUnreadableBySuperuser(FSPermissionChecker pc,
+@@ -6571,18 +6565,18 @@ private void checkUnreadableBySuperuser(FSPermissionChecker pc,
+   private void checkParentAccess(FSPermissionChecker pc,
+       String path, FsAction access) throws AccessControlException,
+       UnresolvedLinkException {
+-    checkPermission(pc, path, false, null, access, null, null);
++    dir.checkParentAccess(pc, path, access);
+   }
+ 
+   private void checkAncestorAccess(FSPermissionChecker pc,
+       String path, FsAction access) throws AccessControlException,
+       UnresolvedLinkException {
+-    checkPermission(pc, path, false, access, null, null, null);
++    dir.checkAncestorAccess(pc, path, access);
+   }
+ 
+   private void checkTraverse(FSPermissionChecker pc, String path)
+       throws AccessControlException, UnresolvedLinkException {
+-    checkPermission(pc, path, false, null, null, null, null);
++    dir.checkTraverse(pc, path);
+   }
+ 
+   @Override
+@@ -6603,30 +6597,17 @@ private void checkPermission(FSPermissionChecker pc,
+       String path, boolean doCheckOwner, FsAction ancestorAccess,
+       FsAction parentAccess, FsAction access, FsAction subAccess)
+       throws AccessControlException, UnresolvedLinkException {
+-        checkPermission(pc, path, doCheckOwner, ancestorAccess,
++    checkPermission(pc, path, doCheckOwner, ancestorAccess,
+             parentAccess, access, subAccess, false, true);
+   }
+ 
+-  /**
+-   * Check whether current user have permissions to access the path. For more
+-   * details of the parameters, see
+-   * {@link FSPermissionChecker#checkPermission}.
+-   */
+   private void checkPermission(FSPermissionChecker pc,
+       String path, boolean doCheckOwner, FsAction ancestorAccess,
+       FsAction parentAccess, FsAction access, FsAction subAccess,
+       boolean ignoreEmptyDir, boolean resolveLink)
+       throws AccessControlException, UnresolvedLinkException {
+-    if (!pc.isSuperUser()) {
+-      waitForLoadingFSImage();
+-      readLock();
+-      try {
+-        pc.checkPermission(path, dir, doCheckOwner, ancestorAccess,
+-            parentAccess, access, subAccess, ignoreEmptyDir, resolveLink);
+-      } finally {
+-        readUnlock();
+-      }
+-    }
++    dir.checkPermission(pc, path, doCheckOwner, ancestorAccess, parentAccess,
++        access, subAccess, ignoreEmptyDir, resolveLink);
+   }
+   
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSPermissionChecker.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSPermissionChecker.java
+index c2ca983..4ae8d26 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSPermissionChecker.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSPermissionChecker.java
+@@ -75,7 +75,7 @@
+   private INodeDirectory inodeRoot;
+ 
+   @Before
+-  public void setUp() {
++  public void setUp() throws IOException {
+     Configuration conf = new Configuration();
+     FSNamesystem fsn = mock(FSNamesystem.class);
+     doAnswer(new Answer() {
+-- 
+1.7.9.5
+

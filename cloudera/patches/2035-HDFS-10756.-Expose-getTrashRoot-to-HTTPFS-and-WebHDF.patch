@@ -1,0 +1,748 @@
+From 4153ea884a3a1ecf1861299fef3d578091290504 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Fri, 4 Nov 2016 18:06:55 -0700
+Subject: [PATCH 2035/2848] HDFS-10756. Expose getTrashRoot to HTTPFS and
+ WebHDFS. Contributed by Yuanbo Liu.
+
+(cherry picked from commit d8bab3dcb693b2773ede9a6e4f71ae85ee056f79)
+(cherry picked from commit f30d33876651ce34b4e8d8e5dd66ec822cd62859)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/web/resources/GetOpParam.java
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/site/markdown/index.md
+	hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/BaseTestHttpFSWith.java
+	hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/WebHDFS.md
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/web/TestWebHDFS.java
+
+Change-Id: I64bd5bcb86a62cb3e573290db46560aa6de31a3b
+---
+ .../main/java/org/apache/hadoop/fs/FileSystem.java |    3 +-
+ .../hadoop/fs/http/client/HttpFSFileSystem.java    |   31 +++-
+ .../apache/hadoop/fs/http/server/FSOperations.java |   23 +++
+ .../fs/http/server/HttpFSParametersProvider.java   |    1 +
+ .../apache/hadoop/fs/http/server/HttpFSServer.java |    7 +
+ .../hadoop-hdfs-httpfs/src/site/apt/index.apt.vm   |    2 +
+ .../hadoop/fs/http/client/BaseTestHttpFSWith.java  |  180 ++++++++++++--------
+ .../hadoop/fs/http/server/TestHttpFSServer.java    |   70 +++++++-
+ .../apache/hadoop/hdfs/DFSOpsCountStatistics.java  |    1 +
+ .../web/resources/NamenodeWebHdfsMethods.java      |   12 ++
+ .../apache/hadoop/hdfs/web/WebHdfsFileSystem.java  |   21 +++
+ .../hadoop/hdfs/web/resources/GetOpParam.java      |    1 +
+ .../hadoop-hdfs/src/site/apt/WebHDFS.apt.vm        |   39 +++++
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |   40 ++++-
+ .../org/apache/hadoop/hdfs/web/TestWebHDFS.java    |   22 +++
+ 15 files changed, 371 insertions(+), 82 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+index fd3fd1c..4c584f8 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+@@ -109,6 +109,7 @@
+   public static final int SHUTDOWN_HOOK_PRIORITY = 10;
+ 
+   public static final String TRASH_PREFIX = ".Trash";
++  public static final String USER_HOME_PREFIX = "/user";
+ 
+   /** FileSystem cache */
+   static final Cache CACHE = new Cache();
+@@ -1911,7 +1912,7 @@ public LocatedFileStatus next() throws IOException {
+    */
+   public Path getHomeDirectory() {
+     return this.makeQualified(
+-        new Path("/user/"+System.getProperty("user.name")));
++        new Path(USER_HOME_PREFIX + "/" + System.getProperty("user.name")));
+   }
+ 
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
+index 30c9947..2a2d724 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
+@@ -125,6 +125,8 @@
+ 
+   public static final String HOME_DIR_JSON = "Path";
+ 
++  public static final String TRASH_DIR_JSON = "Path";
++
+   public static final String SET_REPLICATION_JSON = "boolean";
+ 
+   public static final String UPLOAD_CONTENT_TYPE= "application/octet-stream";
+@@ -200,7 +202,7 @@ public static FILE_TYPE getType(FileStatus fileStatus) {
+     OPEN(HTTP_GET), GETFILESTATUS(HTTP_GET), LISTSTATUS(HTTP_GET),
+     GETHOMEDIRECTORY(HTTP_GET), GETCONTENTSUMMARY(HTTP_GET),
+     GETFILECHECKSUM(HTTP_GET),  GETFILEBLOCKLOCATIONS(HTTP_GET),
+-    INSTRUMENTATION(HTTP_GET), GETACLSTATUS(HTTP_GET),
++    INSTRUMENTATION(HTTP_GET), GETACLSTATUS(HTTP_GET), GETTRASHROOT(HTTP_GET),
+     APPEND(HTTP_POST), CONCAT(HTTP_POST),
+     CREATE(HTTP_PUT), MKDIRS(HTTP_PUT), RENAME(HTTP_PUT), SETOWNER(HTTP_PUT),
+     SETPERMISSION(HTTP_PUT), SETREPLICATION(HTTP_PUT), SETTIMES(HTTP_PUT),
+@@ -798,6 +800,33 @@ public Path getHomeDirectory() {
+   }
+ 
+   /**
++   * Get the root directory of Trash for a path in HDFS.
++   * 1. File in encryption zone returns /ez1/.Trash/username.
++   * 2. File not in encryption zone, or encountered exception when checking
++   *    the encryption zone of the path, returns /users/username/.Trash.
++   * Caller appends either Current or checkpoint timestamp
++   * for trash destination.
++   * The default implementation returns "/user/username/.Trash".
++   * @param fullPath the trash root of the path to be determined.
++   * @return trash root
++   */
++  @Override
++  public Path getTrashRoot(Path fullPath) {
++    Map<String, String> params = new HashMap<>();
++    params.put(OP_PARAM, Operation.GETTRASHROOT.toString());
++    try {
++      HttpURLConnection conn = getConnection(
++              Operation.GETTRASHROOT.getMethod(), params, fullPath, true);
++      HttpExceptionUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++      JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
++      return new Path((String) json.get(TRASH_DIR_JSON));
++    } catch (IOException ex) {
++      LOG.warn("Cannot find trash root of " + fullPath, ex);
++      return super.getTrashRoot(fullPath);
++    }
++  }
++
++  /**
+    * Set owner of a path (i.e. a file or a directory).
+    * The parameters username and groupname cannot both be null.
+    *
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/FSOperations.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/FSOperations.java
+index bb528f8..9dea346 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/FSOperations.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/FSOperations.java
+@@ -1008,6 +1008,29 @@ public Void execute(FileSystem fs) throws IOException {
+   }
+ 
+   /**
++   * Executor that performs getting trash root FileSystemAccess
++   * files system operation.
++   */
++  @InterfaceAudience.Private
++  public static class FSTrashRoot
++      implements FileSystemAccess.FileSystemExecutor<JSONObject> {
++    private Path path;
++    public FSTrashRoot(String path) {
++      this.path = new Path(path);
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public JSONObject execute(FileSystem fs) throws IOException {
++      Path trashRoot = fs.getTrashRoot(this.path);
++      JSONObject json = new JSONObject();
++      json.put(HttpFSFileSystem.TRASH_DIR_JSON, trashRoot.toUri().getPath());
++      return json;
++    }
++
++  }
++
++  /**
+    * Executor that gets the ACL information for a given file.
+    */
+   @InterfaceAudience.Private
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
+index f77b1b5..cdfa145 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
+@@ -59,6 +59,7 @@
+     PARAMS_DEF.put(Operation.GETFILECHECKSUM, new Class[]{});
+     PARAMS_DEF.put(Operation.GETFILEBLOCKLOCATIONS, new Class[]{});
+     PARAMS_DEF.put(Operation.GETACLSTATUS, new Class[]{});
++    PARAMS_DEF.put(Operation.GETTRASHROOT, new Class[]{});
+     PARAMS_DEF.put(Operation.INSTRUMENTATION, new Class[]{});
+     PARAMS_DEF.put(Operation.APPEND, new Class[]{DataParam.class});
+     PARAMS_DEF.put(Operation.CONCAT, new Class[]{SourcesParam.class});
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
+index 4eeb7e0..2f42959 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
+@@ -332,6 +332,13 @@ public InputStream run() throws Exception {
+       response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+       break;
+     }
++    case GETTRASHROOT: {
++      FSOperations.FSTrashRoot command = new FSOperations.FSTrashRoot(path);
++      JSONObject json = fsExecute(user, command);
++      AUDIT_LOG.info("[{}]", path);
++      response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++      break;
++    }
+     default: {
+       throw new IOException(
+           MessageFormat.format("Invalid HTTP GET operation [{0}]", op.value()));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/site/apt/index.apt.vm b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/site/apt/index.apt.vm
+index 2920cd9..4282f49 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/site/apt/index.apt.vm
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/site/apt/index.apt.vm
+@@ -57,6 +57,8 @@ Hadoop HDFS over HTTP - Documentation Sets ${project.version}
+   * <<<$ curl http://httpfs-host:14000/webhdfs/v1/user/foo?op=list>>> returns the
+   contents of the HDFS <<</user/foo>>> directory in JSON format.
+ 
++  * <<<$ curl http://httpfs-host:14000/webhdfs/v1/user/foo?op=GETTRASHROOT>>> returns the path <<</user/foo/.Trash>>>, if <<</>>> is an encrypted zone, returns the path <<</.Trash/foo>>>. See {{{../hadoop-project-dist/hadoop-hdfs/TransparentEncryption.html#Rename_and_Trash_considerations}more details}} about trash path in an encrypted zone.
++
+   * <<<$ curl -X POST http://httpfs-host:14000/webhdfs/v1/user/foo/bar?op=mkdirs>>>
+   creates the HDFS <<</user/foo.bar>>> directory.
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/BaseTestHttpFSWith.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/BaseTestHttpFSWith.java
+index ec00ba0..2b9b2fd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/BaseTestHttpFSWith.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/BaseTestHttpFSWith.java
+@@ -403,6 +403,35 @@ private void testWorkingdirectory() throws Exception {
+         new Path("/tmp").toUri().getPath());
+   }
+ 
++  private void testTrashRoot() throws Exception {
++    if (!isLocalFS()) {
++      FileSystem fs = FileSystem.get(getProxiedFSConf());
++
++      final Path rootDir = new Path("/");
++      final Path fooPath = new Path(getProxiedFSTestDir(), "foo.txt");
++      OutputStream os = fs.create(fooPath);
++      os.write(1);
++      os.close();
++
++      Path trashPath = fs.getTrashRoot(rootDir);
++      Path fooTrashPath = fs.getTrashRoot(fooPath);
++      fs.close();
++
++      fs = getHttpFSFileSystem();
++      Path httpFSTrashPath = fs.getTrashRoot(rootDir);
++      Path httpFSFooTrashPath = fs.getTrashRoot(fooPath);
++      fs.close();
++
++      assertEquals(trashPath.toUri().getPath(),
++          httpFSTrashPath.toUri().getPath());
++      assertEquals(fooTrashPath.toUri().getPath(),
++          httpFSFooTrashPath.toUri().getPath());
++      // trash path is related to USER, not path
++      assertEquals(trashPath.toUri().getPath(),
++          fooTrashPath.toUri().getPath());
++    }
++  }
++
+   private void testMkdirs() throws Exception {
+     Path path = new Path(getProxiedFSTestDir(), "foo");
+     FileSystem fs = getHttpFSFileSystem();
+@@ -886,85 +915,90 @@ private void testEncryption() throws Exception {
+   }
+ 
+   protected enum Operation {
+-    GET, OPEN, CREATE, APPEND, CONCAT, RENAME, DELETE, LIST_STATUS, 
++    GET, OPEN, CREATE, APPEND, CONCAT, RENAME, DELETE, LIST_STATUS,
+     WORKING_DIRECTORY, MKDIRS, SET_TIMES, SET_PERMISSION, SET_OWNER, 
+     SET_REPLICATION, CHECKSUM, CONTENT_SUMMARY, FILEACLS, DIRACLS, SET_XATTR,
+-    GET_XATTRS, REMOVE_XATTR, LIST_XATTRS, ENCRYPTION, LIST_STATUS_BATCH
++    GET_XATTRS, REMOVE_XATTR, LIST_XATTRS, ENCRYPTION, LIST_STATUS_BATCH,
++    GETTRASHROOT
+   }
+ 
+   private void operation(Operation op) throws Exception {
+     switch (op) {
+-      case GET:
+-        testGet();
+-        break;
+-      case OPEN:
+-        testOpen();
+-        break;
+-      case CREATE:
+-        testCreate();
+-        break;
+-      case APPEND:
+-        testAppend();
+-        break;
+-      case CONCAT:
+-        testConcat();
+-      case RENAME:
+-        testRename();
+-        break;
+-      case DELETE:
+-        testDelete();
+-        break;
+-      case LIST_STATUS:
+-        testListStatus();
+-        break;
+-      case WORKING_DIRECTORY:
+-        testWorkingdirectory();
+-        break;
+-      case MKDIRS:
+-        testMkdirs();
+-        break;
+-      case SET_TIMES:
+-        testSetTimes();
+-        break;
+-      case SET_PERMISSION:
+-        testSetPermission();
+-        break;
+-      case SET_OWNER:
+-        testSetOwner();
+-        break;
+-      case SET_REPLICATION:
+-        testSetReplication();
+-        break;
+-      case CHECKSUM:
+-        testChecksum();
+-        break;
+-      case CONTENT_SUMMARY:
+-        testContentSummary();
+-        break;
+-      case FILEACLS:
+-        testFileAcls();
+-        break;
+-      case DIRACLS:
+-        testDirAcls();
+-        break;
+-      case SET_XATTR:
+-        testSetXAttr();
+-        break;
+-      case REMOVE_XATTR:
+-        testRemoveXAttr();
+-        break;
+-      case GET_XATTRS:
+-        testGetXAttrs();
+-        break;
+-      case LIST_XATTRS:
+-        testListXAttrs();
+-        break;
+-      case ENCRYPTION:
+-        testEncryption();
+-        break;
+-      case LIST_STATUS_BATCH:
+-        testListStatusBatch();
+-        break;
++    case GET:
++      testGet();
++      break;
++    case OPEN:
++      testOpen();
++      break;
++    case CREATE:
++      testCreate();
++      break;
++    case APPEND:
++      testAppend();
++      break;
++    case CONCAT:
++      testConcat();
++      break;
++    case RENAME:
++      testRename();
++      break;
++    case DELETE:
++      testDelete();
++      break;
++    case LIST_STATUS:
++      testListStatus();
++      break;
++    case WORKING_DIRECTORY:
++      testWorkingdirectory();
++      break;
++    case MKDIRS:
++      testMkdirs();
++      break;
++    case SET_TIMES:
++      testSetTimes();
++      break;
++    case SET_PERMISSION:
++      testSetPermission();
++      break;
++    case SET_OWNER:
++      testSetOwner();
++      break;
++    case SET_REPLICATION:
++      testSetReplication();
++      break;
++    case CHECKSUM:
++      testChecksum();
++      break;
++    case CONTENT_SUMMARY:
++      testContentSummary();
++      break;
++    case FILEACLS:
++      testFileAcls();
++      break;
++    case DIRACLS:
++      testDirAcls();
++      break;
++    case SET_XATTR:
++      testSetXAttr();
++      break;
++    case REMOVE_XATTR:
++      testRemoveXAttr();
++      break;
++    case GET_XATTRS:
++      testGetXAttrs();
++      break;
++    case LIST_XATTRS:
++      testListXAttrs();
++      break;
++    case ENCRYPTION:
++      testEncryption();
++      break;
++    case LIST_STATUS_BATCH:
++      testListStatusBatch();
++      break;
++    case GETTRASHROOT:
++      testTrashRoot();
++      break;
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+index c6a7a9d..22058ec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestHttpFSServer.java
+@@ -43,7 +43,6 @@
+ import java.util.Map;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.XAttrCodec;
+@@ -137,9 +136,9 @@ private void createHttpFSServer(boolean addDelegationTokenAuthHandler)
+     //HDFS configuration
+     File hadoopConfDir = new File(new File(homeDir, "conf"), "hadoop-conf");
+     hadoopConfDir.mkdirs();
+-    String fsDefaultName = TestHdfsHelper.getHdfsConf().get(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY);
+-    Configuration conf = new Configuration(false);
+-    conf.set(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY, fsDefaultName);
++    Configuration hdfsConf = TestHdfsHelper.getHdfsConf();
++    // Http Server's conf should be based on HDFS's conf
++    Configuration conf = new Configuration(hdfsConf);
+     conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY, true);
+     conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_XATTRS_ENABLED_KEY, true);
+     File hdfsSite = new File(hadoopConfDir, "hdfs-site.xml");
+@@ -347,6 +346,20 @@ private String getPerms ( String statusJson ) throws Exception {
+   }
+ 
+   /**
++   * Given the JSON output from the GETTRASHPATH call, return the
++   * 'path' value.
++   *
++   * @param statusJson JSON from GETTRASHPATH
++   * @return The value of 'path' in statusJson
++   * @throws Exception
++   */
++  private String getPath(String statusJson) throws Exception {
++    JSONParser parser = new JSONParser();
++    JSONObject details = (JSONObject) parser.parse(statusJson);
++    return (String) details.get("Path");
++  }
++
++  /**
+    * Given the JSON output from the GETACLSTATUS call, return the
+    * 'entries' value as a List<String>.
+    * @param statusJson JSON from GETACLSTATUS
+@@ -675,6 +688,40 @@ public void testPutNoOperation() throws Exception {
+   @TestDir
+   @TestJetty
+   @TestHdfs
++  public void testGetTrashRoot() throws Exception {
++    String user = HadoopUsersConfTestHelper.getHadoopUsers()[0];
++    createHttpFSServer(false);
++    String trashJson = getStatus("/", "GETTRASHROOT");
++    String trashPath = getPath(trashJson);
++
++    Path expectedPath = new Path(FileSystem.USER_HOME_PREFIX,
++        new Path(user, FileSystem.TRASH_PREFIX));
++    Assert.assertEquals(expectedPath.toUri().getPath(), trashPath);
++
++    byte[] array = new byte[]{0, 1, 2, 3};
++    FileSystem fs = FileSystem.get(TestHdfsHelper.getHdfsConf());
++    fs.mkdirs(new Path("/tmp"));
++    OutputStream os = fs.create(new Path("/tmp/foo"));
++    os.write(array);
++    os.close();
++
++    trashJson = getStatus("/tmp/foo", "GETTRASHROOT");
++    trashPath = getPath(trashJson);
++    Assert.assertEquals(expectedPath.toUri().getPath(), trashPath);
++
++    //TestHdfsHelp has already set up EZ environment
++    final Path ezFile = TestHdfsHelper.ENCRYPTED_FILE;
++    final Path ezPath = TestHdfsHelper.ENCRYPTION_ZONE;
++    trashJson = getStatus(ezFile.toUri().getPath(), "GETTRASHROOT");
++    trashPath = getPath(trashJson);
++    expectedPath = new Path(ezPath, new Path(FileSystem.TRASH_PREFIX, user));
++    Assert.assertEquals(expectedPath.toUri().getPath(), trashPath);
++  }
++
++  @Test
++  @TestDir
++  @TestJetty
++  @TestHdfs
+   public void testDelegationTokenOperations() throws Exception {
+     createHttpFSServer(true);
+ 
+@@ -754,6 +801,21 @@ public void testDelegationTokenOperations() throws Exception {
+     conn = (HttpURLConnection) url.openConnection();
+     Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
+                         conn.getResponseCode());
++
++    // getTrash test with delegation
++    url = new URL(TestJettyHelper.getJettyURL(),
++        "/webhdfs/v1/?op=GETTRASHROOT&delegation=" + tokenStr);
++    conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_FORBIDDEN,
++        conn.getResponseCode());
++
++    url = new URL(TestJettyHelper.getJettyURL(),
++        "/webhdfs/v1/?op=GETTRASHROOT");
++    conn = (HttpURLConnection) url.openConnection();
++    conn.setRequestProperty("Cookie",
++        AuthenticatedURL.AUTH_COOKIE  + "=" + tokenSigned);
++    Assert.assertEquals(HttpURLConnection.HTTP_OK,
++        conn.getResponseCode());
+   }
+ 
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOpsCountStatistics.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOpsCountStatistics.java
+index d631dd4..4b2a761 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOpsCountStatistics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOpsCountStatistics.java
+@@ -64,6 +64,7 @@
+     GET_STATUS(CommonStatisticNames.OP_GET_STATUS),
+     GET_STORAGE_POLICIES("op_get_storage_policies"),
+     GET_STORAGE_POLICY("op_get_storage_policy"),
++    GET_TRASH_ROOT("op_get_trash_root"),
+     GET_XATTR("op_get_xattr"),
+     LIST_LOCATED_STATUS(CommonStatisticNames.OP_LIST_LOCATED_STATUS),
+     LIST_STATUS(CommonStatisticNames.OP_LIST_STATUS),
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
+index d25f556..61eafd7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
+@@ -936,6 +936,11 @@ private Response get(
+       np.checkAccess(fullpath, FsAction.getFsAction(fsAction.getValue()));
+       return Response.ok().build();
+     }
++    case GETTRASHROOT: {
++      final String trashPath = getTrashRoot(fullpath, conf);
++      final String jsonStr = JsonUtil.toJsonString("Path", trashPath);
++      return Response.ok(jsonStr).type(MediaType.APPLICATION_JSON).build();
++    }
+     case LISTSTATUS_BATCH:
+     {
+       byte[] start = HdfsFileStatus.EMPTY_NAME;
+@@ -951,6 +956,13 @@ private Response get(
+     }
+   }
+ 
++  private static String getTrashRoot(String fullPath,
++      Configuration conf) throws IOException {
++    FileSystem fs = FileSystem.get(conf != null ? conf : new Configuration());
++    return fs.getTrashRoot(
++        new org.apache.hadoop.fs.Path(fullPath)).toUri().getPath();
++  }
++
+   private static DirectoryListing getDirectoryListing(final NamenodeProtocols np,
+       final String p, byte[] startAfter) throws IOException {
+     final DirectoryListing listing = np.getListing(p, startAfter, false);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+index e1deda1..08280fa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+@@ -1525,6 +1525,27 @@ public synchronized void cancelDelegationToken(final Token<?> token
+   }
+ 
+   @Override
++  public Path getTrashRoot(Path path) {
++    statistics.incrementReadOps(1);
++    storageStatistics.incrementOpCounter(OpType.GET_TRASH_ROOT);
++
++    final HttpOpParam.Op op = GetOpParam.Op.GETTRASHROOT;
++    try {
++      String strTrashPath = new FsPathResponseRunner<String>(op, path) {
++        @Override
++        String decodeResponse(Map<?, ?> json) throws IOException {
++          return JsonUtil.getPath(json);
++        }
++      }.run();
++      return new Path(strTrashPath).makeQualified(getUri(), null);
++    } catch(IOException e) {
++      LOG.warn("Cannot find trash root of " + path, e);
++      // keep the same behavior with dfs
++      return super.getTrashRoot(path).makeQualified(getUri(), null);
++    }
++  }
++
++  @Override
+   public void access(final Path path, final FsAction mode) throws IOException {
+     final HttpOpParam.Op op = GetOpParam.Op.CHECKACCESS;
+     new FsPathRunner(op, path, new FsActionParam(mode)).run();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/resources/GetOpParam.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/resources/GetOpParam.java
+index 9fc3633..99a7cd1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/resources/GetOpParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/resources/GetOpParam.java
+@@ -37,6 +37,7 @@
+     GET_BLOCK_LOCATIONS(false, HttpURLConnection.HTTP_OK),
+     GETACLSTATUS(false, HttpURLConnection.HTTP_OK),
+     GETXATTRS(false, HttpURLConnection.HTTP_OK),
++    GETTRASHROOT(false, HttpURLConnection.HTTP_OK),
+     LISTXATTRS(false, HttpURLConnection.HTTP_OK),
+ 
+     NULL(false, HttpURLConnection.HTTP_NOT_IMPLEMENTED),
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
+index 8674299..b9a5354 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/site/apt/WebHDFS.apt.vm
+@@ -67,6 +67,9 @@ WebHDFS REST API
+     * {{{Get Home Directory}<<<GETHOMEDIRECTORY>>>}}
+         (see  {{{../../api/org/apache/hadoop/fs/FileSystem.html}FileSystem}}.getHomeDirectory)
+ 
++    * {{{Get Trash Root}<<<GETTRASHROOT>>>}}
++        (see  {{{../../api/org/apache/hadoop/fs/FileSystem.html}FileSystem}}.getTrashRoot)
++
+     * {{{Get Delegation Token}<<<GETDELEGATIONTOKEN>>>}}
+         (see  {{{../../api/org/apache/hadoop/fs/FileSystem.html}FileSystem}}.getDelegationToken)
+ 
+@@ -833,6 +836,42 @@ Transfer-Encoding: chunked
+    {{{../../api/org/apache/hadoop/fs/FileSystem.html}FileSystem}}.getHomeDirectory
+ 
+ 
++** {Get Trash Root}
++
++  * Submit a HTTP GET request.
++
+++---------------------------------
++curl -i "http://<HOST>:<PORT>/webhdfs/v1/?op=GETTRASHROOT"
+++---------------------------------
++
++  The client receives a response with a {{{Path JSON Schema}<<<Path>>> JSON object}}:
++
+++---------------------------------
++HTTP/1.1 200 OK
++Content-Type: application/json
++Transfer-Encoding: chunked
++
++{"Path": "/user/username/.Trash"}
+++---------------------------------
++
++  If the path is an encrypted zone path and user has permission of the path, the client receives a response like this:
++
+++---------------------------------
++HTTP/1.1 200 OK
++Content-Type: application/json
++Transfer-Encoding: chunked
++
++{"Path": "/PATH/.Trash/username"}
+++---------------------------------
++
++  []
++
++  See also:
++  {{{../../api/org/apache/hadoop/fs/FileSystem.html}FileSystem}}.getTrashRoot
++
++  For more details about trash root in an encrypted zone, please refer to {{{./TransparentEncryption.html#Rename_and_Trash_considerations}Transparent Encryption Guide}}.
++
++
+ ** {Set Permission}
+ 
+   * Submit a HTTP PUT request.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index c0011ca..c16d493 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -1518,6 +1518,25 @@ public void testEncryptionZoneWithTrash() throws Exception {
+     DFSTestUtil.createFile(fs, nestedEZFile, len, (short) 1, 0xFEED);
+     verifyShellDeleteWithTrash(shell, topEZFile);
+     verifyShellDeleteWithTrash(shell, nestedEZFile);
++
++    //Test nested EZ with webHDFS
++    final WebHdfsFileSystem webFS = WebHdfsTestUtil.getWebHdfsFileSystem(
++        conf, WebHdfsFileSystem.SCHEME);
++    final String currentUser =
++        UserGroupInformation.getCurrentUser().getShortUserName();
++    final Path expectedTopTrash = new Path(topEZ,
++        new Path(FileSystem.TRASH_PREFIX, currentUser));
++    final Path expectedNestedTrash = new Path(nestedEZ,
++        new Path(FileSystem.TRASH_PREFIX, currentUser));
++
++    final Path topTrash = webFS.getTrashRoot(topEZFile);
++    final Path nestedTrash = webFS.getTrashRoot(nestedEZFile);
++
++    assertEquals(expectedTopTrash.toUri().getPath(),
++        topTrash.toUri().getPath());
++    assertEquals(expectedNestedTrash.toUri().getPath(),
++        nestedTrash.toUri().getPath());
++
+     verifyShellDeleteWithTrash(shell, nestedEZ);
+     verifyShellDeleteWithTrash(shell, topEZ);
+   }
+@@ -1526,6 +1545,8 @@ public void testEncryptionZoneWithTrash() throws Exception {
+   public void testRootDirEZTrash() throws Exception {
+     final HdfsAdmin dfsAdmin =
+         new HdfsAdmin(FileSystem.getDefaultUri(conf), conf);
++    final String currentUser =
++        UserGroupInformation.getCurrentUser().getShortUserName();
+     final Path rootDir = new Path("/");
+     dfsAdmin.createEncryptionZone(rootDir, TEST_KEY, NO_TRASH);
+     final Path encFile = new Path("/encFile");
+@@ -1538,10 +1559,23 @@ public void testRootDirEZTrash() throws Exception {
+ 
+     // Trash path should be consistent
+     // if root path is an encryption zone
+-    Path encFileTrash = shell.getCurrentTrashDir(encFile);
+-    Path rootDirTrash = shell.getCurrentTrashDir(rootDir);
++    Path encFileCurrentTrash = shell.getCurrentTrashDir(encFile);
++    Path rootDirCurrentTrash = shell.getCurrentTrashDir(rootDir);
+     assertEquals("Root trash should be equal with ezFile trash",
+-        encFileTrash, rootDirTrash);
++        encFileCurrentTrash, rootDirCurrentTrash);
++
++    // Use webHDFS client to test trash root path
++    final WebHdfsFileSystem webFS = WebHdfsTestUtil.getWebHdfsFileSystem(
++        conf, WebHdfsFileSystem.SCHEME);
++    final Path expectedTrash = new Path(rootDir,
++        new Path(FileSystem.TRASH_PREFIX, currentUser));
++
++    Path webHDFSTrash = webFS.getTrashRoot(encFile);
++    assertEquals(expectedTrash.toUri().getPath(),
++        webHDFSTrash.toUri().getPath());
++    assertEquals(encFileCurrentTrash.getParent().toUri().getPath(),
++        webHDFSTrash.toUri().getPath());
++
+   }
+ 
+   @Test
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/web/TestWebHDFS.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/web/TestWebHDFS.java
+index ef53230..da67f8d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/web/TestWebHDFS.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/web/TestWebHDFS.java
+@@ -828,4 +828,26 @@ public RetryAction shouldRetry(Exception e, int retries, int failovers,
+     webIn.close();
+     in.close();
+   }
++
++  @Test
++  public void testGetTrashRoot() throws Exception {
++    MiniDFSCluster cluster = null;
++    final Configuration conf = WebHdfsTestUtil.createConf();
++    final String currentUser =
++        UserGroupInformation.getCurrentUser().getShortUserName();
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0).build();
++      final WebHdfsFileSystem webFS = WebHdfsTestUtil.getWebHdfsFileSystem(
++          conf, WebHdfsFileSystem.SCHEME);
++
++      Path trashPath = webFS.getTrashRoot(new Path("/"));
++      Path expectedPath = new Path(FileSystem.USER_HOME_PREFIX,
++          new Path(currentUser, FileSystem.TRASH_PREFIX));
++      assertEquals(expectedPath.toUri().getPath(), trashPath.toUri().getPath());
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

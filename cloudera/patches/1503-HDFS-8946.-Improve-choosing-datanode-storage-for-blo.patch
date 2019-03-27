@@ -1,0 +1,359 @@
+From c67aa42407b3ab8cf69fcf12c7d1bbd749edde80 Mon Sep 17 00:00:00 2001
+From: yliu <yliu@apache.org>
+Date: Tue, 1 Sep 2015 08:51:32 +0800
+Subject: [PATCH 1503/2848] HDFS-8946. Improve choosing datanode storage for
+ block placement. (yliu)
+
+(cherry picked from commit d852ec1f77bcffa3db84c81ea374c45bcb2b19c1)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+
+Change-Id: I5c5814e780e947594dec84c974c34e5f33681a57
+---
+ .../BlockPlacementPolicyDefault.java               |  147 ++++++--------------
+ .../server/blockmanagement/DatanodeDescriptor.java |   37 +++--
+ .../blockmanagement/TestReplicationPolicy.java     |   26 +++-
+ 3 files changed, 92 insertions(+), 118 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index a0a84d2..036e34a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -25,12 +25,9 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+-import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.namenode.FSClusterStats;
+-import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage.State;
+ import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.net.NodeBase;
+@@ -456,19 +453,18 @@ protected DatanodeStorageInfo chooseLocalStorage(Node localMachine,
+         for (Iterator<Map.Entry<StorageType, Integer>> iter = storageTypes
+             .entrySet().iterator(); iter.hasNext(); ) {
+           Map.Entry<StorageType, Integer> entry = iter.next();
+-          for (DatanodeStorageInfo localStorage : DFSUtil.shuffle(
+-              localDatanode.getStorageInfos())) {
+-            StorageType type = entry.getKey();
+-            if (addIfIsGoodTarget(localStorage, excludedNodes, blocksize,
+-                results, type) >= 0) {
+-              int num = entry.getValue();
+-              if (num == 1) {
+-                iter.remove();
+-              } else {
+-                entry.setValue(num - 1);
+-              }
+-              return localStorage;
++          DatanodeStorageInfo localStorage = chooseStorage4Block(
++              localDatanode, blocksize, results, entry.getKey());
++          if (localStorage != null) {
++            // add node and related nodes to excludedNode
++            addToExcludedNodes(localDatanode, excludedNodes);
++            int num = entry.getValue();
++            if (num == 1) {
++              iter.remove();
++            } else {
++              entry.setValue(num - 1);
+             }
++            return localStorage;
+           }
+         }
+       } 
+@@ -649,7 +645,7 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+                             boolean avoidStaleNodes,
+                             EnumMap<StorageType, Integer> storageTypes)
+                             throws NotEnoughReplicasException {
+-      
++
+     int numOfAvailableNodes = clusterMap.countNumOfAvailableNodes(
+         scope, excludedNodes);
+     int refreshCounter = numOfAvailableNodes;
+@@ -668,49 +664,39 @@ protected DatanodeStorageInfo chooseRandom(int numOfReplicas,
+           builder.append("\nNode ").append(NodeBase.getPath(chosenNode)).append(" [");
+         }
+         numOfAvailableNodes--;
+-        if (!isGoodDatanode(chosenNode, maxNodesPerRack, considerLoad,
++        DatanodeStorageInfo storage = null;
++        if (isGoodDatanode(chosenNode, maxNodesPerRack, considerLoad,
+             results, avoidStaleNodes)) {
+-          if (LOG.isDebugEnabled()) {
+-            builder.append("\n]");
+-          }
+-          badTarget = true;
+-          continue;
+-        }
+-
+-        final DatanodeStorageInfo[] storages = DFSUtil.shuffle(
+-            chosenNode.getStorageInfos());
+-        int i = 0;
+-        boolean search = true;
+-        for (Iterator<Map.Entry<StorageType, Integer>> iter = storageTypes
+-            .entrySet().iterator(); search && iter.hasNext(); ) {
+-          Map.Entry<StorageType, Integer> entry = iter.next();
+-          for (i = 0; i < storages.length; i++) {
+-            StorageType type = entry.getKey();
+-            final int newExcludedNodes = addIfIsGoodTarget(storages[i],
+-                excludedNodes, blocksize, results, type);
+-            if (newExcludedNodes >= 0) {
++          for (Iterator<Map.Entry<StorageType, Integer>> iter = storageTypes
++              .entrySet().iterator(); iter.hasNext(); ) {
++            Map.Entry<StorageType, Integer> entry = iter.next();
++            storage = chooseStorage4Block(
++                chosenNode, blocksize, results, entry.getKey());
++            if (storage != null) {
+               numOfReplicas--;
+               if (firstChosen == null) {
+-                firstChosen = storages[i];
++                firstChosen = storage;
+               }
+-              numOfAvailableNodes -= newExcludedNodes;
++              // add node and related nodes to excludedNode
++              numOfAvailableNodes -=
++                  addToExcludedNodes(chosenNode, excludedNodes);
+               int num = entry.getValue();
+               if (num == 1) {
+                 iter.remove();
+               } else {
+                 entry.setValue(num - 1);
+               }
+-              search = false;
+               break;
+             }
+           }
+         }
++
+         if (LOG.isDebugEnabled()) {
+           builder.append("\n]");
+         }
+ 
+         // If no candidate storage was found on this DN then set badTarget.
+-        badTarget = (i == storages.length);
++        badTarget = (storage == null);
+       }
+       // Refresh the node count. If the live node count became smaller,
+       // but it is not reflected in this loop, it may loop forever in case
+@@ -747,32 +733,27 @@ protected DatanodeDescriptor chooseDataNode(final String scope) {
+   }
+ 
+   /**
+-   * If the given storage is a good target, add it to the result list and
+-   * update the set of excluded nodes.
+-   * @return -1 if the given is not a good target;
+-   *         otherwise, return the number of nodes added to excludedNodes set.
++   * Choose a good storage of given storage type from datanode, and add it to
++   * the result list.
++   *
++   * @param dnd datanode descriptor
++   * @param blockSize requested block size
++   * @param results the result storages
++   * @param storageType requested storage type
++   * @return the chosen datanode storage
+    */
+-  int addIfIsGoodTarget(DatanodeStorageInfo storage,
+-      Set<Node> excludedNodes,
++  DatanodeStorageInfo chooseStorage4Block(DatanodeDescriptor dnd,
+       long blockSize,
+       List<DatanodeStorageInfo> results,
+       StorageType storageType) {
+-    if (isGoodTarget(storage, blockSize, results, storageType)) {
++    DatanodeStorageInfo storage =
++        dnd.chooseStorage4Block(storageType, blockSize);
++    if (storage != null) {
+       results.add(storage);
+-      // add node and related nodes to excludedNode
+-      return addToExcludedNodes(storage.getDatanodeDescriptor(), excludedNodes);
+-    } else { 
+-      return -1;
+-    }
+-  }
+-
+-  private static void logNodeIsNotChosen(DatanodeStorageInfo storage, String reason) {
+-    if (LOG.isDebugEnabled()) {
+-      // build the error message for later use.
+-      debugLoggingBuilder.get()
+-          .append("\n  Storage ").append(storage)
+-          .append(" is not chosen since ").append(reason).append(".");
++    } else {
++      logNodeIsNotChosen(dnd, "no good storage to place the block ");
+     }
++    return storage;
+   }
+ 
+   private static void logNodeIsNotChosen(DatanodeDescriptor node,
+@@ -844,52 +825,6 @@ boolean isGoodDatanode(DatanodeDescriptor node,
+   }
+ 
+   /**
+-   * Determine if a storage is a good target.
+-   *
+-   * @param storage The target storage
+-   * @param blockSize Size of block
+-   * @param results A list containing currently chosen nodes. Used to check if
+-   *                too many nodes has been chosen in the target rack.
+-   * @return Return true if <i>node</i> has enough space.
+-   */
+-  private boolean isGoodTarget(DatanodeStorageInfo storage,
+-                               long blockSize,
+-                               List<DatanodeStorageInfo> results,
+-                               StorageType requiredStorageType) {
+-    if (storage.getStorageType() != requiredStorageType) {
+-      logNodeIsNotChosen(storage, "storage types do not match,"
+-          + " where the required storage type is " + requiredStorageType);
+-      return false;
+-    }
+-    if (storage.getState() == State.READ_ONLY_SHARED) {
+-      logNodeIsNotChosen(storage, "storage is read-only");
+-      return false;
+-    }
+-
+-    if (storage.getState() == State.FAILED) {
+-      logNodeIsNotChosen(storage, "storage has failed");
+-      return false;
+-    }
+-
+-    DatanodeDescriptor node = storage.getDatanodeDescriptor();
+-
+-    final long requiredSize = blockSize * HdfsConstants.MIN_BLOCKS_FOR_WRITE;
+-    final long scheduledSize = blockSize * node.getBlocksScheduled(storage.getStorageType());
+-    final long remaining =
+-        node.getRemaining(storage.getStorageType(), requiredSize);
+-    if (requiredSize > remaining - scheduledSize) {
+-      logNodeIsNotChosen(storage, "the node does not have enough "
+-          + storage.getStorageType() + " space"
+-          + " (required=" + requiredSize
+-          + ", scheduled=" + scheduledSize
+-          + ", remaining=" + remaining + ")");
+-      return false;
+-    }
+-
+-    return true;
+-  }
+-
+-  /**
+    * Return a pipeline of nodes.
+    * The pipeline is formed finding a shortest path that 
+    * starts from the writer and traverses all <i>nodes</i>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+index 369e105..1653753 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+@@ -31,14 +31,16 @@
+ import java.util.Set;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-
+ import com.google.common.collect.ImmutableList;
++
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.namenode.CachedBlock;
+ import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
+@@ -664,26 +666,39 @@ int getNumberOfBlocksToBeInvalidated() {
+   }
+ 
+   /**
+-   * Return the sum of remaining spaces of the specified type. If the remaining
+-   * space of a storage is less than minSize, it won't be counted toward the
+-   * sum.
++   * Find whether the datanode contains good storage of given type to
++   * place block of size <code>blockSize</code>.
+    *
+-   * @param t The storage type. If null, the type is ignored.
+-   * @param minSize The minimum free space required.
+-   * @return the sum of remaining spaces that are bigger than minSize.
++   * <p>Currently datanode only cares about the storage type, in this
++   * method, the first storage of given type we see is returned.
++   *
++   * @param t requested storage type
++   * @param blockSize requested block size
++   * @return
+    */
+-  public long getRemaining(StorageType t, long minSize) {
++  public DatanodeStorageInfo chooseStorage4Block(StorageType t,
++      long blockSize) {
++    final long requiredSize =
++        blockSize * HdfsConstants.MIN_BLOCKS_FOR_WRITE;
++    final long scheduledSize = blockSize * getBlocksScheduled(t);
+     long remaining = 0;
++    DatanodeStorageInfo storage = null;
+     for (DatanodeStorageInfo s : getStorageInfos()) {
+       if (s.getState() == State.NORMAL &&
+-          (t == null || s.getStorageType() == t)) {
++          s.getStorageType() == t) {
++        if (storage == null) {
++          storage = s;
++        }
+         long r = s.getRemaining();
+-        if (r >= minSize) {
++        if (r >= requiredSize) {
+           remaining += r;
+         }
+       }
+     }
+-    return remaining;
++    if (requiredSize > remaining - scheduledSize) {
++      return null;
++    }
++    return storage;
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index d906ca2..b9b4f72 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -184,7 +184,7 @@ private static boolean isOnSameRack(DatanodeStorageInfo left, DatanodeDescriptor
+    * considered.
+    */
+   @Test
+-  public void testChooseNodeWithMultipleStorages() throws Exception {
++  public void testChooseNodeWithMultipleStorages1() throws Exception {
+     updateHeartbeatWithUsage(dataNodes[5],
+         2* HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
+         (2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE)/3, 0L,
+@@ -204,6 +204,30 @@ public void testChooseNodeWithMultipleStorages() throws Exception {
+   }
+ 
+   /**
++   * Test whether all storages on the datanode are considered while
++   * choosing target to place block.
++   */
++  @Test
++  public void testChooseNodeWithMultipleStorages2() throws Exception {
++    updateHeartbeatWithUsage(dataNodes[5],
++        2* HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
++        (2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE)/3, 0L,
++        0L, 0L, 0, 0);
++
++    updateHeartbeatForExtraStorage(
++        2* HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
++        HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L);
++
++    DatanodeStorageInfo[] targets;
++    targets = chooseTarget (1, dataNodes[5],
++        new ArrayList<DatanodeStorageInfo>(), null);
++    assertEquals(1, targets.length);
++    assertEquals(dataNodes[5], targets[0].getDatanodeDescriptor());
++
++    resetHeartbeatForStorages();
++  }
++
++  /**
+    * In this testcase, client is dataNodes[0]. So the 1st replica should be
+    * placed on dataNodes[0], the 2nd replica should be placed on 
+    * different rack and third should be placed on different node
+-- 
+1.7.9.5
+

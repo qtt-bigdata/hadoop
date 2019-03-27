@@ -1,0 +1,534 @@
+From 9f9e53582cafd0474ae91b46b61d0a771dcc3e0b Mon Sep 17 00:00:00 2001
+From: Wei-Chiu Chuang <weichiu@cloudera.com>
+Date: Tue, 23 May 2017 13:39:10 -0700
+Subject: [PATCH 2491/2848] Revert "HDFS-10797. Disk usage summary of
+ snapshots causes renamed blocks to get counted
+ twice. Contributed by Sean Mackrory."
+
+This reverts commit 8cae66a79b5f2d1b04b955e9cda4d6d0c176f57a.
+
+Change-Id: Iefc79512d29490328bf51793ba5aa65c271ed31a
+---
+ .../namenode/ContentSummaryComputationContext.java |   95 +---------
+ .../apache/hadoop/hdfs/server/namenode/INode.java  |    1 -
+ .../hdfs/server/namenode/INodeDirectory.java       |   10 +-
+ .../hadoop/hdfs/server/namenode/INodeFile.java     |    1 -
+ .../hdfs/server/namenode/INodeReference.java       |    2 -
+ .../hadoop/hdfs/server/namenode/INodeSymlink.java  |    1 -
+ .../snapshot/DirectorySnapshottableFeature.java    |    8 +-
+ .../snapshot/DirectoryWithSnapshotFeature.java     |   13 +-
+ .../hdfs/server/namenode/snapshot/Snapshot.java    |    1 -
+ .../namenode/snapshot/TestRenameWithSnapshots.java |  199 --------------------
+ 10 files changed, 22 insertions(+), 309 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
+index 43f69ac..1780d87 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryComputationContext.java
+@@ -20,11 +20,6 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ 
+-import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
+-
+-import java.util.HashSet;
+-import java.util.Set;
+-
+ @InterfaceAudience.Private
+ @InterfaceStability.Unstable
+ public class ContentSummaryComputationContext {
+@@ -37,8 +32,6 @@
+   private long yieldCount = 0;
+   private long sleepMilliSec = 0;
+   private int sleepNanoSec = 0;
+-  private Set<INode> includedNodes = new HashSet<>();
+-  private Set<INode> deletedSnapshottedNodes = new HashSet<>();
+ 
+   /**
+    * Constructor
+@@ -55,8 +48,8 @@ public ContentSummaryComputationContext(FSDirectory dir,
+     this.fsn = fsn;
+     this.limitPerRun = limitPerRun;
+     this.nextCountLimit = limitPerRun;
+-    setCounts(Content.Counts.newInstance());
+-    setSnapshotCounts(this.snapshotCounts = Content.Counts.newInstance());
++    this.counts = Content.Counts.newInstance();
++    this.snapshotCounts = Content.Counts.newInstance();
+     this.sleepMilliSec = sleepMicroSec/1000;
+     this.sleepNanoSec = (int)((sleepMicroSec%1000)*1000);
+   }
+@@ -85,7 +78,6 @@ public boolean yield() {
+     }
+ 
+     // Have we reached the limit?
+-    Content.Counts counts = getCounts();
+     long currentCount = counts.get(Content.FILE) +
+         counts.get(Content.SYMLINK) +
+         counts.get(Content.DIRECTORY) +
+@@ -127,92 +119,11 @@ public boolean yield() {
+   }
+ 
+   /** Get the content counts */
+-  public synchronized Content.Counts getCounts() {
++  public Content.Counts getCounts() {
+     return counts;
+   }
+ 
+-  private synchronized void setCounts(Content.Counts counts) {
+-    this.counts = counts;
+-  }
+-
+   public Content.Counts getSnapshotCounts() {
+     return snapshotCounts;
+   }
+-
+-  private void setSnapshotCounts(Content.Counts snapshotCounts) {
+-    this.snapshotCounts = snapshotCounts;
+-  }
+-
+-  /**
+-   * If the node is an INodeReference, resolves it to the actual inode.
+-   * Snapshot diffs represent renamed / moved files as different
+-   * INodeReferences, but the underlying INode it refers to is consistent.
+-   *
+-   * @param node
+-   * @return The referred INode if there is one, else returns the input
+-   * unmodified.
+-   */
+-  private INode resolveINodeReference(INode node) {
+-    if (node.isReference() && node instanceof INodeReference) {
+-      return ((INodeReference)node).getReferredINode();
+-    }
+-    return node;
+-  }
+-
+-  /**
+-   * Reports that a node is about to be included in this summary. Can be used
+-   * either to simply report that a node has been including, or check whether
+-   * a node has already been included.
+-   *
+-   * @param node
+-   * @return true if node has already been included
+-   */
+-  public boolean nodeIncluded(INode node) {
+-    INode resolvedNode = resolveINodeReference(node);
+-    synchronized (includedNodes) {
+-      if (!includedNodes.contains(resolvedNode)) {
+-        includedNodes.add(resolvedNode);
+-        return false;
+-      }
+-    }
+-    return true;
+-  }
+-
+-  /**
+-   * Schedules a node that is listed as DELETED in a snapshot's diff to be
+-   * included in the summary at the end of computation. See
+-   * {@link #tallyDeletedSnapshottedINodes()} for more context.
+-   *
+-   * @param node
+-   */
+-  public void reportDeletedSnapshottedNode(INode node) {
+-    deletedSnapshottedNodes.add(node);
+-  }
+-
+-  /**
+-   * Finalizes the computation by including all nodes that were reported as
+-   * deleted by a snapshot but have not been already including due to other
+-   * references.
+-   * <p>
+-   * Nodes that get renamed are listed in the snapshot's diff as both DELETED
+-   * under the old name and CREATED under the new name. The computation
+-   * relies on nodes to report themselves as being included (via
+-   * {@link #nodeIncluded(INode)} as the only reliable way to determine which
+-   * nodes were renamed within the tree being summarized and which were
+-   * removed (either by deletion or being renamed outside of the tree).
+-   */
+-  public synchronized void tallyDeletedSnapshottedINodes() {
+-    /* Temporarily create a new counts object so these results can then be
+-    added to both counts and snapshotCounts */
+-    Content.Counts originalCounts = getCounts();
+-    setCounts(Content.Counts.newInstance());
+-    for (INode node : deletedSnapshottedNodes) {
+-      if (!nodeIncluded(node)) {
+-        node.computeContentSummary(Snapshot.CURRENT_STATE_ID, this);
+-      }
+-    }
+-    originalCounts.add(getCounts());
+-    snapshotCounts.add(getCounts());
+-    setCounts(originalCounts);
+-  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+index eed9ffd..cb50475 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+@@ -508,7 +508,6 @@ public final ContentSummary computeContentSummary() {
+   public final ContentSummary computeAndConvertContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+     computeContentSummary(snapshotId, summary);
+-    summary.tallyDeletedSnapshottedINodes();
+     final Content.Counts counts = summary.getCounts();
+     final Content.Counts snapshotCounts = summary.getSnapshotCounts();
+     final Quota.Counts q = getQuotaCounts();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+index 359870b..c68202d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+@@ -608,10 +608,16 @@ private void addChild(final INode node, final int insertionPoint) {
+   @Override
+   public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+-    summary.nodeIncluded(this);
+     final DirectoryWithSnapshotFeature sf = getDirectoryWithSnapshotFeature();
+     if (sf != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
+-      sf.computeContentSummary4Snapshot(summary);
++      final Content.Counts counts = Content.Counts.newInstance();
++      // if the getContentSummary call is against a non-snapshot path, the
++      // computation should include all the deleted files/directories
++      sf.computeContentSummary4Snapshot(counts);
++      summary.getCounts().add(counts);
++      // Also add ContentSummary to snapshotCounts (So we can extract it
++      // later from the ContentSummary of all).
++      summary.getSnapshotCounts().add(counts);
+     }
+     final DirectoryWithQuotaFeature q = getDirectoryWithQuotaFeature();
+     if (q != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+index b961906..76e6202 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+@@ -561,7 +561,6 @@ public String getName() {
+   @Override
+   public final ContentSummaryComputationContext computeContentSummary(
+       int snapshotId, final ContentSummaryComputationContext summary) {
+-    summary.nodeIncluded(this);
+     computeContentSummary4Snapshot(summary.getCounts());
+     computeContentSummary4Current(snapshotId, summary.getCounts());
+     return summary;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
+index a1e7071..105ae8b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
+@@ -346,7 +346,6 @@ public void destroyAndCollectBlocks(
+   @Override
+   public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+-    summary.nodeIncluded(this);
+     return referred.computeContentSummary(snapshotId, summary);
+   }
+ 
+@@ -535,7 +534,6 @@ public int getLastSnapshotId() {
+     @Override
+     public final ContentSummaryComputationContext computeContentSummary(
+         int snapshotId, ContentSummaryComputationContext summary) {
+-      summary.nodeIncluded(this);
+       final int s = snapshotId < lastSnapshotId ? snapshotId : lastSnapshotId;
+       //only count diskspace for WithName
+       final Quota.Counts q = Quota.Counts.newInstance();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
+index 35af0c3..a85e60c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
+@@ -98,7 +98,6 @@ public void destroyAndCollectBlocks(final BlocksMapUpdateInfo collectedBlocks,
+   @Override
+   public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       final ContentSummaryComputationContext summary) {
+-    summary.nodeIncluded(this);
+     summary.getCounts().add(Content.SYMLINK, 1);
+     return summary;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+index 75865c5..1a69645 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+@@ -31,7 +31,6 @@
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+ import org.apache.hadoop.hdfs.protocol.SnapshotException;
+ import org.apache.hadoop.hdfs.server.namenode.Content;
+-import org.apache.hadoop.hdfs.server.namenode.ContentSummaryComputationContext;
+ import org.apache.hadoop.hdfs.server.namenode.INode;
+ import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo;
+ import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
+@@ -252,13 +251,10 @@ public Snapshot removeSnapshot(INodeDirectory snapshotRoot,
+   }
+ 
+   @Override
+-  public void computeContentSummary4Snapshot(ContentSummaryComputationContext
+-                                                   context) {
+-    super.computeContentSummary4Snapshot(context);
+-    Content.Counts counts = context.getCounts();
++  public void computeContentSummary4Snapshot(final Content.Counts counts) {
+     counts.add(Content.SNAPSHOT, snapshotsByNames.size());
+     counts.add(Content.SNAPSHOTTABLE_DIRECTORY, 1);
+-    super.computeContentSummary4Snapshot(context);
++    super.computeContentSummary4Snapshot(counts);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+index 2b32174..aef7aea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+@@ -28,6 +28,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
++import org.apache.hadoop.hdfs.server.namenode.Content;
+ import org.apache.hadoop.hdfs.server.namenode.ContentSummaryComputationContext;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageSerialization;
+ import org.apache.hadoop.hdfs.server.namenode.INode;
+@@ -650,13 +651,17 @@ public void clear(INodeDirectory currentINode,
+     return counts;
+   }
+ 
+-  public void computeContentSummary4Snapshot(
+-      ContentSummaryComputationContext context) {
++  public void computeContentSummary4Snapshot(final Content.Counts counts) {
++    // Create a new blank summary context for blocking processing of subtree.
++    ContentSummaryComputationContext summary = 
++        new ContentSummaryComputationContext();
+     for(DirectoryDiff d : diffs) {
+-      for(INode deletedNode : d.getChildrenDiff().getList(ListType.DELETED)) {
+-        context.reportDeletedSnapshottedNode(deletedNode);
++      for(INode deleted : d.getChildrenDiff().getList(ListType.DELETED)) {
++        deleted.computeContentSummary(Snapshot.CURRENT_STATE_ID, summary);
+       }
+     }
++    // Add the counts from deleted trees.
++    counts.add(summary.getCounts());
+   }
+   
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+index c315fa3..1d1948a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+@@ -177,7 +177,6 @@ public INode getChild(byte[] name, int snapshotId) {
+     @Override
+     public ContentSummaryComputationContext computeContentSummary(
+         int snapshotId, ContentSummaryComputationContext summary) {
+-      summary.nodeIncluded(this);
+       return computeDirectoryContentSummary(summary, snapshotId);
+     }
+     
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
+index 2efa060..23a280d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
+@@ -36,10 +36,8 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileStatus;
+-import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Options.Rename;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -2410,201 +2408,4 @@ public void testRenameWithOverWrite() throws Exception {
+     assertTrue(existsInDiffReport(entries, DiffType.RENAME, "foo/file2", "newDir/file2"));
+     assertTrue(existsInDiffReport(entries, DiffType.RENAME, "foo/file3", "newDir/file1"));
+   }
+-
+-  private void checkSpaceConsumed(String message, Path directory,
+-                                  long expectedSpace) throws Exception {
+-    ContentSummary summary = hdfs.getContentSummary(directory);
+-    assertEquals(message, expectedSpace, summary.getSpaceConsumed());
+-  }
+-
+-  /**
+-   * Runs through various combinations of renames, deletes, appends and other
+-   * operations in a snapshotted directory and ensures disk usage summaries
+-   * (e.g. du -s) are computed correctly.
+-   *
+-   * @throws Exception
+-   */
+-  @Test (timeout=300000)
+-  public void testDu() throws Exception {
+-    File tempFile = File.createTempFile("testDu-", ".tmp");
+-    tempFile.deleteOnExit();
+-
+-    final FileSystem localfs = FileSystem.getLocal(conf);
+-    final Path localOriginal = new Path(tempFile.getPath());
+-    final Path dfsRoot = new Path("/testDu");
+-    final Path dfsOriginal = new Path(dfsRoot, "original");
+-    final Path dfsRenamed1 = new Path(dfsRoot, "renamed1");
+-    final Path dfsRenamed2 = new Path(dfsRoot, "renamed2");
+-    final Path dfsAppended = new Path(dfsRoot, "appended");
+-
+-    /* We will test with a single block worth of data. If we don't at least use
+-    a multiple of BLOCKSIZE, append operations will modify snapshotted blocks
+-    and other factors will come into play here that we'll have to account for */
+-    final long spaceIncrement = BLOCKSIZE * REPL;
+-    final byte[] appendData = new byte[(int) BLOCKSIZE];
+-    DFSTestUtil.createFile(localfs, localOriginal, BLOCKSIZE, REPL, SEED);
+-
+-    FSDataOutputStream out = null;
+-    long expectedSpace = 0;
+-
+-    hdfs.mkdirs(dfsRoot);
+-    checkSpaceConsumed("Du is wrong immediately",
+-        dfsRoot, 0L);
+-
+-    hdfs.copyFromLocalFile(localOriginal, dfsOriginal);
+-    expectedSpace += spaceIncrement;
+-    checkSpaceConsumed("Du is wrong after creating / copying file",
+-        dfsRoot, expectedSpace);
+-
+-    SnapshotTestHelper.createSnapshot(hdfs, dfsRoot, "s0");
+-    checkSpaceConsumed("Du is wrong after snapshotting",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.rename(dfsOriginal, dfsRenamed1);
+-    checkSpaceConsumed("Du is wrong after 1 rename",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.rename(dfsRenamed1, dfsRenamed2);
+-    checkSpaceConsumed("Du is wrong after 2 renames",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.delete(dfsRenamed2, false);
+-    checkSpaceConsumed("Du is wrong after deletion",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.copyFromLocalFile(localOriginal, dfsOriginal);
+-    expectedSpace += spaceIncrement;
+-    checkSpaceConsumed("Du is wrong after replacing a renamed file",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.copyFromLocalFile(localOriginal, dfsAppended);
+-    expectedSpace += spaceIncrement;
+-    SnapshotTestHelper.createSnapshot(hdfs, dfsRoot, "s1");
+-
+-    out = hdfs.append(dfsAppended);
+-    out.write(appendData);
+-    out.close();
+-    expectedSpace += spaceIncrement;
+-    checkSpaceConsumed("Du is wrong after 1 snapshot + append",
+-        dfsRoot, expectedSpace);
+-
+-    SnapshotTestHelper.createSnapshot(hdfs, dfsRoot, "s2");
+-    out = hdfs.append(dfsAppended);
+-    out.write(appendData);
+-    out.close();
+-    expectedSpace += spaceIncrement;
+-    checkSpaceConsumed("Du is wrong after 2 snapshot + appends",
+-        dfsRoot, expectedSpace);
+-
+-    SnapshotTestHelper.createSnapshot(hdfs, dfsRoot, "s3");
+-    out = hdfs.append(dfsAppended);
+-    out.write(appendData);
+-    out.close();
+-    expectedSpace += spaceIncrement;
+-    hdfs.rename(dfsAppended, dfsRenamed1);
+-    checkSpaceConsumed("Du is wrong after snapshot, append, & rename",
+-        dfsRoot, expectedSpace);
+-    hdfs.delete(dfsRenamed1, false);
+-    // everything but the last append is snapshotted
+-    expectedSpace -= spaceIncrement;
+-    checkSpaceConsumed("Du is wrong after snapshot, append, delete & rename",
+-        dfsRoot, expectedSpace);
+-
+-    hdfs.delete(dfsOriginal, false);
+-    hdfs.deleteSnapshot(dfsRoot, "s0");
+-    hdfs.deleteSnapshot(dfsRoot, "s1");
+-    hdfs.deleteSnapshot(dfsRoot, "s2");
+-    hdfs.deleteSnapshot(dfsRoot, "s3");
+-    expectedSpace = 0;
+-    checkSpaceConsumed("Du is wrong after deleting all files and snapshots",
+-        dfsRoot, expectedSpace);
+-  }
+-
+-  /**
+-   * Runs through various combinations of renames, deletes, appends and other
+-   * operations between two snapshotted directories and ensures disk usage
+-   * summaries (e.g. du -s) are computed correctly.
+-   *
+-   * This test currently assumes some incorrect behavior when files have been
+-   * moved between subdirectories of the one being queried. In the cases
+-   * below, only 1 block worth of data should ever actually be used. However
+-   * if there are 2 - 3 subdirectories that do contained or have contained
+-   * when snapshotted the same file, that file will be counted 2-3 times,
+-   * respectively, since each directory is computed independently recursively.
+-   *
+-   * @throws Exception
+-   */
+-  @Test (timeout=300000)
+-  public void testDuMultipleDirs() throws Exception {
+-    File tempFile = File.createTempFile("testDuMultipleDirs-", "" + ".tmp");
+-    tempFile.deleteOnExit();
+-
+-    final FileSystem localfs = FileSystem.getLocal(conf);
+-    final Path localOriginal = new Path(tempFile.getPath());
+-    final Path dfsRoot = new Path("/testDuMultipleDirs");
+-    final Path snapshottable1 = new Path(dfsRoot, "snapshottable1");
+-    final Path snapshottable2 = new Path(dfsRoot, "snapshottable2");
+-    final Path nonsnapshottable = new Path(dfsRoot, "nonsnapshottable");
+-    final Path subdirectory = new Path(snapshottable1, "subdirectory");
+-    final Path dfsOriginal = new Path(snapshottable1, "file");
+-    final Path renamedNonsnapshottable = new Path(nonsnapshottable, "file");
+-    final Path renamedSnapshottable = new Path(snapshottable2, "file");
+-    final Path renamedSubdirectory = new Path(subdirectory, "file");
+-
+-    /* We will test with a single block worth of data. If we don't at least use
+-    a multiple of BLOCKSIZE, append operations will modify snapshotted blocks
+-    and other factors will come into play here that we'll have to account for */
+-    final long spaceConsumed = BLOCKSIZE * REPL;
+-    DFSTestUtil.createFile(localfs, localOriginal, BLOCKSIZE, REPL, SEED);
+-
+-    hdfs.mkdirs(snapshottable1);
+-    hdfs.mkdirs(snapshottable2);
+-    hdfs.mkdirs(nonsnapshottable);
+-    hdfs.mkdirs(subdirectory);
+-    checkSpaceConsumed("Du is wrong immediately",
+-        dfsRoot, 0L);
+-
+-    hdfs.copyFromLocalFile(localOriginal, dfsOriginal);
+-    checkSpaceConsumed("Du is wrong after creating / copying file",
+-        snapshottable1, spaceConsumed);
+-
+-    SnapshotTestHelper.createSnapshot(hdfs, snapshottable1, "s1");
+-    checkSpaceConsumed("Du is wrong in original dir after 1st snapshot",
+-        snapshottable1, spaceConsumed);
+-
+-    hdfs.rename(dfsOriginal, renamedNonsnapshottable);
+-    checkSpaceConsumed("Du is wrong in original dir after 1st rename",
+-        snapshottable1, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in non-snapshottable dir after 1st rename",
+-        nonsnapshottable, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in root dir after 1st rename",
+-        dfsRoot, spaceConsumed);
+-
+-    hdfs.rename(renamedNonsnapshottable, renamedSnapshottable);
+-    checkSpaceConsumed("Du is wrong in original dir after 2nd rename",
+-        snapshottable1, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in non-snapshottable dir after 2nd rename",
+-        nonsnapshottable, 0);
+-    checkSpaceConsumed("Du is wrong in snapshottable dir after 2nd rename",
+-        snapshottable2, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in root dir after 2nd rename",
+-        dfsRoot, spaceConsumed);
+-
+-    SnapshotTestHelper.createSnapshot(hdfs, snapshottable2, "s2");
+-    hdfs.rename(renamedSnapshottable, renamedSubdirectory);
+-    checkSpaceConsumed("Du is wrong in original dir after 3rd rename",
+-        snapshottable1, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in snapshottable dir after 3rd rename",
+-        snapshottable2, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in original subdirectory after 3rd rename",
+-        subdirectory, spaceConsumed);
+-    checkSpaceConsumed("Du is wrong in root dir after 3rd rename",
+-        dfsRoot, spaceConsumed);
+-
+-    hdfs.delete(renamedSubdirectory, false);
+-    hdfs.deleteSnapshot(snapshottable1, "s1");
+-    hdfs.deleteSnapshot(snapshottable2, "s2");
+-    checkSpaceConsumed("Du is wrong after deleting all files and snapshots",
+-        dfsRoot, 0);
+-  }
+ }
+-- 
+1.7.9.5
+

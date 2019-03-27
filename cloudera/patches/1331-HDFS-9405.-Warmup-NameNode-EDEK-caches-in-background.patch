@@ -1,0 +1,441 @@
+From 3236a1b3293694b9cfec565a413b4c5cbf104185 Mon Sep 17 00:00:00 2001
+From: Andrew Wang <wang@apache.org>
+Date: Mon, 21 Mar 2016 11:39:05 -0700
+Subject: [PATCH 1331/2848] HDFS-9405. Warmup NameNode EDEK caches in
+ background thread. Contributed by Xiao Chen.
+
+(cherry picked from commit e3bb38d62567eafe57d16b78deeba1b71c58e41c)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirEncryptionZoneOp.java
+
+Change-Id: I70cb7b636cd844135b1e92f44cf8635082944eaa
+---
+ .../hadoop/crypto/key/kms/KMSClientProvider.java   |    8 +-
+ .../apache/hadoop/crypto/key/kms/ValueQueue.java   |   16 ++-
+ .../apache/hadoop/crypto/key/TestValueQueue.java   |    6 --
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    4 +
+ .../server/namenode/EncryptionZoneManager.java     |   15 +++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |  109 ++++++++++++++++++++
+ .../src/main/resources/hdfs-default.xml            |   18 ++++
+ .../apache/hadoop/hdfs/TestEncryptionZones.java    |    4 +-
+ .../hadoop/hdfs/TestEncryptionZonesWithKMS.java    |   36 ++++++-
+ 9 files changed, 196 insertions(+), 20 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+index 19b6b19..bf20a0f 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+@@ -842,12 +842,8 @@ public void drain(String keyName) {
+   }
+ 
+   @VisibleForTesting
+-  public int getEncKeyQueueSize(String keyName) throws IOException {
+-    try {
+-      return encKeyVersionQueue.getSize(keyName);
+-    } catch (ExecutionException e) {
+-      throw new IOException(e);
+-    }
++  public int getEncKeyQueueSize(String keyName) {
++    return encKeyVersionQueue.getSize(keyName);
+   }
+ 
+   @Override
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/ValueQueue.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/ValueQueue.java
+index 8e67ecc..804d157 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/ValueQueue.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/ValueQueue.java
+@@ -18,9 +18,11 @@
+ package org.apache.hadoop.crypto.key.kms;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Queue;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.LinkedBlockingQueue;
+@@ -240,13 +242,19 @@ public void drain(String keyName ) {
+   }
+ 
+   /**
+-   * Get size of the Queue for keyName
++   * Get size of the Queue for keyName. This is only used in unit tests.
+    * @param keyName the key name
+    * @return int queue size
+-   * @throws ExecutionException
+    */
+-  public int getSize(String keyName) throws ExecutionException {
+-    return keyQueues.get(keyName).size();
++  public int getSize(String keyName) {
++    // We can't do keyQueues.get(keyName).size() here,
++    // since that will have the side effect of populating the cache.
++    Map<String, LinkedBlockingQueue<E>> map =
++        keyQueues.getAllPresent(Arrays.asList(keyName));
++    if (map.get(keyName) == null) {
++      return 0;
++    }
++    return map.get(keyName).size();
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestValueQueue.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestValueQueue.java
+index 5eae9a0..abc4ebf 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestValueQueue.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestValueQueue.java
+@@ -19,7 +19,6 @@
+ 
+ import java.io.IOException;
+ import java.util.Queue;
+-import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -158,17 +157,12 @@ public void testgetAtMostPolicyALL() throws Exception {
+     GenericTestUtils.waitFor(new Supplier<Boolean>() {
+       @Override
+       public Boolean get() {
+-        try {
+           int size = vq.getSize("k1");
+           if (size != 10) {
+             LOG.info("Current ValueQueue size is " + size);
+             return false;
+           }
+           return true;
+-        } catch (ExecutionException e) {
+-          LOG.error("Exception when getSize.", e);
+-          return false;
+-        }
+       }
+     }, 100, 3000);
+     Assert.assertEquals("Failed in async call.", 10, filler.getTop().num);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 186739fa..8c9d968 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -688,6 +688,10 @@
+   public static final int    DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES_DEFAULT = 100;
+   public static final String DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES = "dfs.namenode.list.encryption.zones.num.responses";
+   public static final String DFS_ENCRYPTION_KEY_PROVIDER_URI = "dfs.encryption.key.provider.uri";
++  public static final String DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_KEY = "dfs.namenode.edekcacheloader.interval.ms";
++  public static final int DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_DEFAULT = 1000;
++  public static final String DFS_NAMENODE_EDEKCACHELOADER_INITIAL_DELAY_MS_KEY = "dfs.namenode.edekcacheloader.initial.delay.ms";
++  public static final int DFS_NAMENODE_EDEKCACHELOADER_INITIAL_DELAY_MS_DEFAULT = 3000;
+ 
+   // Journal-node related configs. These are read on the JN side.
+   public static final String  DFS_JOURNALNODE_EDITS_DIR_KEY = "dfs.journalnode.edits.dir";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+index 3350514..fb25810 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EncryptionZoneManager.java
+@@ -23,6 +23,7 @@
+ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.List;
++import java.util.Map;
+ import java.util.NavigableMap;
+ import java.util.TreeMap;
+ 
+@@ -384,4 +385,18 @@ XAttr createEncryptionZone(String src, CipherSuite suite,
+     final boolean hasMore = (numResponses < tailMap.size());
+     return new BatchedListEntries<EncryptionZone>(zones, hasMore);
+   }
++
++  /**
++   * @return a list of all key names.
++   */
++  String[] getKeyNames() {
++    assert dir.hasReadLock();
++    String[] ret = new String[encryptionZones.size()];
++    int index = 0;
++    for (Map.Entry<Long, EncryptionZoneInt> entry : encryptionZones
++        .entrySet()) {
++      ret[index] = entry.getValue().getKeyName();
++    }
++    return ret;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index fa7f966..4cd8710 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -125,6 +125,8 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.TreeMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.locks.Condition;
+ import java.util.concurrent.locks.ReentrantLock;
+@@ -308,6 +310,7 @@
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Lists;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ /***************************************************
+  * FSNamesystem does the actual bookkeeping work for the
+@@ -456,6 +459,12 @@ private void logAuditEvent(boolean succeeded,
+   // A daemon to periodically clean up corrupt lazyPersist files
+   // from the name space.
+   Daemon lazyPersistFileScrubber = null;
++
++  // Executor to warm up EDEK cache
++  private ExecutorService edekCacheLoader = null;
++  private final int edekCacheLoaderDelay;
++  private final int edekCacheLoaderInterval;
++
+   /**
+    * When an active namenode will roll its own edit log, in # edits
+    */
+@@ -914,6 +923,13 @@ static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+             DFS_NAMENODE_LAZY_PERSIST_FILE_SCRUB_INTERVAL_SEC + " must be non-zero.");
+       }
+ 
++      this.edekCacheLoaderDelay = conf.getInt(
++          DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INITIAL_DELAY_MS_KEY,
++          DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INITIAL_DELAY_MS_DEFAULT);
++      this.edekCacheLoaderInterval = conf.getInt(
++          DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_KEY,
++          DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INTERVAL_MS_DEFAULT);
++
+       // For testing purposes, allow the DT secret manager to be started regardless
+       // of whether security is enabled.
+       alwaysUseDelegationTokensForTests = conf.getBoolean(
+@@ -1259,6 +1275,14 @@ void startActiveServices() throws IOException {
+ 
+       cacheManager.startMonitorThread();
+       blockManager.getDatanodeManager().setShouldSendCachingCommands(true);
++      if (provider != null) {
++        edekCacheLoader = Executors.newSingleThreadExecutor(
++            new ThreadFactoryBuilder().setDaemon(true)
++                .setNameFormat("Warm Up EDEK Cache Thread #%d")
++                .build());
++        warmUpEdekCache(edekCacheLoader,
++            edekCacheLoaderDelay, edekCacheLoaderInterval);
++      }
+     } finally {
+       startingActiveService = false;
+       checkSafeMode();
+@@ -1306,6 +1330,9 @@ void stopActiveServices() {
+         ((NameNodeResourceMonitor) nnrmthread.getRunnable()).stopMonitor();
+         nnrmthread.interrupt();
+       }
++      if (edekCacheLoader != null) {
++        edekCacheLoader.shutdownNow();
++      }
+       if (nnEditLogRoller != null) {
+         ((NameNodeEditLogRoller)nnEditLogRoller.getRunnable()).stop();
+         nnEditLogRoller.interrupt();
+@@ -9569,5 +9596,87 @@ private static void enableAsyncAuditLog() {
+       logger.addAppender(asyncAppender);        
+     }
+   }
++
++  /**
++   * Proactively warm up the edek cache. We'll get all the edek key names,
++   * then launch up a separate thread to warm them up.
++   */
++  private void warmUpEdekCache(final ExecutorService executor,
++      final int delay, final int interval) {
++    dir.readLock();
++    try {
++      String[] edeks = dir.ezManager.getKeyNames();
++      executor.execute(
++          new EDEKCacheLoader(edeks, getProvider(), delay, interval));
++    } finally {
++      dir.readUnlock();
++    }
++  }
++
++  /**
++   * EDEKCacheLoader is being run in a separate thread to loop through all the
++   * EDEKs and warm them up in the KMS cache.
++   */
++  class EDEKCacheLoader implements Runnable {
++    private final String[] keyNames;
++    private final KeyProviderCryptoExtension kp;
++    private int initialDelay;
++    private int retryInterval;
++
++    EDEKCacheLoader(final String[] names, final KeyProviderCryptoExtension kp,
++        final int delay, final int interval) {
++      this.keyNames = names;
++      this.kp = kp;
++      this.initialDelay = delay;
++      this.retryInterval = interval;
++    }
++
++    @Override
++    public void run() {
++      NameNode.LOG.info("Warming up {} EDEKs... (initialDelay={}, "
++          + "retryInterval={})", keyNames.length, initialDelay, retryInterval);
++      try {
++        Thread.sleep(initialDelay);
++      } catch (InterruptedException ie) {
++        NameNode.LOG.info("EDEKCacheLoader interrupted before warming up.");
++        return;
++      }
++
++      final int logCoolDown = 10000; // periodically print error log (if any)
++      int sinceLastLog = logCoolDown; // always print the first failure
++      boolean success = false;
++      IOException lastSeenIOE = null;
++      while (true) {
++        try {
++          kp.warmUpEncryptedKeys(keyNames);
++          NameNode.LOG
++              .info("Successfully warmed up {} EDEKs.", keyNames.length);
++          success = true;
++          break;
++        } catch (IOException ioe) {
++          lastSeenIOE = ioe;
++          if (sinceLastLog >= logCoolDown) {
++            NameNode.LOG.info("Failed to warm up EDEKs.", ioe);
++            sinceLastLog = 0;
++          } else {
++            NameNode.LOG.debug("Failed to warm up EDEKs.", ioe);
++          }
++        }
++        try {
++          Thread.sleep(retryInterval);
++        } catch (InterruptedException ie) {
++          NameNode.LOG.info("EDEKCacheLoader interrupted during retry.");
++          break;
++        }
++        sinceLastLog += retryInterval;
++      }
++      if (!success) {
++        NameNode.LOG.warn("Unable to warm up EDEKs.");
++        if (lastSeenIOE != null) {
++          NameNode.LOG.warn("Last seen exception:", lastSeenIOE);
++        }
++      }
++    }
++  }
+ }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 49d8c40..fca52c4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -2237,6 +2237,24 @@
+ </property>
+ 
+ <property>
++  <name>dfs.namenode.edekcacheloader.interval.ms</name>
++  <value>1000</value>
++  <description>When KeyProvider is configured, the interval time of warming
++    up edek cache on NN starts up / becomes active. All edeks will be loaded
++    from KMS into provider cache. The edek cache loader will try to warm up the
++    cache until succeed or NN leaves active state.
++  </description>
++</property>
++
++<property>
++  <name>dfs.namenode.edekcacheloader.initial.delay.ms</name>
++  <value>3000</value>
++  <description>When KeyProvider is configured, the time delayed until the first
++    attempt to warm up edek cache on NN start up / become active.
++  </description>
++</property>
++
++<property>
+   <name>dfs.namenode.inotify.max.events.per.rpc</name>
+   <value>1000</value>
+   <description>Maximum number of events that will be sent to an inotify client
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+index 3d28842..73fbddd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZones.java
+@@ -117,10 +117,10 @@
+ 
+ public class TestEncryptionZones {
+ 
+-  private Configuration conf;
++  protected Configuration conf;
+   private FileSystemTestHelper fsHelper;
+ 
+-  private MiniDFSCluster cluster;
++  protected MiniDFSCluster cluster;
+   protected HdfsAdmin dfsAdmin;
+   protected DistributedFileSystem fs;
+   private File testRootDir;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZonesWithKMS.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZonesWithKMS.java
+index 0040d75..59c8dd5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZonesWithKMS.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestEncryptionZonesWithKMS.java
+@@ -19,6 +19,7 @@
+ 
+ import static org.junit.Assert.assertTrue;
+ 
++import com.google.common.base.Supplier;
+ import org.apache.hadoop.crypto.key.kms.KMSClientProvider;
+ import org.apache.hadoop.crypto.key.kms.server.MiniKMS;
+ import org.apache.hadoop.security.Credentials;
+@@ -26,10 +27,12 @@
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.internal.util.reflection.Whitebox;
+ 
+ import java.io.File;
+ import java.util.Arrays;
+@@ -71,8 +74,10 @@ public void testCreateEZPopulatesEDEKCache() throws Exception {
+     final Path zonePath = new Path("/TestEncryptionZone");
+     fsWrapper.mkdir(zonePath, FsPermission.getDirDefault(), false);
+     dfsAdmin.createEncryptionZone(zonePath, TEST_KEY);
+-    assertTrue(((KMSClientProvider)fs.getClient().getKeyProvider()).
+-        getEncKeyQueueSize(TEST_KEY) > 0);
++    @SuppressWarnings("unchecked")
++    KMSClientProvider kcp = (KMSClientProvider) Whitebox
++        .getInternalState(cluster.getNamesystem().getProvider(), "extension");
++    assertTrue(kcp.getEncKeyQueueSize(TEST_KEY) > 0);
+   }
+ 
+   @Test(timeout = 120000)
+@@ -92,4 +97,31 @@ public void testDelegationToken() throws Exception {
+     Assert.assertEquals(0, tokens.length);
+     Assert.assertEquals(2, creds.numberOfTokens());
+   }
++
++  @Test(timeout = 120000)
++  public void testWarmupEDEKCacheOnStartup() throws Exception {
++    final Path zonePath = new Path("/TestEncryptionZone");
++    fsWrapper.mkdir(zonePath, FsPermission.getDirDefault(), false);
++    dfsAdmin.createEncryptionZone(zonePath, TEST_KEY);
++
++    @SuppressWarnings("unchecked")
++    KMSClientProvider spy = (KMSClientProvider) Whitebox
++        .getInternalState(cluster.getNamesystem().getProvider(), "extension");
++    assertTrue("key queue is empty after creating encryption zone",
++        spy.getEncKeyQueueSize(TEST_KEY) > 0);
++
++    conf.setInt(
++        DFSConfigKeys.DFS_NAMENODE_EDEKCACHELOADER_INITIAL_DELAY_MS_KEY, 0);
++    cluster.restartNameNode(true);
++
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++      @Override
++      public Boolean get() {
++        final KMSClientProvider kspy = (KMSClientProvider) Whitebox
++            .getInternalState(cluster.getNamesystem().getProvider(),
++                "extension");
++        return kspy.getEncKeyQueueSize(TEST_KEY) > 0;
++      }
++    }, 1000, 60000);
++  }
+ }
+-- 
+1.7.9.5
+

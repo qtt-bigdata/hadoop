@@ -1,0 +1,547 @@
+From 539218a245f10d5bff9f12dd904fdb9756afe284 Mon Sep 17 00:00:00 2001
+From: Colin Patrick Mccabe <cmccabe@cloudera.com>
+Date: Tue, 5 May 2015 11:27:36 -0700
+Subject: [PATCH 2572/2848] HDFS-7847. Modify NNThroughputBenchmark to be able
+ to operate on a remote NameNode (Charles Lamb via
+ Colin P. McCabe)
+
+(cherry picked from commit ffce9a3413277a69444fcb890460c885de56db69)(cherry picked from commit 51f012aec4f219823bb277e48b09a51d64f43977)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+
+Change-Id: I24f54505f537c6534e710e98790032d944a60e7d
+---
+ .../java/org/apache/hadoop/hdfs/DFSTestUtil.java   |   72 ++++++++---
+ .../server/namenode/NNThroughputBenchmark.java     |  136 ++++++++++++++------
+ 2 files changed, 149 insertions(+), 59 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+index eb1e8e1..f728f5a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hdfs;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Charsets;
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+@@ -84,6 +85,7 @@
+         .ConfiguredFailoverProxyProvider;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
++import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
+ import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo.BlockStatus;
+ import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
+@@ -94,6 +96,7 @@
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.net.unix.DomainSocket;
+ import org.apache.hadoop.net.unix.TemporarySocketDirectory;
++import org.apache.hadoop.security.RefreshUserMappingsProtocol;
+ import org.apache.hadoop.security.ShellBasedUnixGroupsMapping;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+@@ -114,6 +117,7 @@
+ import java.security.PrivilegedExceptionAction;
+ import java.util.*;
+ import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
+ import static org.apache.hadoop.fs.CreateFlag.CREATE;
+@@ -1766,22 +1770,39 @@ public static boolean changeReplicaLength(MiniDFSCluster cluster,
+     return false;
+   }
+ 
+-  public static void waitForMetric(final JMXGet jmx, final String metricName, final int expectedValue)
+-      throws TimeoutException, InterruptedException {
+-    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+-      @Override
+-      public Boolean get() {
+-        try {
+-          final int currentValue = Integer.parseInt(jmx.getValue(metricName));
+-          LOG.info("Waiting for " + metricName +
+-                       " to reach value " + expectedValue +
+-                       ", current value = " + currentValue);
+-          return currentValue == expectedValue;
+-        } catch (Exception e) {
+-          throw new UnhandledException("Test failed due to unexpected exception", e);
+-        }
+-      }
+-    }, 1000, 60000);
++  /**
++   * Get the NamenodeProtocol RPC proxy for the NN associated with this
++   * DFSClient object
++   *
++   * @param nameNodeUri the URI of the NN to get a proxy for.
++   *
++   * @return the Namenode RPC proxy associated with this DFSClient object
++   */
++  @VisibleForTesting
++  public static NamenodeProtocol getNamenodeProtocolProxy(Configuration conf,
++      URI nameNodeUri, UserGroupInformation ugi)
++      throws IOException {
++    return NameNodeProxies.createNonHAProxy(conf,
++        NameNode.getAddress(nameNodeUri), NamenodeProtocol.class, ugi, false).
++        getProxy();
++  }
++
++  /**
++   * Get the RefreshUserMappingsProtocol RPC proxy for the NN associated with
++   * this DFSClient object
++   *
++   * @param nameNodeUri the URI of the NN to get a proxy for.
++   *
++   * @return the RefreshUserMappingsProtocol RPC proxy associated with this
++   * DFSClient object
++   */
++  @VisibleForTesting
++  public static RefreshUserMappingsProtocol getRefreshUserMappingsProtocolProxy(
++      Configuration conf, URI nameNodeUri) throws IOException {
++    final AtomicBoolean nnFallbackToSimpleAuth = new AtomicBoolean(false);
++    return NameNodeProxies.createProxy(conf,
++        nameNodeUri, RefreshUserMappingsProtocol.class,
++        nnFallbackToSimpleAuth).getProxy();
+   }
+ 
+   public static StorageReceivedDeletedBlocks[] makeReportForReceivedBlock(
+@@ -1846,7 +1867,24 @@ public static Block addBlockToFile(
+     lastBlock.setNumBytes(len);
+     return lastBlock;
+   }
+-  
++
++  public static void waitForMetric(final JMXGet jmx, final String metricName, final int expectedValue)
++      throws TimeoutException, InterruptedException {
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++      @Override
++      public Boolean get() {
++        try {
++          final int currentValue = Integer.parseInt(jmx.getValue(metricName));
++          LOG.info("Waiting for " + metricName + " to reach value " + expectedValue
++              + ", current value = " + currentValue);
++          return currentValue == expectedValue;
++        } catch (Exception e) {
++          throw new UnhandledException("Test failed due to unexpected exception", e);
++        }
++      }
++    }, 1000, 60000);
++  }
++
+   /*
+    * Copy a block from sourceProxy to destination. If the block becomes
+    * over-replicated, preferably remove it from source.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+index c4cc660..2f387ac 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+@@ -20,6 +20,7 @@
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
++import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.EnumSet;
+@@ -30,19 +31,24 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.crypto.CryptoProtocolVersion;
+ import org.apache.hadoop.fs.CreateFlag;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
+ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs.BlockReportReplica;
++import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
+ import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+@@ -53,6 +59,7 @@
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
++import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
+@@ -64,6 +71,8 @@
+ import org.apache.hadoop.net.DNS;
+ import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.security.Groups;
++import org.apache.hadoop.security.RefreshUserMappingsProtocol;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+@@ -97,6 +106,9 @@
+  * By default the refresh is never called.</li>
+  * <li>-keepResults do not clean up the name-space after execution.</li>
+  * <li>-useExisting do not recreate the name-space, use existing data.</li>
++ * <li>-namenode will run the test against a namenode in another
++ * process or on another host. If you use this option, the namenode
++ * must have dfs.namenode.fs-limits.min-block-size set to 16.</li>
+  * </ol>
+  * 
+  * The benchmark first generates inputs for each thread so that the
+@@ -112,11 +124,20 @@
+   private static final Log LOG = LogFactory.getLog(NNThroughputBenchmark.class);
+   private static final int BLOCK_SIZE = 16;
+   private static final String GENERAL_OPTIONS_USAGE = 
+-    "     [-keepResults] | [-logLevel L] | [-UGCacheRefreshCount G]";
++    "     [-keepResults] | [-logLevel L] | [-UGCacheRefreshCount G] |" +
++    " [-namenode <namenode URI>]\n" +
++    "     If using -namenode, set the namenode's" +
++    "         dfs.namenode.fs-limits.min-block-size to 16.";
+ 
+   static Configuration config;
+   static NameNode nameNode;
+-  static NamenodeProtocols nameNodeProto;
++  static NamenodeProtocol nameNodeProto;
++  static ClientProtocol clientProto;
++  static DatanodeProtocol dataNodeProto;
++  static RefreshUserMappingsProtocol refreshUserMappingsProto;
++  static String bpid = null;
++
++  private String namenodeUri = null; // NN URI to use, if specified
+ 
+   NNThroughputBenchmark(Configuration conf) throws IOException {
+     config = conf;
+@@ -265,7 +286,7 @@ void benchmark() throws IOException {
+         for(StatsDaemon d : daemons)
+           d.start();
+       } finally {
+-        while(isInPorgress()) {
++        while(isInProgress()) {
+           // try {Thread.sleep(500);} catch (InterruptedException e) {}
+         }
+         elapsedTime = Time.now() - start;
+@@ -276,7 +297,7 @@ void benchmark() throws IOException {
+       }
+     }
+ 
+-    private boolean isInPorgress() {
++    private boolean isInProgress() {
+       for(StatsDaemon d : daemons)
+         if(d.isInProgress())
+           return true;
+@@ -284,10 +305,10 @@ private boolean isInPorgress() {
+     }
+ 
+     void cleanUp() throws IOException {
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++      clientProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
+           false);
+       if(!keepResults)
+-        nameNodeProto.delete(getBaseDir(), true);
++        clientProto.delete(getBaseDir(), true);
+     }
+ 
+     int getNumOpsExecuted() {
+@@ -361,6 +382,12 @@ protected boolean verifyOpArgument(List<String> args) {
+         args.remove(ugrcIndex);
+       }
+ 
++      try {
++        namenodeUri = StringUtils.popOptionWithArgument("-namenode", args);
++      } catch (IllegalArgumentException iae) {
++        printUsage();
++      }
++
+       String type = args.get(1);
+       if(OP_ALL_NAME.equals(type)) {
+         type = getOpName();
+@@ -419,7 +446,7 @@ public String toString() {
+     void benchmarkOne() throws IOException {
+       for(int idx = 0; idx < opsPerThread; idx++) {
+         if((localNumOpsExecuted+1) % statsOp.ugcRefreshCount == 0)
+-          nameNodeProto.refreshUserToGroupsMappings();
++          refreshUserMappingsProto.refreshUserToGroupsMappings();
+         long stat = statsOp.executeOp(daemonId, idx, arg1);
+         localNumOpsExecuted++;
+         localCumulativeTime += stat;
+@@ -485,10 +512,10 @@ String getExecutionArgument(int daemonId) {
+     @Override
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++      clientProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
+           false);
+       long start = Time.now();
+-      nameNodeProto.delete(BASE_DIR_NAME, true);
++      clientProto.delete(BASE_DIR_NAME, true);
+       long end = Time.now();
+       return end-start;
+     }
+@@ -554,7 +581,7 @@ void parseArguments(List<String> args) {
+     @Override
+     void generateInputs(int[] opsPerThread) throws IOException {
+       assert opsPerThread.length == numThreads : "Error opsPerThread.length"; 
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++      clientProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
+           false);
+       // int generatedFileIdx = 0;
+       LOG.info("Generate " + numOpsRequired + " intputs for " + getOpName());
+@@ -589,13 +616,13 @@ long executeOp(int daemonId, int inputIdx, String clientName)
+     throws IOException {
+       long start = Time.now();
+       // dummyActionNoSynch(fileIdx);
+-      nameNodeProto.create(fileNames[daemonId][inputIdx], FsPermission.getDefault(),
++      clientProto.create(fileNames[daemonId][inputIdx], FsPermission.getDefault(),
+                       clientName, new EnumSetWritable<CreateFlag>(EnumSet
+               .of(CreateFlag.CREATE, CreateFlag.OVERWRITE)), true, 
+-          replication, BLOCK_SIZE, null);
++          replication, BLOCK_SIZE, CryptoProtocolVersion.supported());
+       long end = Time.now();
+       for(boolean written = !closeUponCreate; !written; 
+-        written = nameNodeProto.complete(fileNames[daemonId][inputIdx],
++        written = clientProto.complete(fileNames[daemonId][inputIdx],
+                                     clientName, null, INodeId.GRANDFATHER_INODE_ID));
+       return end-start;
+     }
+@@ -658,7 +685,7 @@ void parseArguments(List<String> args) {
+     @Override
+     void generateInputs(int[] opsPerThread) throws IOException {
+       assert opsPerThread.length == numThreads : "Error opsPerThread.length";
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++      clientProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
+           false);
+       LOG.info("Generate " + numOpsRequired + " inputs for " + getOpName());
+       dirPaths = new String[numThreads][];
+@@ -686,7 +713,7 @@ String getExecutionArgument(int daemonId) {
+     long executeOp(int daemonId, int inputIdx, String clientName)
+         throws IOException {
+       long start = Time.now();
+-      nameNodeProto.mkdirs(dirPaths[daemonId][inputIdx],
++      clientProto.mkdirs(dirPaths[daemonId][inputIdx],
+           FsPermission.getDefault(), true);
+       long end = Time.now();
+       return end-start;
+@@ -758,11 +785,11 @@ void generateInputs(int[] opsPerThread) throws IOException {
+       }
+       // use the same files for open
+       super.generateInputs(opsPerThread);
+-      if(nameNodeProto.getFileInfo(opCreate.getBaseDir()) != null
+-          && nameNodeProto.getFileInfo(getBaseDir()) == null) {
+-        nameNodeProto.rename(opCreate.getBaseDir(), getBaseDir());
++      if(clientProto.getFileInfo(opCreate.getBaseDir()) != null
++          && clientProto.getFileInfo(getBaseDir()) == null) {
++        clientProto.rename(opCreate.getBaseDir(), getBaseDir());
+       }
+-      if(nameNodeProto.getFileInfo(getBaseDir()) == null) {
++      if(clientProto.getFileInfo(getBaseDir()) == null) {
+         throw new IOException(getBaseDir() + " does not exist.");
+       }
+     }
+@@ -774,7 +801,7 @@ void generateInputs(int[] opsPerThread) throws IOException {
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+       long start = Time.now();
+-      nameNodeProto.getBlockLocations(fileNames[daemonId][inputIdx], 0L, BLOCK_SIZE);
++      clientProto.getBlockLocations(fileNames[daemonId][inputIdx], 0L, BLOCK_SIZE);
+       long end = Time.now();
+       return end-start;
+     }
+@@ -804,7 +831,7 @@ String getOpName() {
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+       long start = Time.now();
+-      nameNodeProto.delete(fileNames[daemonId][inputIdx], false);
++      clientProto.delete(fileNames[daemonId][inputIdx], false);
+       long end = Time.now();
+       return end-start;
+     }
+@@ -834,7 +861,7 @@ String getOpName() {
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+       long start = Time.now();
+-      nameNodeProto.getFileInfo(fileNames[daemonId][inputIdx]);
++      clientProto.getFileInfo(fileNames[daemonId][inputIdx]);
+       long end = Time.now();
+       return end-start;
+     }
+@@ -878,7 +905,7 @@ void generateInputs(int[] opsPerThread) throws IOException {
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+       long start = Time.now();
+-      nameNodeProto.rename(fileNames[daemonId][inputIdx],
++      clientProto.rename(fileNames[daemonId][inputIdx],
+                       destNames[daemonId][inputIdx]);
+       long end = Time.now();
+       return end-start;
+@@ -934,14 +961,14 @@ void register() throws IOException {
+           new DataStorage(nsInfo),
+           new ExportedBlockKeys(), VersionInfo.getVersion());
+       // register datanode
+-      dnRegistration = nameNodeProto.registerDatanode(dnRegistration);
++      dnRegistration = dataNodeProto.registerDatanode(dnRegistration);
++      dnRegistration.setNamespaceInfo(nsInfo);
+       //first block reports
+       storage = new DatanodeStorage(DatanodeStorage.generateUuid());
+       final StorageBlockReport[] reports = {
+           new StorageBlockReport(storage, BlockListAsLongs.EMPTY)
+       };
+-      nameNodeProto.blockReport(dnRegistration, 
+-          nameNode.getNamesystem().getBlockPoolId(), reports,
++      dataNodeProto.blockReport(dnRegistration, bpid, reports,
+               new BlockReportContext(1, 0, System.nanoTime(), 0L, true));
+     }
+ 
+@@ -954,7 +981,7 @@ void sendHeartbeat() throws IOException {
+       // TODO:FEDERATION currently a single block pool is supported
+       StorageReport[] rep = { new StorageReport(storage, false,
+           DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0L) };
+-      DatanodeCommand[] cmds = nameNodeProto.sendHeartbeat(dnRegistration, rep,
++      DatanodeCommand[] cmds = dataNodeProto.sendHeartbeat(dnRegistration, rep,
+           0L, 0L, 0, 0, 0, null, true).getCommands();
+       if(cmds != null) {
+         for (DatanodeCommand cmd : cmds ) {
+@@ -1003,7 +1030,7 @@ int replicateBlocks() throws IOException {
+       // register datanode
+       StorageReport[] rep = { new StorageReport(storage,
+           false, DF_CAPACITY, DF_USED, DF_CAPACITY - DF_USED, DF_USED, 0L) };
+-      DatanodeCommand[] cmds = nameNodeProto.sendHeartbeat(dnRegistration,
++      DatanodeCommand[] cmds = dataNodeProto.sendHeartbeat(dnRegistration,
+           rep, 0L, 0L, 0, 0, 0, null, true).getCommands();
+       if (cmds != null) {
+         for (DatanodeCommand cmd : cmds) {
+@@ -1042,8 +1069,7 @@ private int transferBlocks( Block blocks[],
+                   null) };
+           StorageReceivedDeletedBlocks[] report = { new StorageReceivedDeletedBlocks(
+               targetStorageID, rdBlocks) };
+-          nameNodeProto.blockReceivedAndDeleted(receivedDNReg, nameNode
+-              .getNamesystem().getBlockPoolId(), report);
++          dataNodeProto.blockReceivedAndDeleted(receivedDNReg, bpid, report);
+         }
+       }
+       return blocks.length;
+@@ -1134,15 +1160,15 @@ void generateInputs(int[] ignore) throws IOException {
+       FileNameGenerator nameGenerator;
+       nameGenerator = new FileNameGenerator(getBaseDir(), 100);
+       String clientName = getClientName(007);
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++      clientProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
+           false);
+       for(int idx=0; idx < nrFiles; idx++) {
+         String fileName = nameGenerator.getNextFileName("ThroughputBench");
+-        nameNodeProto.create(fileName, FsPermission.getDefault(), clientName,
++        clientProto.create(fileName, FsPermission.getDefault(), clientName,
+             new EnumSetWritable<CreateFlag>(EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE)), true, replication,
+-            BLOCK_SIZE, null);
++            BLOCK_SIZE, CryptoProtocolVersion.supported());
+         ExtendedBlock lastBlock = addBlocks(fileName, clientName);
+-        nameNodeProto.complete(fileName, clientName, lastBlock, INodeId.GRANDFATHER_INODE_ID);
++        clientProto.complete(fileName, clientName, lastBlock, INodeId.GRANDFATHER_INODE_ID);
+       }
+       // prepare block reports
+       for(int idx=0; idx < nrDatanodes; idx++) {
+@@ -1165,8 +1191,8 @@ private ExtendedBlock addBlocks(String fileName, String clientName)
+               ReceivedDeletedBlockInfo.BlockStatus.RECEIVED_BLOCK, null) };
+           StorageReceivedDeletedBlocks[] report = { new StorageReceivedDeletedBlocks(
+               datanodes[dnIdx].storage.getStorageID(), rdBlocks) };
+-          nameNodeProto.blockReceivedAndDeleted(datanodes[dnIdx].dnRegistration, loc
+-              .getBlock().getBlockPoolId(), report);
++          dataNodeProto.blockReceivedAndDeleted(datanodes[dnIdx].dnRegistration,
++              bpid, report);
+         }
+         // IBRs are asynchronously processed by NameNode. The next
+         // ClientProtocol#addBlock() may throw NotReplicatedYetException.
+@@ -1184,7 +1210,7 @@ private LocatedBlock addBlock(String src, String clientName,
+         String[] favoredNodes) throws IOException {
+       for (int i = 0; i < 30; i++) {
+         try {
+-          return nameNodeProto.addBlock(src, clientName,
++          return clientProto.addBlock(src, clientName,
+               previous, excludeNodes, fileId, favoredNodes, null);
+         } catch (NotReplicatedYetException|RemoteException e) {
+           if (e instanceof RemoteException) {
+@@ -1218,8 +1244,7 @@ long executeOp(int daemonId, int inputIdx, String ignore) throws IOException {
+       long start = Time.now();
+       StorageBlockReport[] report = { new StorageBlockReport(
+           dn.storage, dn.getBlockReportList()) };
+-      nameNodeProto.blockReport(dn.dnRegistration,
+-          nameNode.getNamesystem().getBlockPoolId(), report,
++      dataNodeProto.blockReport(dn.dnRegistration, bpid, report,
+           new BlockReportContext(1, 0, System.nanoTime(), 0L, true));
+       long end = Time.now();
+       return end-start;
+@@ -1350,7 +1375,7 @@ private void decommissionNodes() throws IOException {
+         LOG.info("Datanode " + dn + " is decommissioned.");
+       }
+       excludeFile.close();
+-      nameNodeProto.refreshNodes();
++      clientProto.refreshNodes();
+     }
+ 
+     /**
+@@ -1446,8 +1471,6 @@ public int run(String[] aArgs) throws Exception {
+ 
+     // Start the NameNode
+     String[] argv = new String[] {};
+-    nameNode = NameNode.createNameNode(argv, config);
+-    nameNodeProto = nameNode.getRpcServer();
+ 
+     List<OperationStatsBase> ops = new ArrayList<OperationStatsBase>();
+     OperationStatsBase opStat = null;
+@@ -1488,6 +1511,29 @@ public int run(String[] aArgs) throws Exception {
+         opStat = new CleanAllStats(args);
+         ops.add(opStat);
+       }
++
++      if (namenodeUri == null) {
++        nameNode = NameNode.createNameNode(argv, config);
++        NamenodeProtocols nnProtos = nameNode.getRpcServer();
++        nameNodeProto = nnProtos;
++        clientProto = nnProtos;
++        dataNodeProto = nnProtos;
++        refreshUserMappingsProto = nnProtos;
++        bpid = nameNode.getNamesystem().getBlockPoolId();
++      } else {
++        FileSystem.setDefaultUri(getConf(), namenodeUri);
++        DistributedFileSystem dfs = (DistributedFileSystem)
++            FileSystem.get(getConf());
++        final URI nnUri = new URI(namenodeUri);
++        nameNodeProto = DFSTestUtil.getNamenodeProtocolProxy(config, nnUri,
++            UserGroupInformation.getCurrentUser());
++        clientProto = dfs.getClient().getNamenode();
++        dataNodeProto = new DatanodeProtocolClientSideTranslatorPB(
++            NameNode.getAddress(nnUri), config);
++        refreshUserMappingsProto =
++            DFSTestUtil.getRefreshUserMappingsProtocolProxy(config, nnUri);
++        getBlockPoolId(dfs);
++      }
+       if(ops.size() == 0)
+         printUsage();
+       // run each benchmark
+@@ -1508,6 +1554,12 @@ public int run(String[] aArgs) throws Exception {
+     return 0;
+   }
+ 
++  private void getBlockPoolId(DistributedFileSystem unused)
++    throws IOException {
++    final NamespaceInfo nsInfo = nameNodeProto.versionRequest();
++    bpid = nsInfo.getBlockPoolID();
++  }
++
+   public static void main(String[] args) throws Exception {
+     NNThroughputBenchmark bench = null;
+     try {
+-- 
+1.7.9.5
+

@@ -1,0 +1,138 @@
+From 4da379f27bf5f8b9e8ad6bad17cc5a84b5f6d059 Mon Sep 17 00:00:00 2001
+From: Brahma Reddy Battula <brahma@apache.org>
+Date: Wed, 10 May 2017 11:06:57 +0530
+Subject: [PATCH 2474/2848] HDFS-11373. Backport HDFS-11258 and
+ HDFS-11272(File mtime change could not save to
+ editlog). (Contributed by Jimmy Xiang, backported
+ by Akira Ajisaka)
+
+(cherry picked from commit 48c5e37abfb1874e0b36b075543abe1a1c841cc1)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAttrOp.java
+
+Change-Id: If8d2b692cc6504bf743378e92d24287ba503bf1c
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |   20 +++-----
+ .../hdfs/server/namenode/TestFSDirectory.java      |   51 +++++++++++++++++++-
+ 2 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 55808a6..08c1312 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -2511,18 +2511,14 @@ private boolean unprotectedSetTimes(INode inode, long mtime,
+       inode = inode.setModificationTime(mtime, latest);
+       status = true;
+     }
+-    if (atime != -1) {
+-      long inodeTime = inode.getAccessTime();
+-
+-      // if the last access time update was within the last precision interval, then
+-      // no need to store access time
+-      if (atime <= inodeTime + getFSNamesystem().getAccessTimePrecision() && !force) {
+-        status =  false;
+-      } else {
+-        inode.setAccessTime(atime, latest);
+-        status = true;
+-      }
+-    } 
++    // if the last access time update was within the last precision interval,
++    // then no need to store access time
++    if (atime != -1 && (status || force
++        || (atime > inode.getAccessTime()
++        + getFSNamesystem().getAccessTimePrecision()))) {
++      inode.setAccessTime(atime, latest);
++      status = true;
++    }
+     return status;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirectory.java
+index 0550dd6..e3ad160 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSDirectory.java
+@@ -31,6 +31,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.UnresolvedLinkException;
+ import org.apache.hadoop.fs.XAttr;
+ import org.apache.hadoop.fs.XAttrSetFlag;
+ import org.apache.hadoop.hdfs.protocol.NSQuotaExceededException;
+@@ -38,18 +39,21 @@
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.junit.After;
+-import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+ import com.google.common.collect.Lists;
++import org.mockito.Mockito;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
++import static org.mockito.Mockito.when;
+ 
+ /**
+  * Test {@link FSDirectory}, the in-memory namespace tree.
+@@ -381,4 +385,49 @@ public void testXAttrMultiAddRemoveErrors() throws Exception {
+         EnumSet.of(XAttrSetFlag.CREATE, XAttrSetFlag.REPLACE));
+     verifyXAttrsPresent(newXAttrs, 4);
+   }
++
++  private boolean unprotectedSetTimes(long atime, long atime0, long precision,
++      long mtime, boolean force) throws QuotaExceededException,
++      UnresolvedLinkException {
++    FSDirectory fsd = Mockito.mock(FSDirectory.class);
++    FSNamesystem fsn = Mockito.mock(FSNamesystem.class);
++    INodesInPath iip = Mockito.mock(INodesInPath.class);
++    INode inode = Mockito.mock(INode.class);
++
++    when(fsd.getFSNamesystem()).thenReturn(fsn);
++    when(fsn.getAccessTimePrecision()).thenReturn(precision);
++    when(fsd.getINodesInPath("", true)).thenReturn(iip);
++    when(fsd.getLastINodeInPath("")).thenReturn(iip);
++    when(fsd.hasWriteLock()).thenReturn(Boolean.TRUE);
++    when(iip.getLastINode()).thenReturn(inode);
++    when(iip.getLatestSnapshotId()).thenReturn(Mockito.anyInt());
++    when(inode.getAccessTime()).thenReturn(atime0);
++    when(fsd.unprotectedSetTimes("", mtime, atime, force)).thenCallRealMethod();
++    return fsd.unprotectedSetTimes("", mtime, atime, force);
++  }
++
++  @Test
++  public void testUnprotectedSetTimes() throws Exception {
++    // atime < access time + precision
++    assertFalse("SetTimes should not update access time "
++            + "because it's within the last precision interval",
++        unprotectedSetTimes(100, 0, 1000, -1, false));
++
++    // atime = access time + precision
++    assertFalse("SetTimes should not update access time "
++            + "because it's within the last precision interval",
++        unprotectedSetTimes(1000, 0, 1000, -1, false));
++
++    // atime > access time + precision
++    assertTrue("SetTimes should update access time",
++        unprotectedSetTimes(1011, 10, 1000, -1, false));
++
++    // atime < access time + precision, but force is set
++    assertTrue("SetTimes should update access time",
++        unprotectedSetTimes(100, 0, 1000, -1, true));
++
++    // atime < access time + precision, but mtime is set
++    assertTrue("SetTimes should update access time",
++        unprotectedSetTimes(100, 0, 1000, 1, false));
++  }
+ }
+-- 
+1.7.9.5
+

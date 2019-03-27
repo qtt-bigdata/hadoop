@@ -1,0 +1,993 @@
+From 7c3e2dddbd1920c6889d52479a8320189118a0d1 Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Tue, 6 Dec 2016 12:04:04 -0800
+Subject: [PATCH 2605/2848] HADOOP-13827. Add reencryptEncryptedKey interface
+ to KMS.
+
+(cherry picked from commit 79d90b810c14d5e3abab75235f587663834ce36c)
+
+ Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
+	hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMS.java
+	hadoop-common-project/hadoop-kms/src/site/markdown/index.md.vm
+
+Change-Id: I65d34f1086e809a6f8ce10e12b1afd8648edd558
+---
+ .../org/apache/hadoop/crypto/key/KeyProvider.java  |   28 +++++
+ .../crypto/key/KeyProviderCryptoExtension.java     |  109 +++++++++++++++----
+ .../hadoop/crypto/key/kms/KMSClientProvider.java   |   77 +++++++++----
+ .../hadoop/crypto/key/kms/KMSRESTConstants.java    |    1 +
+ .../key/kms/LoadBalancingKMSClientProvider.java    |   19 ++++
+ .../crypto/key/TestKeyProviderCryptoExtension.java |  114 ++++++++++++++++++++
+ ...agerKeyGeneratorKeyProviderCryptoExtension.java |    7 +-
+ .../apache/hadoop/crypto/key/kms/server/KMS.java   |   38 +++++--
+ .../hadoop/crypto/key/kms/server/KMSAudit.java     |    4 +-
+ .../kms/server/KeyAuthorizationKeyProvider.java    |   13 +++
+ .../hadoop-kms/src/site/apt/index.apt.vm           |   43 +++++++-
+ .../hadoop/crypto/key/kms/server/TestKMS.java      |   90 ++++++++++++++--
+ .../hadoop/crypto/key/kms/server/TestKMSAudit.java |   11 +-
+ 13 files changed, 484 insertions(+), 70 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProvider.java
+index dfd10ca..be9540e 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProvider.java
+@@ -32,6 +32,8 @@
+ 
+ import com.google.gson.stream.JsonReader;
+ import com.google.gson.stream.JsonWriter;
++import org.apache.commons.lang.builder.EqualsBuilder;
++import org.apache.commons.lang.builder.HashCodeBuilder;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+@@ -85,6 +87,7 @@ public String getVersionName() {
+       return material;
+     }
+ 
++    @Override
+     public String toString() {
+       StringBuilder buf = new StringBuilder();
+       buf.append("key(");
+@@ -104,6 +107,31 @@ public String toString() {
+       }
+       return buf.toString();
+     }
++
++    @Override
++    public boolean equals(Object rhs) {
++      if (this == rhs) {
++        return true;
++      }
++      if (rhs == null || getClass() != rhs.getClass()) {
++        return false;
++      }
++      final KeyVersion kv = (KeyVersion) rhs;
++      return new EqualsBuilder().
++          append(name, kv.name).
++          append(versionName, kv.versionName).
++          append(material, kv.material).
++          isEquals();
++    }
++
++    @Override
++    public int hashCode() {
++      return new HashCodeBuilder().
++          append(name).
++          append(versionName).
++          append(material).
++          toHashCode();
++    }
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
+index 992ba42..5146745 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/KeyProviderCryptoExtension.java
+@@ -188,8 +188,8 @@ public void warmUpEncryptedKeys(String... keyNames)
+     public void drain(String keyName);
+ 
+     /**
+-     * Generates a key material and encrypts it using the given key version name
+-     * and initialization vector. The generated key material is of the same
++     * Generates a key material and encrypts it using the given key name.
++     * The generated key material is of the same
+      * length as the <code>KeyVersion</code> material of the latest key version
+      * of the key and is encrypted using the same cipher.
+      * <p/>
+@@ -210,7 +210,7 @@ public EncryptedKeyVersion generateEncryptedKey(
+         GeneralSecurityException;
+ 
+     /**
+-     * Decrypts an encrypted byte[] key material using the given a key version
++     * Decrypts an encrypted byte[] key material using the given key version
+      * name and initialization vector.
+      *
+      * @param encryptedKeyVersion
+@@ -227,6 +227,26 @@ public EncryptedKeyVersion generateEncryptedKey(
+     public KeyVersion decryptEncryptedKey(
+         EncryptedKeyVersion encryptedKeyVersion) throws IOException,
+         GeneralSecurityException;
++
++    /**
++     * Re-encrypts an encrypted key version, using its initialization vector
++     * and key material, but with the latest key version name of its key name
++     * in the key provider.
++     * <p>
++     * If the latest key version name in the provider is the
++     * same as the one encrypted the passed-in encrypted key version, the same
++     * encrypted key version is returned.
++     * <p>
++     * NOTE: The generated key is not stored by the <code>KeyProvider</code>
++     *
++     * @param  ekv The EncryptedKeyVersion containing keyVersionName and IV.
++     * @return     The re-encrypted EncryptedKeyVersion.
++     * @throws IOException If the key material could not be re-encrypted.
++     * @throws GeneralSecurityException If the key material could not be
++     *                            re-encrypted because of a cryptographic issue.
++     */
++    EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++        throws IOException, GeneralSecurityException;
+   }
+ 
+   private static class DefaultCryptoExtension implements CryptoExtension {
+@@ -259,27 +279,58 @@ public EncryptedKeyVersion generateEncryptedKey(String encryptionKeyName)
+         cc.generateSecureRandom(newKey);
+         final byte[] iv = new byte[cc.getCipherSuite().getAlgorithmBlockSize()];
+         cc.generateSecureRandom(iv);
+-        // Encryption key IV is derived from new key's IV
+-        final byte[] encryptionIV = EncryptedKeyVersion.deriveIV(iv);
+         Encryptor encryptor = cc.createEncryptor();
+-        encryptor.init(encryptionKey.getMaterial(), encryptionIV);
+-        int keyLen = newKey.length;
+-        ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
+-        ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
+-        bbIn.put(newKey);
+-        bbIn.flip();
+-        encryptor.encrypt(bbIn, bbOut);
+-        bbOut.flip();
+-        byte[] encryptedKey = new byte[keyLen];
+-        bbOut.get(encryptedKey);
+-        return new EncryptedKeyVersion(encryptionKeyName,
+-            encryptionKey.getVersionName(), iv,
+-            new KeyVersion(encryptionKey.getName(), EEK, encryptedKey));
++        return generateEncryptedKey(encryptor, encryptionKey, newKey, iv);
+       } finally {
+         cc.close();
+       }
+     }
+ 
++    private EncryptedKeyVersion generateEncryptedKey(final Encryptor encryptor,
++        final KeyVersion encryptionKey, final byte[] key, final byte[] iv)
++        throws IOException, GeneralSecurityException {
++      // Encryption key IV is derived from new key's IV
++      final byte[] encryptionIV = EncryptedKeyVersion.deriveIV(iv);
++      encryptor.init(encryptionKey.getMaterial(), encryptionIV);
++      final int keyLen = key.length;
++      ByteBuffer bbIn = ByteBuffer.allocateDirect(keyLen);
++      ByteBuffer bbOut = ByteBuffer.allocateDirect(keyLen);
++      bbIn.put(key);
++      bbIn.flip();
++      encryptor.encrypt(bbIn, bbOut);
++      bbOut.flip();
++      byte[] encryptedKey = new byte[keyLen];
++      bbOut.get(encryptedKey);
++      return new EncryptedKeyVersion(encryptionKey.getName(),
++          encryptionKey.getVersionName(), iv,
++          new KeyVersion(encryptionKey.getName(), EEK, encryptedKey));
++    }
++
++    @Override
++    public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++        throws IOException, GeneralSecurityException {
++      final String ekName = ekv.getEncryptionKeyName();
++      final KeyVersion ekNow = keyProvider.getCurrentKey(ekName);
++      Preconditions
++          .checkNotNull(ekNow, "KeyVersion name '%s' does not exist", ekName);
++      Preconditions.checkArgument(ekv.getEncryptedKeyVersion().getVersionName()
++              .equals(KeyProviderCryptoExtension.EEK),
++          "encryptedKey version name must be '%s', is '%s'",
++          KeyProviderCryptoExtension.EEK,
++          ekv.getEncryptedKeyVersion().getVersionName());
++
++      if (ekv.getEncryptedKeyVersion().equals(ekNow)) {
++        // no-op if same key version
++        return ekv;
++      }
++
++      final KeyVersion dek = decryptEncryptedKey(ekv);
++      final CryptoCodec cc = CryptoCodec.getInstance(keyProvider.getConf());
++      final Encryptor encryptor = cc.createEncryptor();
++      return generateEncryptedKey(encryptor, ekNow, dek.getMaterial(),
++          ekv.getEncryptedKeyIv());
++    }
++
+     @Override
+     public KeyVersion decryptEncryptedKey(
+         EncryptedKeyVersion encryptedKeyVersion) throws IOException,
+@@ -397,6 +448,28 @@ public KeyVersion decryptEncryptedKey(EncryptedKeyVersion encryptedKey)
+   }
+ 
+   /**
++   * Re-encrypts an encrypted key version, using its initialization vector
++   * and key material, but with the latest key version name of its key name
++   * in the key provider.
++   * <p>
++   * If the latest key version name in the provider is the
++   * same as the one encrypted the passed-in encrypted key version, the same
++   * encrypted key version is returned.
++   * <p>
++   * NOTE: The generated key is not stored by the <code>KeyProvider</code>
++   *
++   * @param  ekv The EncryptedKeyVersion containing keyVersionName and IV.
++   * @return     The re-encrypted EncryptedKeyVersion.
++   * @throws IOException If the key material could not be re-encrypted
++   * @throws GeneralSecurityException If the key material could not be
++   *                            re-encrypted because of a cryptographic issue.
++   */
++  public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++      throws IOException, GeneralSecurityException {
++    return getExtension().reencryptEncryptedKey(ekv);
++  }
++
++  /**
+    * Creates a <code>KeyProviderCryptoExtension</code> using a given
+    * {@link KeyProvider}.
+    * <p/>
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+index 3f8c58f..1a1a8c1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+@@ -145,7 +145,7 @@ public void fillQueueForKey(String keyName,
+       List response = call(conn, null,
+           HttpURLConnection.HTTP_OK, List.class);
+       List<EncryptedKeyVersion> ekvs =
+-          parseJSONEncKeyVersion(keyName, response);
++          parseJSONEncKeyVersions(keyName, response);
+       keyQueue.addAll(ekvs);
+     }
+   }
+@@ -220,37 +220,41 @@ public KMSEncryptedKeyVersion(String keyName, String keyVersionName,
+ 
+   @SuppressWarnings("rawtypes")
+   private static List<EncryptedKeyVersion>
+-      parseJSONEncKeyVersion(String keyName, List valueList) {
++      parseJSONEncKeyVersions(String keyName, List valueList) {
+     List<EncryptedKeyVersion> ekvs = new LinkedList<EncryptedKeyVersion>();
+     if (!valueList.isEmpty()) {
+       for (Object values : valueList) {
+         Map valueMap = (Map) values;
++        ekvs.add(parseJSONEncKeyVersion(keyName, valueMap));
++      }
++    }
++    return ekvs;
++  }
+ 
+-        String versionName = checkNotNull(
+-                (String) valueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
+-                KMSRESTConstants.VERSION_NAME_FIELD);
++  private static EncryptedKeyVersion parseJSONEncKeyVersion(String keyName,
++      Map valueMap) {
++    String versionName = checkNotNull(
++        (String) valueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
++        KMSRESTConstants.VERSION_NAME_FIELD);
+ 
+-        byte[] iv = Base64.decodeBase64(checkNotNull(
+-                (String) valueMap.get(KMSRESTConstants.IV_FIELD),
+-                KMSRESTConstants.IV_FIELD));
++    byte[] iv = Base64.decodeBase64(checkNotNull(
++        (String) valueMap.get(KMSRESTConstants.IV_FIELD),
++        KMSRESTConstants.IV_FIELD));
+ 
+-        Map encValueMap = checkNotNull((Map)
+-                valueMap.get(KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD),
+-                KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD);
++    Map encValueMap = checkNotNull((Map)
++            valueMap.get(KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD),
++        KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD);
+ 
+-        String encVersionName = checkNotNull((String)
+-                encValueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
+-                KMSRESTConstants.VERSION_NAME_FIELD);
++    String encVersionName = checkNotNull((String)
++            encValueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
++        KMSRESTConstants.VERSION_NAME_FIELD);
+ 
+-        byte[] encKeyMaterial = Base64.decodeBase64(checkNotNull((String)
+-                encValueMap.get(KMSRESTConstants.MATERIAL_FIELD),
+-                KMSRESTConstants.MATERIAL_FIELD));
++    byte[] encKeyMaterial = Base64.decodeBase64(checkNotNull((String)
++            encValueMap.get(KMSRESTConstants.MATERIAL_FIELD),
++        KMSRESTConstants.MATERIAL_FIELD));
+ 
+-        ekvs.add(new KMSEncryptedKeyVersion(keyName, versionName, iv,
+-            encVersionName, encKeyMaterial));
+-      }
+-    }
+-    return ekvs;
++    return new KMSEncryptedKeyVersion(keyName, versionName, iv,
++        encVersionName, encKeyMaterial);
+   }
+ 
+   private static KeyVersion parseJSONKeyVersion(Map valueMap) {
+@@ -838,6 +842,35 @@ public KeyVersion decryptEncryptedKey(
+   }
+ 
+   @Override
++  public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++      throws IOException, GeneralSecurityException {
++    checkNotNull(ekv.getEncryptionKeyVersionName(), "versionName");
++    checkNotNull(ekv.getEncryptedKeyIv(), "iv");
++    checkNotNull(ekv.getEncryptedKeyVersion(), "encryptedKey");
++    Preconditions.checkArgument(ekv.getEncryptedKeyVersion().getVersionName()
++            .equals(KeyProviderCryptoExtension.EEK),
++        "encryptedKey version name must be '%s', is '%s'",
++        KeyProviderCryptoExtension.EEK,
++        ekv.getEncryptedKeyVersion().getVersionName());
++    final Map<String, String> params = new HashMap<>();
++    params.put(KMSRESTConstants.EEK_OP, KMSRESTConstants.EEK_REENCRYPT);
++    final Map<String, Object> jsonPayload = new HashMap<>();
++    jsonPayload.put(KMSRESTConstants.NAME_FIELD, ekv.getEncryptionKeyName());
++    jsonPayload.put(KMSRESTConstants.IV_FIELD,
++        Base64.encodeBase64String(ekv.getEncryptedKeyIv()));
++    jsonPayload.put(KMSRESTConstants.MATERIAL_FIELD,
++        Base64.encodeBase64String(ekv.getEncryptedKeyVersion().getMaterial()));
++    final URL url = createURL(KMSRESTConstants.KEY_VERSION_RESOURCE,
++        ekv.getEncryptionKeyVersionName(), KMSRESTConstants.EEK_SUB_RESOURCE,
++        params);
++    final HttpURLConnection conn = createConnection(url, HTTP_POST);
++    conn.setRequestProperty(CONTENT_TYPE, APPLICATION_JSON_MIME);
++    final Map response =
++        call(conn, jsonPayload, HttpURLConnection.HTTP_OK, Map.class);
++    return parseJSONEncKeyVersion(ekv.getEncryptionKeyName(), response);
++  }
++
++  @Override
+   public List<KeyVersion> getKeyVersions(String name) throws IOException {
+     checkNotEmpty(name, "name");
+     URL url = createURL(KMSRESTConstants.KEY_RESOURCE, name,
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSRESTConstants.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSRESTConstants.java
+index b7d7898..3d7951e 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSRESTConstants.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSRESTConstants.java
+@@ -42,6 +42,7 @@
+   public static final String EEK_GENERATE = "generate";
+   public static final String EEK_DECRYPT = "decrypt";
+   public static final String EEK_NUM_KEYS = "num_keys";
++  public static final String EEK_REENCRYPT = "reencrypt";
+ 
+   public static final String IV_FIELD = "iv";
+   public static final String NAME_FIELD = "name";
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/LoadBalancingKMSClientProvider.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/LoadBalancingKMSClientProvider.java
+index 0d3100c..aa532d5 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/LoadBalancingKMSClientProvider.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/LoadBalancingKMSClientProvider.java
+@@ -286,6 +286,25 @@ public KeyVersion call(KMSClientProvider provider)
+     }
+   }
+ 
++  public EncryptedKeyVersion reencryptEncryptedKey(
++      final EncryptedKeyVersion edek)
++      throws IOException, GeneralSecurityException {
++    try {
++      return doOp(new ProviderCallable<EncryptedKeyVersion>() {
++        @Override
++        public EncryptedKeyVersion call(KMSClientProvider provider)
++            throws IOException, GeneralSecurityException {
++          return provider.reencryptEncryptedKey(edek);
++        }
++      }, nextIdx());
++    } catch (WrapperException we) {
++      if (we.getCause() instanceof GeneralSecurityException) {
++        throw (GeneralSecurityException) we.getCause();
++      }
++      throw new IOException(we.getCause());
++    }
++  }
++
+   @Override
+   public KeyVersion getKeyVersion(final String versionName) throws IOException {
+     return doOp(new ProviderCallable<KeyVersion>() {
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestKeyProviderCryptoExtension.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestKeyProviderCryptoExtension.java
+index 316c74f..e6bb60b 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestKeyProviderCryptoExtension.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/crypto/key/TestKeyProviderCryptoExtension.java
+@@ -33,7 +33,9 @@
+ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.EncryptedKeyVersion;
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.Timeout;
+ 
+ import static org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
+ import static org.junit.Assert.assertArrayEquals;
+@@ -52,6 +54,9 @@
+   private static KeyProvider.Options options;
+   private static KeyVersion encryptionKey;
+ 
++  @Rule
++  public Timeout testTimeout = new Timeout(180000);
++
+   @BeforeClass
+   public static void setup() throws Exception {
+     conf = new Configuration();
+@@ -139,6 +144,103 @@ public void testEncryptDecrypt() throws Exception {
+   }
+ 
+   @Test
++  public void testReencryptEncryptedKey() throws Exception {
++    // Generate a new EEK
++    final KeyProviderCryptoExtension.EncryptedKeyVersion ek1 =
++        kpExt.generateEncryptedKey(encryptionKey.getName());
++
++    // Decrypt EEK into an EK and check it
++    final KeyVersion k1 = kpExt.decryptEncryptedKey(ek1);
++    assertEquals(KeyProviderCryptoExtension.EK, k1.getVersionName());
++    assertEquals(encryptionKey.getMaterial().length, k1.getMaterial().length);
++    if (Arrays.equals(k1.getMaterial(), encryptionKey.getMaterial())) {
++      fail("Encrypted key material should not equal encryption key material");
++    }
++
++    // Roll the EK
++    kpExt.rollNewVersion(ek1.getEncryptionKeyName());
++
++    // Reencrypt ek1
++    final KeyProviderCryptoExtension.EncryptedKeyVersion ek2 =
++        kpExt.reencryptEncryptedKey(ek1);
++    assertEquals("Version name of EEK should be EEK",
++        KeyProviderCryptoExtension.EEK,
++        ek2.getEncryptedKeyVersion().getVersionName());
++    assertEquals("Name of EEK should be encryption key name",
++        ENCRYPTION_KEY_NAME, ek2.getEncryptionKeyName());
++    assertNotNull("Expected encrypted key material",
++        ek2.getEncryptedKeyVersion().getMaterial());
++    assertEquals("Length of encryption key material and EEK material should "
++            + "be the same", encryptionKey.getMaterial().length,
++        ek2.getEncryptedKeyVersion().getMaterial().length);
++    if (Arrays.equals(ek2.getEncryptedKeyVersion().getMaterial(),
++        encryptionKey.getMaterial())) {
++      fail("Encrypted key material should not equal decrypted key material");
++    }
++    if (Arrays.equals(ek2.getEncryptedKeyVersion().getMaterial(),
++        ek1.getEncryptedKeyVersion().getMaterial())) {
++      fail("Re-encrypted EEK should have different material");
++    }
++
++    // Decrypt the new EEK into an EK and check it
++    final KeyVersion k2 = kpExt.decryptEncryptedKey(ek2);
++    assertEquals(KeyProviderCryptoExtension.EK, k2.getVersionName());
++    assertEquals(encryptionKey.getMaterial().length, k2.getMaterial().length);
++    if (Arrays.equals(k2.getMaterial(), encryptionKey.getMaterial())) {
++      fail("Encrypted key material should not equal encryption key material");
++    }
++
++    // Re-encrypting the same EEK with the same EK should be deterministic
++    final KeyProviderCryptoExtension.EncryptedKeyVersion ek2a =
++        kpExt.reencryptEncryptedKey(ek1);
++    assertEquals("Version name of EEK should be EEK",
++        KeyProviderCryptoExtension.EEK,
++        ek2a.getEncryptedKeyVersion().getVersionName());
++    assertEquals("Name of EEK should be encryption key name",
++        ENCRYPTION_KEY_NAME, ek2a.getEncryptionKeyName());
++    assertNotNull("Expected encrypted key material",
++        ek2a.getEncryptedKeyVersion().getMaterial());
++    assertEquals("Length of encryption key material and EEK material should "
++            + "be the same", encryptionKey.getMaterial().length,
++        ek2a.getEncryptedKeyVersion().getMaterial().length);
++    if (Arrays.equals(ek2a.getEncryptedKeyVersion().getMaterial(),
++        encryptionKey.getMaterial())) {
++      fail("Encrypted key material should not equal decrypted key material");
++    }
++    if (Arrays.equals(ek2a.getEncryptedKeyVersion().getMaterial(),
++        ek1.getEncryptedKeyVersion().getMaterial())) {
++      fail("Re-encrypted EEK should have different material");
++    }
++    assertArrayEquals(ek2.getEncryptedKeyVersion().getMaterial(),
++        ek2a.getEncryptedKeyVersion().getMaterial());
++
++    // Re-encrypting an EEK with the same version EK should be no-op
++    final KeyProviderCryptoExtension.EncryptedKeyVersion ek3 =
++        kpExt.reencryptEncryptedKey(ek2);
++    assertEquals("Version name of EEK should be EEK",
++        KeyProviderCryptoExtension.EEK,
++        ek3.getEncryptedKeyVersion().getVersionName());
++    assertEquals("Name of EEK should be encryption key name",
++        ENCRYPTION_KEY_NAME, ek3.getEncryptionKeyName());
++    assertNotNull("Expected encrypted key material",
++        ek3.getEncryptedKeyVersion().getMaterial());
++    assertEquals("Length of encryption key material and EEK material should "
++            + "be the same", encryptionKey.getMaterial().length,
++        ek3.getEncryptedKeyVersion().getMaterial().length);
++    if (Arrays.equals(ek3.getEncryptedKeyVersion().getMaterial(),
++        encryptionKey.getMaterial())) {
++      fail("Encrypted key material should not equal decrypted key material");
++    }
++
++    if (Arrays.equals(ek3.getEncryptedKeyVersion().getMaterial(),
++        ek1.getEncryptedKeyVersion().getMaterial())) {
++      fail("Re-encrypted EEK should have different material");
++    }
++    assertArrayEquals(ek2.getEncryptedKeyVersion().getMaterial(),
++        ek3.getEncryptedKeyVersion().getMaterial());
++  }
++
++  @Test
+   public void testNonDefaultCryptoExtensionSelectionWithCachingKeyProvider()
+           throws Exception {
+     Configuration config = new Configuration();
+@@ -234,6 +336,12 @@ public EncryptedKeyVersion generateEncryptedKey(String encryptionKeyName)
+     }
+ 
+     @Override
++    public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++        throws IOException, GeneralSecurityException {
++      return ekv;
++    }
++
++    @Override
+     public KeyVersion decryptEncryptedKey(
+             EncryptedKeyVersion encryptedKeyVersion)
+             throws IOException, GeneralSecurityException {
+@@ -339,5 +447,11 @@ public KeyVersion decryptEncryptedKey(
+             throws IOException, GeneralSecurityException {
+       return kv;
+     }
++
++    @Override
++    public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++        throws IOException, GeneralSecurityException {
++      return ekv;
++    }
+   }
+ }
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/EagerKeyGeneratorKeyProviderCryptoExtension.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/EagerKeyGeneratorKeyProviderCryptoExtension.java
+index 87f6209..22fc9dc 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/EagerKeyGeneratorKeyProviderCryptoExtension.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/EagerKeyGeneratorKeyProviderCryptoExtension.java
+@@ -28,7 +28,6 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.crypto.key.KeyProvider;
+ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
+ import org.apache.hadoop.crypto.key.kms.ValueQueue;
+ import org.apache.hadoop.crypto.key.kms.ValueQueue.SyncGenerationPolicy;
+@@ -136,6 +135,12 @@ public EncryptedKeyVersion generateEncryptedKey(String encryptionKeyName)
+       return keyProviderCryptoExtension.decryptEncryptedKey(
+           encryptedKeyVersion);
+     }
++
++    @Override
++    public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++        throws IOException, GeneralSecurityException {
++      return keyProviderCryptoExtension.reencryptEncryptedKey(ekv);
++    }
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMS.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMS.java
+index e9d6a7a..186bc70 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMS.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMS.java
+@@ -31,7 +31,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-
+ import javax.ws.rs.Consumes;
+ import javax.ws.rs.DELETE;
+ import javax.ws.rs.DefaultValue;
+@@ -64,7 +63,7 @@
+     CREATE_KEY, DELETE_KEY, ROLL_NEW_VERSION,
+     GET_KEYS, GET_KEYS_METADATA,
+     GET_KEY_VERSIONS, GET_METADATA, GET_KEY_VERSION, GET_CURRENT_KEY,
+-    GENERATE_EEK, DECRYPT_EEK
++    GENERATE_EEK, DECRYPT_EEK, REENCRYPT_EEK
+   }
+ 
+   private KeyProviderCryptoExtension provider;
+@@ -509,7 +508,7 @@ public Void run() throws Exception {
+   @Path(KMSRESTConstants.KEY_VERSION_RESOURCE + "/{versionName:.*}/" +
+       KMSRESTConstants.EEK_SUB_RESOURCE)
+   @Produces(MediaType.APPLICATION_JSON)
+-  public Response decryptEncryptedKey(
++  public Response handleEncryptedKeyOp(
+       @PathParam("versionName") final String versionName,
+       @QueryParam(KMSRESTConstants.EEK_OP) String eekOp,
+       Map jsonPayload)
+@@ -527,15 +526,15 @@ public Response decryptEncryptedKey(
+       String ivStr = (String) jsonPayload.get(KMSRESTConstants.IV_FIELD);
+       String encMaterialStr =
+               (String) jsonPayload.get(KMSRESTConstants.MATERIAL_FIELD);
++      KMSClientProvider.checkNotNull(ivStr, KMSRESTConstants.IV_FIELD);
++      final byte[] iv = Base64.decodeBase64(ivStr);
++      KMSClientProvider.checkNotNull(encMaterialStr,
++          KMSRESTConstants.MATERIAL_FIELD);
++      final byte[] encMaterial = Base64.decodeBase64(encMaterialStr);
+       Object retJSON;
+       if (eekOp.equals(KMSRESTConstants.EEK_DECRYPT)) {
+         assertAccess(KMSACLs.Type.DECRYPT_EEK, user, KMSOp.DECRYPT_EEK,
+                 keyName);
+-        KMSClientProvider.checkNotNull(ivStr, KMSRESTConstants.IV_FIELD);
+-        final byte[] iv = Base64.decodeBase64(ivStr);
+-        KMSClientProvider.checkNotNull(encMaterialStr,
+-                KMSRESTConstants.MATERIAL_FIELD);
+-        final byte[] encMaterial = Base64.decodeBase64(encMaterialStr);
+ 
+         KeyProvider.KeyVersion retKeyVersion = user.doAs(
+                 new PrivilegedExceptionAction<KeyVersion>() {
+@@ -553,6 +552,23 @@ public KeyVersion run() throws Exception {
+ 
+         retJSON = KMSServerJSONUtils.toJSON(retKeyVersion);
+         kmsAudit.ok(user, KMSOp.DECRYPT_EEK, keyName, "");
++      } else if (eekOp.equals(KMSRESTConstants.EEK_REENCRYPT)) {
++        assertAccess(KMSACLs.Type.GENERATE_EEK, user, KMSOp.REENCRYPT_EEK,
++            keyName);
++
++        EncryptedKeyVersion retEncryptedKeyVersion =
++            user.doAs(new PrivilegedExceptionAction<EncryptedKeyVersion>() {
++              @Override
++              public EncryptedKeyVersion run() throws Exception {
++                return provider.reencryptEncryptedKey(
++                    new KMSClientProvider.KMSEncryptedKeyVersion(keyName,
++                        versionName, iv, KeyProviderCryptoExtension.EEK,
++                        encMaterial));
++              }
++            });
++
++        retJSON = KMSServerJSONUtils.toJSON(retEncryptedKeyVersion);
++        kmsAudit.ok(user, KMSOp.REENCRYPT_EEK, keyName, "");
+       } else {
+         StringBuilder error;
+         error = new StringBuilder("IllegalArgumentException Wrong ");
+@@ -565,11 +581,11 @@ public KeyVersion run() throws Exception {
+         throw new IllegalArgumentException(error.toString());
+       }
+       KMSWebApp.getDecryptEEKCallsMeter().mark();
+-      LOG.trace("Exiting decryptEncryptedKey method.");
++      LOG.trace("Exiting handleEncryptedKeyOp method.");
+       return Response.ok().type(MediaType.APPLICATION_JSON).entity(retJSON)
+-              .build();
++          .build();
+     } catch (Exception e) {
+-      LOG.debug("Exception in decryptEncryptedKey.", e);
++      LOG.debug("Exception in handleEncryptedKeyOp.", e);
+       throw e;
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+index adf53cc..13a2d5c 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+@@ -57,8 +57,8 @@
+ public class KMSAudit {
+   @VisibleForTesting
+   static final Set<KMS.KMSOp> AGGREGATE_OPS_WHITELIST = Sets.newHashSet(
+-    KMS.KMSOp.GET_KEY_VERSION, KMS.KMSOp.GET_CURRENT_KEY,
+-    KMS.KMSOp.DECRYPT_EEK, KMS.KMSOp.GENERATE_EEK
++      KMS.KMSOp.GET_KEY_VERSION, KMS.KMSOp.GET_CURRENT_KEY,
++      KMS.KMSOp.DECRYPT_EEK, KMS.KMSOp.GENERATE_EEK, KMS.KMSOp.REENCRYPT_EEK
+   );
+ 
+   private Cache<String, AuditEvent> cache;
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KeyAuthorizationKeyProvider.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KeyAuthorizationKeyProvider.java
+index e8cabc8..b0e85da 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KeyAuthorizationKeyProvider.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KeyAuthorizationKeyProvider.java
+@@ -265,6 +265,19 @@ public KeyVersion decryptEncryptedKey(EncryptedKeyVersion encryptedKeyVersion)
+   }
+ 
+   @Override
++  public EncryptedKeyVersion reencryptEncryptedKey(EncryptedKeyVersion ekv)
++      throws IOException, GeneralSecurityException {
++    readLock.lock();
++    try {
++      verifyKeyVersionBelongsToKey(ekv);
++      doAccessCheck(ekv.getEncryptionKeyName(), KeyOpType.GENERATE_EEK);
++      return provider.reencryptEncryptedKey(ekv);
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  @Override
+   public KeyVersion getKeyVersion(String versionName) throws IOException {
+     readLock.lock();
+     try {
+diff --git a/hadoop-common-project/hadoop-kms/src/site/apt/index.apt.vm b/hadoop-common-project/hadoop-kms/src/site/apt/index.apt.vm
+index a1600b8..b2b69c8 100644
+--- a/hadoop-common-project/hadoop-kms/src/site/apt/index.apt.vm
++++ b/hadoop-common-project/hadoop-kms/src/site/apt/index.apt.vm
+@@ -107,7 +107,7 @@ Hadoop Key Management Server (KMS) - Documentation Sets ${project.version}
+ ** KMS Aggregated Audit logs
+ 
+   Audit logs are aggregated for API accesses to the GET_KEY_VERSION,
+-  GET_CURRENT_KEY, DECRYPT_EEK, GENERATE_EEK operations.
++  GET_CURRENT_KEY, DECRYPT_EEK, GENERATE_EEK, REENCRYPT\_EEK operations.
+ 
+   Entries are grouped by the (user,key,operation) combined key for a
+   configurable aggregation interval after which the number of accesses to the
+@@ -477,7 +477,7 @@ $ keytool -genkey -alias tomcat -keyalg RSA
+ 
+     * MANAGEMENT - createKey, deleteKey, rolloverNewVersion
+ 
+-    * GENERATE_EEK - generateEncryptedKey, warmUpEncryptedKeys
++    * GENERATE_EEK - generateEncryptedKey, reencryptEncryptedKey, warmUpEncryptedKeys
+ 
+     * DECRYPT_EEK - decryptEncryptedKey
+ 
+@@ -886,7 +886,7 @@ GET http://HOST:PORT/kms/v1/key/<key-name>/_eek?eek_op=generate&num_keys=<number
+ Content-Type: application/json
+ [
+   {
+-    "versionName"         : "encryptionVersionName",
++    "versionName"         : "<encryptionVersionName>",
+     "iv"                  : "<iv>",          //base64
+     "encryptedKeyVersion" : {
+         "versionName"       : "EEK",
+@@ -894,7 +894,7 @@ Content-Type: application/json
+     }
+   },
+   {
+-    "versionName"         : "encryptionVersionName",
++    "versionName"         : "<encryptionVersionName>",
+     "iv"                  : "<iv>",          //base64
+     "encryptedKeyVersion" : {
+         "versionName"       : "EEK",
+@@ -933,6 +933,41 @@ Content-Type: application/json
+ }
+ +---+
+ 
++*** Re-encrypt Encrypted Key With The Latest KeyVersion
++
++  This command takes a previously generated encrypted key, and re-encrypts it using the latest KeyVersion encryption key in the KeyProvider. If the latest KeyVersion is the same as the one used to generate the encrypted key, the same encrypted key is returned.
++
++  This is usually useful after a {{{./index.html#Rollover_Key}<<<Rollover>>>}} of an encryption key. Re-encrypting the encrypted key will allow it to be encrypted using the latest version of the encryption key, but still with the same key material and initialization vector.
++
++  <REQUEST:>
++
+++---+
++POST http://HOST:PORT/kms/v1/keyversion/<version-name>/_eek?eek_op=reencrypt
++Content-Type: application/json
++
++{
++  "name"        : "<key-name>",
++  "iv"          : "<iv>",          //base64
++  "material"    : "<material>",    //base64
++}
++
+++---+
++
++  <RESPONSE:>
++
+++---+
++200 OK
++Content-Type: application/json
++
++{
++  "versionName"         : "<encryptionVersionName>",
++  "iv"                  : "<iv>",            //base64
++  "encryptedKeyVersion" : {
++    "versionName"       : "EEK",
++    "material"          : "<material>",    //base64
++  }
++}
+++---+
+ 
+ *** Get Key Version
+ 
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+index f8d5d6e..27d3405 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+@@ -70,6 +70,7 @@
+ import java.net.URL;
+ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Date;
+ import java.util.HashMap;
+@@ -81,6 +82,11 @@
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ 
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++
+ public class TestKMS {
+   private static final Logger LOG = LoggerFactory.getLogger(TestKMS.class);
+ 
+@@ -460,6 +466,7 @@ public Void call() throws Exception {
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:methodlength")
+   public void testKMSProvider() throws Exception {
+     Configuration conf = new Configuration();
+     conf.set("hadoop.security.authentication", "kerberos");
+@@ -604,6 +611,25 @@ public Void call() throws Exception {
+         }
+         Assert.assertFalse(isEq);
+ 
++        // test re-encrypt
++        kpExt.rollNewVersion(ek1.getEncryptionKeyName());
++        EncryptedKeyVersion ek1r = kpExt.reencryptEncryptedKey(ek1);
++        assertEquals(KeyProviderCryptoExtension.EEK,
++            ek1r.getEncryptedKeyVersion().getVersionName());
++        assertFalse(Arrays.equals(ek1.getEncryptedKeyVersion().getMaterial(),
++            ek1r.getEncryptedKeyVersion().getMaterial()));
++        assertEquals(kv.getMaterial().length,
++            ek1r.getEncryptedKeyVersion().getMaterial().length);
++        assertEquals(ek1.getEncryptionKeyName(), ek1r.getEncryptionKeyName());
++        assertArrayEquals(ek1.getEncryptedKeyIv(), ek1r.getEncryptedKeyIv());
++        assertNotEquals(ek1.getEncryptionKeyVersionName(),
++            ek1r.getEncryptionKeyVersionName());
++
++        KeyProvider.KeyVersion k1r = kpExt.decryptEncryptedKey(ek1r);
++        assertEquals(KeyProviderCryptoExtension.EK, k1r.getVersionName());
++        assertArrayEquals(k1.getMaterial(), k1r.getMaterial());
++        assertEquals(kv.getMaterial().length, k1r.getMaterial().length);
++
+         // deleteKey()
+         kp.deleteKey("k1");
+ 
+@@ -719,6 +745,7 @@ public Void call() throws Exception {
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:methodlength")
+   public void testKeyACLs() throws Exception {
+     Configuration conf = new Configuration();
+     conf.set("hadoop.security.authentication", "kerberos");
+@@ -967,17 +994,10 @@ public Void call() throws Exception {
+           @Override
+           public Void run() throws Exception {
+             KeyProvider kp = createProvider(uri, conf);
+-            try {
+-              KeyProviderCryptoExtension kpce =
+-                  KeyProviderCryptoExtension.createKeyProviderCryptoExtension(kp);
+-              try {
+-                kpce.generateEncryptedKey("k1");
+-              } catch (Exception e) {
+-                Assert.fail("User [GENERATE_EEK] should be allowed to generate_eek on k1");
+-              }
+-            } catch (Exception ex) {
+-              Assert.fail(ex.getMessage());
+-            }
++            KeyProviderCryptoExtension kpce =
++                KeyProviderCryptoExtension.createKeyProviderCryptoExtension(kp);
++            EncryptedKeyVersion ekv = kpce.generateEncryptedKey("k1");
++            kpce.reencryptEncryptedKey(ekv);
+             return null;
+           }
+         });
+@@ -1168,6 +1188,7 @@ public Void run() throws Exception {
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:methodlength")
+   public void testACLs() throws Exception {
+     Configuration conf = new Configuration();
+     conf.set("hadoop.security.authentication", "kerberos");
+@@ -1399,6 +1420,17 @@ public EncryptedKeyVersion run() throws Exception {
+           }
+         });
+ 
++        doAs("GENERATE_EEK", new PrivilegedExceptionAction<Void>() {
++          @Override
++          public Void run() throws Exception {
++            KeyProvider kp = createProvider(uri, conf);
++            KeyProviderCryptoExtension kpCE = KeyProviderCryptoExtension.
++                createKeyProviderCryptoExtension(kp);
++            kpCE.reencryptEncryptedKey(encKv);
++            return null;
++          }
++        });
++
+         doAs("DECRYPT_EEK", new PrivilegedExceptionAction<Void>() {
+           @Override
+           public Void run() throws Exception {
+@@ -1447,6 +1479,7 @@ public Void run() throws Exception {
+         // test ACL reloading
+         Thread.sleep(10); // to ensure the ACLs file modifiedTime is newer
+         conf.set(KMSACLs.Type.CREATE.getAclConfigKey(), "foo");
++        conf.set(KMSACLs.Type.GENERATE_EEK.getAclConfigKey(), "foo");
+         writeConf(testDir, conf);
+         Thread.sleep(1000);
+ 
+@@ -1471,6 +1504,41 @@ public Void run() throws Exception {
+           }
+         });
+ 
++        doAs("GENERATE_EEK", new PrivilegedExceptionAction<Void>() {
++          @Override
++          public Void run() throws Exception {
++            KeyProvider kp = createProvider(uri, conf);
++            try {
++              KeyProviderCryptoExtension kpCE = KeyProviderCryptoExtension.
++                  createKeyProviderCryptoExtension(kp);
++              kpCE.generateEncryptedKey("k1");
++            } catch (IOException ex) {
++              // This isn't an AuthorizationException because generate goes
++              // through the ValueQueue. See KMSCP#generateEncryptedKey.
++              if (ex.getCause().getCause() instanceof AuthorizationException) {
++                LOG.info("Caught expected exception.", ex);
++              } else {
++                throw ex;
++              }
++            }
++            return null;
++          }
++        });
++
++        doAs("GENERATE_EEK", new PrivilegedExceptionAction<Void>() {
++          @Override
++          public Void run() throws Exception {
++            KeyProvider kp = createProvider(uri, conf);
++            try {
++              KeyProviderCryptoExtension kpCE = KeyProviderCryptoExtension.
++                  createKeyProviderCryptoExtension(kp);
++              kpCE.reencryptEncryptedKey(encKv);
++            } catch (AuthorizationException ex) {
++              LOG.info("Caught expected exception.", ex);
++            }
++            return null;
++          }
++        });
+         return null;
+       }
+     });
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+index 40cbb53..70112df 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+@@ -95,6 +95,7 @@ private String getAndResetLogOutput() {
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:linelength")
+   public void testAggregation() throws Exception {
+     UserGroupInformation luser = Mockito.mock(UserGroupInformation.class);
+     Mockito.when(luser.getShortUserName()).thenReturn("luser");
+@@ -109,6 +110,10 @@ public void testAggregation() throws Exception {
+     kmsAudit.evictCacheForTesting();
+     kmsAudit.ok(luser, KMSOp.DECRYPT_EEK, "k1", "testmsg");
+     kmsAudit.evictCacheForTesting();
++    kmsAudit.ok(luser, KMSOp.REENCRYPT_EEK, "k1", "testmsg");
++    kmsAudit.ok(luser, KMSOp.REENCRYPT_EEK, "k1", "testmsg");
++    kmsAudit.ok(luser, KMSOp.REENCRYPT_EEK, "k1", "testmsg");
++    kmsAudit.evictCacheForTesting();
+     String out = getAndResetLogOutput();
+     System.out.println(out);
+     Assert.assertTrue(
+@@ -119,10 +124,13 @@ public void testAggregation() throws Exception {
+             + "OK\\[op=ROLL_NEW_VERSION, key=k1, user=luser\\] testmsg"
+             // Aggregated
+             + "OK\\[op=DECRYPT_EEK, key=k1, user=luser, accessCount=6, interval=[^m]{1,4}ms\\] testmsg"
+-            + "OK\\[op=DECRYPT_EEK, key=k1, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"));
++            + "OK\\[op=DECRYPT_EEK, key=k1, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
++            + "OK\\[op=REENCRYPT_EEK, key=k1, user=luser, accessCount=1, interval=[^m]{1,4}ms\\] testmsg"
++            + "OK\\[op=REENCRYPT_EEK, key=k1, user=luser, accessCount=3, interval=[^m]{1,4}ms\\] testmsg"));
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:linelength")
+   public void testAggregationUnauth() throws Exception {
+     UserGroupInformation luser = Mockito.mock(UserGroupInformation.class);
+     Mockito.when(luser.getShortUserName()).thenReturn("luser");
+@@ -159,6 +167,7 @@ public void testAggregationUnauth() throws Exception {
+   }
+ 
+   @Test
++  @SuppressWarnings("checkstyle:linelength")
+   public void testAuditLogFormat() throws Exception {
+     UserGroupInformation luser = Mockito.mock(UserGroupInformation.class);
+     Mockito.when(luser.getShortUserName()).thenReturn("luser");
+-- 
+1.7.9.5
+

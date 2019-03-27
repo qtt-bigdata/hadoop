@@ -1,0 +1,170 @@
+From 0f5e722ec6289850f26a07582d970538da04c426 Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Mon, 8 Jun 2015 15:37:53 -0700
+Subject: [PATCH 2502/2848] HADOOP-12054. RPC client should not retry for
+ InvalidToken exceptions. (Contributed by Varun
+ Saxena)
+
+(cherry picked from commit 82e772bdbb153bbfaaf459dfa1bc4dd7ab347d9e)
+
+Change-Id: If3836f4ef4b1c64b183d55d7acbf649290063fdb
+---
+ .../org/apache/hadoop/io/retry/RetryPolicies.java  |    4 +
+ .../test/java/org/apache/hadoop/ipc/TestIPC.java   |   78 +++++++++++++++++---
+ 2 files changed, 73 insertions(+), 9 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+index 47c14c1..e5b88f7 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+@@ -37,6 +37,7 @@
+ import org.apache.hadoop.ipc.RetriableException;
+ import org.apache.hadoop.ipc.StandbyException;
+ import org.apache.hadoop.net.ConnectTimeoutException;
++import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -655,6 +656,9 @@ public RetryAction shouldRetry(Exception e, int retries,
+         // RetriableException or RetriableException wrapped 
+         return new RetryAction(RetryAction.RetryDecision.RETRY,
+               getFailoverOrRetrySleepTime(retries));
++      } else if (e instanceof InvalidToken) {
++        return new RetryAction(RetryAction.RetryDecision.FAIL, 0,
++            "Invalid or Cancelled Token");
+       } else if (e instanceof SocketException
+           || (e instanceof IOException && !(e instanceof RemoteException))) {
+         if (isIdempotentOrAtMostOnce) {
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+index f959526..7d8d157 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+@@ -66,6 +66,9 @@
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
++import org.apache.hadoop.io.retry.DefaultFailoverProxyProvider;
++import org.apache.hadoop.io.retry.FailoverProxyProvider;
++import org.apache.hadoop.io.retry.Idempotent;
+ import org.apache.hadoop.io.retry.RetryPolicies;
+ import org.apache.hadoop.io.retry.RetryProxy;
+ import org.apache.hadoop.ipc.Client.ConnectionId;
+@@ -77,6 +80,7 @@
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.log4j.Level;
+ import org.junit.Assert;
+ import org.junit.Assume;
+@@ -211,18 +215,21 @@ public void run() {
+       this.server = server;
+       this.total = total;
+     }
+-    
++
++    protected Object returnValue(Object value) throws Exception {
++      if (retry++ < total) {
++        throw new IOException("Fake IOException");
++      }
++      return value;
++    }
++
+     @Override
+     public Object invoke(Object proxy, Method method, Object[] args)
+         throws Throwable {
+       LongWritable param = new LongWritable(RANDOM.nextLong());
+       LongWritable value = (LongWritable) client.call(param,
+           NetUtils.getConnectAddress(server), null, null, 0, conf);
+-      if (retry++ < total) {
+-        throw new IOException("Fake IOException");
+-      } else {
+-        return value;
+-      }
++      return returnValue(value);
+     }
+ 
+     @Override
+@@ -233,7 +240,26 @@ public ConnectionId getConnectionId() {
+       return null;
+     }
+   }
+-  
++
++  private static class TestInvalidTokenHandler extends TestInvocationHandler {
++    private int invocations = 0;
++    TestInvalidTokenHandler(Client client, Server server) {
++      super(client, server, 1);
++    }
++
++    @Override
++    protected Object returnValue(Object value) throws Exception {
++      throw new InvalidToken("Invalid Token");
++    }
++
++    @Override
++    public Object invoke(Object proxy, Method method, Object[] args)
++        throws Throwable {
++      invocations++;
++      return super.invoke(proxy, method, args);
++    }
++  }
++
+   @Test(timeout=60000)
+   public void testSerial() throws Exception {
+     internalTestSerial(3, false, 2, 5, 100);
+@@ -1083,7 +1109,8 @@ public void run() {
+   
+   /** A dummy protocol */
+   private interface DummyProtocol {
+-    public void dummyRun();
++    @Idempotent
++    public void dummyRun() throws IOException;
+   }
+   
+   /**
+@@ -1122,7 +1149,40 @@ public void run() {
+       server.stop();
+     }
+   }
+-  
++
++  /**
++   * Test that there is no retry when invalid token exception is thrown.
++   * Verfies fix for HADOOP-12054
++   */
++  @Test(expected = InvalidToken.class)
++  public void testNoRetryOnInvalidToken() throws IOException {
++    final Client client = new Client(LongWritable.class, conf);
++    final TestServer server = new TestServer(1, false);
++    TestInvalidTokenHandler handler =
++        new TestInvalidTokenHandler(client, server);
++    DummyProtocol proxy = (DummyProtocol) Proxy.newProxyInstance(
++        DummyProtocol.class.getClassLoader(),
++        new Class[] { DummyProtocol.class }, handler);
++    FailoverProxyProvider<DummyProtocol> provider =
++        new DefaultFailoverProxyProvider<DummyProtocol>(
++            DummyProtocol.class, proxy);
++    DummyProtocol retryProxy =
++        (DummyProtocol) RetryProxy.create(DummyProtocol.class, provider,
++        RetryPolicies.failoverOnNetworkException(
++            RetryPolicies.TRY_ONCE_THEN_FAIL, 100, 100, 10000, 0));
++
++    try {
++      server.start();
++      retryProxy.dummyRun();
++    } finally {
++      // Check if dummyRun called only once
++      Assert.assertEquals(handler.invocations, 1);
++      Client.setCallIdAndRetryCount(0, 0);
++      client.stop();
++      server.stop();
++    }
++  }
++
+   /**
+    * Test if the rpc server gets the default retry count (0) from client.
+    */
+-- 
+1.7.9.5
+

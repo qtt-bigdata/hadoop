@@ -1,0 +1,238 @@
+From e3473d0b6b98d8a8f1a74923972685090c2553b6 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Tue, 13 Sep 2016 16:29:05 +0000
+Subject: [PATCH 1990/2848] YARN-5009. NMLeveldbStateStoreService database can
+ grow substantially leading to longer recovery
+ times. Contributed by Jason Lowe
+
+(cherry picked from commit 9074ebc0d1d33e1759f426a53ba9af641a340249)
+
+Change-Id: I1c32156732fe5143f629f8410392b7eb89dd08ad
+---
+ .../apache/hadoop/yarn/conf/YarnConfiguration.java |    7 +++
+ .../src/main/resources/yarn-default.xml            |   15 +++++--
+ .../recovery/NMLeveldbStateStoreService.java       |   45 +++++++++++++++++++-
+ .../recovery/TestNMLeveldbStateStoreService.java   |   25 +++++++++++
+ 4 files changed, 86 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index 692817a..aa284b7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -1204,6 +1204,13 @@ private static void addDeprecatedKeys() {
+ 
+   public static final String NM_RECOVERY_DIR = NM_RECOVERY_PREFIX + "dir";
+ 
++  /** The time in seconds between full compactions of the NM state database.
++   *  Setting the interval to zero disables the full compaction cycles.
++   */
++  public static final String NM_RECOVERY_COMPACTION_INTERVAL_SECS =
++      NM_RECOVERY_PREFIX + "compaction-interval-secs";
++  public static final int DEFAULT_NM_RECOVERY_COMPACTION_INTERVAL_SECS = 3600;
++
+   ////////////////////////////////
+   // Web Proxy Configs
+   ////////////////////////////////
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 43e3180..589aa7f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -1030,7 +1030,7 @@
+     <description>The maximum percentage of disk space utilization allowed after 
+     which a disk is marked as bad. Values can range from 0.0 to 100.0. 
+     If the value is greater than or equal to 100, the nodemanager will check 
+-    for full disk. This applies to yarn-nodemanager.local-dirs and 
++    for full disk. This applies to yarn-nodemanager.local-dirs and
+     yarn.nodemanager.log-dirs.</description>
+     <name>yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage</name>
+     <value>90.0</value>
+@@ -1049,7 +1049,7 @@
+ 
+   <property>
+     <description>The minimum space that must be available on a disk for
+-    it to be used. This applies to yarn-nodemanager.local-dirs and 
++    it to be used. This applies to yarn-nodemanager.local-dirs and
+     yarn.nodemanager.log-dirs.</description>
+     <name>yarn.nodemanager.disk-health-checker.min-free-space-per-disk-mb</name>
+     <value>0</value>
+@@ -1229,13 +1229,20 @@
+ 
+   <property>
+     <description>
+-    The delay time ms to unregister container metrics after completion.
++        The delay time ms to unregister container metrics after completion.
+     </description>
+     <name>yarn.nodemanager.container-metrics.unregister-delay-ms</name>
+     <value>10000</value>
+   </property>
+ 
+-  <!-- Docker Configuration -->
++  <property>
++    <description>The time in seconds between full compactions of the NM state
++        database. Setting the interval to zero disables the full compaction
++        cycles.</description>
++    <name>yarn.nodemanager.recovery.compaction-interval-secs</name>
++    <value>3600</value>
++  </property>
++  <!--Docker configuration-->
+ 
+   <property>
+     <name>yarn.nodemanager.docker-container-executor.exec-name</name>
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
+index df58182..201f51e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/recovery/NMLeveldbStateStoreService.java
+@@ -28,6 +28,8 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
++import java.util.Timer;
++import java.util.TimerTask;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -35,6 +37,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.yarn.api.protocolrecords.StartContainerRequest;
+ import org.apache.hadoop.yarn.api.protocolrecords.impl.pb.StartContainerRequestPBImpl;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+@@ -122,6 +125,7 @@
+ 
+   private DB db;
+   private boolean isNewlyCreated;
++  private Timer compactionTimer;
+ 
+   public NMLeveldbStateStoreService() {
+     super(NMLeveldbStateStoreService.class.getName());
+@@ -133,6 +137,10 @@ protected void startStorage() throws IOException {
+ 
+   @Override
+   protected void closeStorage() throws IOException {
++    if (compactionTimer != null) {
++      compactionTimer.cancel();
++      compactionTimer = null;
++    }
+     if (db != null) {
+       db.close();
+     }
+@@ -920,6 +928,12 @@ private String getLogDeleterKey(ApplicationId appId) {
+   @Override
+   protected void initStorage(Configuration conf)
+       throws IOException {
++    db = openDatabase(conf);
++    checkVersion();
++    startCompactionTimer(conf);
++  }
++
++  protected DB openDatabase(Configuration conf) throws IOException {
+     Path storeRoot = createStorageDir(conf);
+     Options options = new Options();
+     options.createIfMissing(false);
+@@ -944,7 +958,7 @@ protected void initStorage(Configuration conf)
+         throw e;
+       }
+     }
+-    checkVersion();
++    return db;
+   }
+ 
+   private Path createStorageDir(Configuration conf) throws IOException {
+@@ -960,6 +974,33 @@ private Path createStorageDir(Configuration conf) throws IOException {
+     return root;
+   }
+ 
++  private void startCompactionTimer(Configuration conf) {
++    long intervalMsec = conf.getLong(
++        YarnConfiguration.NM_RECOVERY_COMPACTION_INTERVAL_SECS,
++        YarnConfiguration.DEFAULT_NM_RECOVERY_COMPACTION_INTERVAL_SECS) * 1000;
++    if (intervalMsec > 0) {
++      compactionTimer = new Timer(
++          this.getClass().getSimpleName() + " compaction timer", true);
++      compactionTimer.schedule(new CompactionTimerTask(),
++          intervalMsec, intervalMsec);
++    }
++  }
++
++
++  private class CompactionTimerTask extends TimerTask {
++    @Override
++    public void run() {
++      long start = Time.monotonicNow();
++      LOG.info("Starting full compaction cycle");
++      try {
++        db.compactRange(null, null);
++      } catch (DBException e) {
++        LOG.error("Error compacting database", e);
++      }
++      long duration = Time.monotonicNow() - start;
++      LOG.info("Full compaction cycle completed in " + duration + " msec");
++    }
++  }
+ 
+   private static class LeveldbLogger implements Logger {
+     private static final Log LOG = LogFactory.getLog(LeveldbLogger.class);
+@@ -1017,7 +1058,7 @@ Version getCurrentVersion() {
+    *    throw exception and indicate user to use a separate upgrade tool to
+    *    upgrade NM state or remove incompatible old state.
+    */
+-  private void checkVersion() throws IOException {
++  protected void checkVersion() throws IOException {
+     Version loadedVersion = loadVersion();
+     LOG.info("Loaded NM state version info " + loadedVersion);
+     if (loadedVersion.equals(getCurrentVersion())) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
+index 38eae27..ad3122a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/recovery/TestNMLeveldbStateStoreService.java
+@@ -23,6 +23,10 @@
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertFalse;
++import static org.mockito.Mockito.isNull;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.timeout;
++import static org.mockito.Mockito.verify;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -75,6 +79,7 @@
+ import org.apache.hadoop.yarn.server.security.BaseNMTokenSecretManager;
+ import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+ import org.apache.hadoop.yarn.util.ConverterUtils;
++import org.iq80.leveldb.DB;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
+@@ -882,6 +887,26 @@ public void testLogDeleterStorage() throws IOException {
+     assertTrue(state.getLogDeleterMap().isEmpty());
+   }
+ 
++  @Test
++  public void testCompactionCycle() throws IOException {
++    final DB mockdb = mock(DB.class);
++    conf.setInt(YarnConfiguration.NM_RECOVERY_COMPACTION_INTERVAL_SECS, 1);
++    NMLeveldbStateStoreService store = new NMLeveldbStateStoreService() {
++      @Override
++      protected void checkVersion() {}
++
++      @Override
++      protected DB openDatabase(Configuration conf) {
++        return mockdb;
++      }
++    };
++    store.init(conf);
++    store.start();
++    verify(mockdb, timeout(10000)).compactRange(
++        (byte[]) isNull(), (byte[]) isNull());
++    store.close();
++  }
++
+   private static class NMTokenSecretManagerForTest extends
+       BaseNMTokenSecretManager {
+     public MasterKey generateKey() {
+-- 
+1.7.9.5
+

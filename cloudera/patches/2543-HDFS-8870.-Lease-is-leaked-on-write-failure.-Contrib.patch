@@ -1,0 +1,172 @@
+From 5ca317a0208143a697589feb50bd597bf502a6bf Mon Sep 17 00:00:00 2001
+From: John Zhuge <jzhuge@cloudera.com>
+Date: Mon, 26 Jun 2017 16:48:09 -0700
+Subject: [PATCH 2543/2848] HDFS-8870. Lease is leaked on write failure.
+ Contributed by Kuhu Shukla.
+
+(cherry picked from commit 4fcea8a0c8019d6d9a5e6f315c83659938b93a40)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
+
+Change-Id: If93b39cdce2e0d3a9f7cdd78d016998612eafe48
+---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |    4 +--
+ .../org/apache/hadoop/hdfs/DFSOutputStream.java    |   27 ++++++++++----------
+ .../java/org/apache/hadoop/hdfs/LeaseRenewer.java  |    2 +-
+ .../apache/hadoop/hdfs/TestDFSOutputStream.java    |   19 ++++++++++++++
+ 4 files changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 9953754..87c849e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -866,7 +866,7 @@ void checkOpen() throws IOException {
+    *  until the first output stream is created. The same instance will
+    *  be returned until all output streams are closed.
+    */
+-  public LeaseRenewer getLeaseRenewer() throws IOException {
++  public LeaseRenewer getLeaseRenewer() {
+     return LeaseRenewer.getInstance(
+         namenodeUri != null ? namenodeUri.getAuthority() : "null", ugi, this);
+   }
+@@ -878,7 +878,7 @@ private void beginFileLease(final long inodeId, final DFSOutputStream out)
+   }
+ 
+   /** Stop renewal of lease for the file. */
+-  void endFileLease(final long inodeId) throws IOException {
++  void endFileLease(final long inodeId) {
+     getLeaseRenewer().closeFile(inodeId, this);
+   }
+     
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+index 138af98..ee0785d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+@@ -920,7 +920,7 @@ private void closeInternal() {
+       closeResponder();       // close and join
+       closeStream();
+       streamerClosed = true;
+-      setClosed();
++      release();
+       synchronized (dataQueue) {
+         dataQueue.notifyAll();
+       }
+@@ -2600,11 +2600,6 @@ void abort() throws IOException {
+         ioes.add(e);
+       }
+     }
+-    try {
+-      dfsClient.endFileLease(fileId);
+-    } catch (IOException e) {
+-      ioes.add(e);
+-    }
+     final IOException ioe = MultipleIOException.createIOException(ioes);
+     if (ioe != null) {
+       throw ioe;
+@@ -2612,17 +2607,26 @@ void abort() throws IOException {
+   }
+ 
+   boolean isClosed() {
+-    return closed;
++    return closed || getStreamer().streamerClosed;
+   }
+ 
+   void setClosed() {
+     closed = true;
++    dfsClient.endFileLease(fileId);
++    release();
++  }
++
++  /**
++   * release the DFSPackets in the two queues
++   *
++   */
++  void release() {
+     synchronized (dataQueue) {
+       releaseBuffer(dataQueue, byteArrayManager);
+       releaseBuffer(ackQueue, byteArrayManager);
+     }
+   }
+-  
++
+   private static void releaseBuffer(List<Packet> packets, ByteArrayManager bam) {
+     for(Packet p : packets) {
+       p.releaseBuffer(bam);
+@@ -2632,7 +2636,7 @@ private static void releaseBuffer(List<Packet> packets, ByteArrayManager bam) {
+ 
+   // shutdown datastreamer and responseprocessor threads.
+   // interrupt datastreamer if force is true
+-  private void closeThreads(boolean force) throws IOException {
++  protected void closeThreads(boolean force) throws IOException {
+     try {
+       streamer.close(force);
+       streamer.join();
+@@ -2666,11 +2670,6 @@ public void close() throws IOException {
+         scope.close();
+       }
+     }
+-    try {
+-      dfsClient.endFileLease(fileId);
+-    } catch (IOException e) {
+-      ioes.add(e);
+-    }
+     final IOException ioe = MultipleIOException.createIOException(ioes);
+     if (ioe != null) {
+       throw ioe;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
+index 855b539..0f39d1c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/LeaseRenewer.java
+@@ -76,7 +76,7 @@
+ 
+   /** Get a {@link LeaseRenewer} instance */
+   static LeaseRenewer getInstance(final String authority,
+-      final UserGroupInformation ugi, final DFSClient dfsc) throws IOException {
++      final UserGroupInformation ugi, final DFSClient dfsc) {
+     final LeaseRenewer r = Factory.INSTANCE.get(authority, ugi);
+     r.addClient(dfsc);
+     return r;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+index 4d2217f..4c29f59 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSOutputStream.java
+@@ -48,6 +48,11 @@
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
++import static org.mockito.Matchers.anyBoolean;
++import static org.mockito.Matchers.anyLong;
++import org.mockito.Mockito;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
+ import org.mockito.internal.util.reflection.Whitebox;
+ 
+ import static org.mockito.Mockito.mock;
+@@ -168,6 +173,20 @@ public void testCongestionBackoff() throws IOException {
+     Assert.assertTrue(congestedNodes.isEmpty());
+   }
+ 
++  @Test
++  public void testEndLeaseCall() throws Exception {
++    Configuration conf = new Configuration();
++    DFSClient client = new DFSClient(cluster.getNameNode(0)
++        .getNameNodeAddress(), conf);
++    DFSClient spyClient = Mockito.spy(client);
++    DFSOutputStream dfsOutputStream = spyClient.create("/file2",
++        FsPermission.getFileDefault(),
++        EnumSet.of(CreateFlag.CREATE), (short) 3, 1024, null , 1024, null);
++    DFSOutputStream spyDFSOutputStream = Mockito.spy(dfsOutputStream);
++    spyDFSOutputStream.closeThreads(anyBoolean());
++    verify(spyClient, times(1)).endFileLease(anyLong());
++  }
++
+   @AfterClass
+   public static void tearDown() {
+     cluster.shutdown();
+-- 
+1.7.9.5
+

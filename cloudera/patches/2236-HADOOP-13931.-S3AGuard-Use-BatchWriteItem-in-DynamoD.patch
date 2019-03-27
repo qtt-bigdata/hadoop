@@ -1,0 +1,116 @@
+From 46c9aa0d918304d2a80e40e9d5467c514a6b0807 Mon Sep 17 00:00:00 2001
+From: Chris Nauroth <cnauroth@apache.org>
+Date: Fri, 6 Jan 2017 10:30:47 -0800
+Subject: [PATCH 2236/2848] HADOOP-13931. S3AGuard: Use BatchWriteItem in
+ DynamoDBMetadataStore#put(). Contributed by
+ Mingliang Liu.
+
+(cherry picked from commit a1b47db405832087c080a4c5743f2efaa620d566)
+
+Change-Id: I143e350df5753c1844683bbfe2adb1040831b198
+---
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |   51 ++++++++++++--------
+ .../hadoop/fs/s3a/s3guard/MetadataStore.java       |    5 +-
+ 2 files changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index e3bff13..42b89a1 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -415,9 +415,27 @@ private void processBatchWriteRequest(PrimaryKey[] keysToDelete,
+ 
+   @Override
+   public void put(PathMetadata meta) throws IOException {
+-    checkPathMetadata(meta);
++    // For a deeply nested path, this method will automatically create the full
++    // ancestry and save respective item in DynamoDB table.
++    // So after put operation, we maintain the invariant that if a path exists,
++    // all its ancestors will also exist in the table.
++    // For performance purpose, we generate the full paths to put and use batch
++    // write item request to save the items.
+     LOG.debug("Saving to table {} in region {}: {}", tableName, region, meta);
+-    innerPut(meta);
++    processBatchWriteRequest(null, pathMetadataToItem(fullPathsToPut(meta)));
++  }
++
++  /**
++   * Helper method to get full path of ancestors that are nonexistent in table.
++   */
++  private Collection<PathMetadata> fullPathsToPut(PathMetadata meta)
++      throws IOException {
++    checkPathMetadata(meta);
++    final Collection<PathMetadata> metasToPut = new ArrayList<>();
++    // root path is not persisted
++    if (!meta.getFileStatus().getPath().isRoot()) {
++      metasToPut.add(meta);
++    }
+ 
+     // put all its ancestors if not present; as an optimization we return at its
+     // first existent ancestor
+@@ -429,34 +447,29 @@ public void put(PathMetadata meta) throws IOException {
+       final Item item = table.getItem(spec);
+       if (item == null) {
+         final S3AFileStatus status = new S3AFileStatus(false, path, username);
+-        innerPut(new PathMetadata(status));
++        metasToPut.add(new PathMetadata(status));
+         path = path.getParent();
+       } else {
+         break;
+       }
+     }
+-  }
+-
+-  private void innerPut(PathMetadata meta) throws IOException {
+-    final Path path = meta.getFileStatus().getPath();
+-    if (path.isRoot()) {
+-      LOG.debug("Root path / is not persisted");
+-      return;
+-    }
+-
+-    try {
+-      table.putItem(pathMetadataToItem(meta));
+-    } catch (AmazonClientException e) {
+-      throw translateException("put", path, e);
+-    }
++    return metasToPut;
+   }
+ 
+   @Override
+   public void put(DirListingMetadata meta) throws IOException {
+     LOG.debug("Saving to table {} in region {}: {}", tableName, region, meta);
+ 
+-    for (PathMetadata pathMetadata : meta.getListing()) {
+-      put(pathMetadata);
++    // directory path
++    final Collection<PathMetadata> metasToPut = fullPathsToPut(
++        new PathMetadata(new S3AFileStatus(false, meta.getPath(), username)));
++    // all children of the directory
++    metasToPut.addAll(meta.getListing());
++
++    try {
++      processBatchWriteRequest(null, pathMetadataToItem(metasToPut));
++    } catch (AmazonClientException e) {
++      throw translateException("put", (String) null, e);
+     }
+   }
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+index 6d3c440..5c611c2 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+@@ -113,10 +113,9 @@ void move(Collection<Path> pathsToDelete, Collection<PathMetadata>
+       pathsToCreate) throws IOException;
+ 
+   /**
+-   * Saves metadata for exactly one path.  For a deeply nested path, this method
+-   * will not automatically create the full ancestry.  Callers need to ensure
+-   * saving the full path ancestry.
++   * Saves metadata for exactly one path.
+    *
++   * Implementations may pre-create all the path's ancestors automatically.
+    * Implementations must update any {@code DirListingMetadata} objects which
+    * track the immediate parent of this file.
+    *
+-- 
+1.7.9.5
+

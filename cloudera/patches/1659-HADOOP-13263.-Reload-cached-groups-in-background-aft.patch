@@ -1,0 +1,572 @@
+From f0cbc3158a6fdd89d033ae018b968a0135b0de5a Mon Sep 17 00:00:00 2001
+From: Arpit Agarwal <arp@apache.org>
+Date: Mon, 27 Jun 2016 09:49:04 -0700
+Subject: [PATCH 1659/2848] HADOOP-13263. Reload cached groups in background
+ after expiry. (Contributed bt Stephen O'Donnell)
+
+(cherry picked from commit f7bd3025501bad6a90e76545f49a64a00a34c765)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+	hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+
+Change-Id: I62d70ed42f2a7b21257eedd03e91599f661c0503
+---
+ .../hadoop/fs/CommonConfigurationKeysPublic.java   |   13 +
+ .../java/org/apache/hadoop/security/Groups.java    |  119 ++++++++-
+ .../src/main/resources/core-default.xml            |   22 ++
+ .../apache/hadoop/security/TestGroupsCaching.java  |  269 +++++++++++++++++++-
+ 4 files changed, 419 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+index 590b63d..f66dc00 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+@@ -264,6 +264,19 @@
+   public static final long HADOOP_SECURITY_GROUPS_CACHE_WARN_AFTER_MS_DEFAULT =
+     5000;
+   /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a> */
++  public static final String HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD =
++      "hadoop.security.groups.cache.background.reload";
++  /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a>. */
++  public static final boolean
++      HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_DEFAULT = false;
++  /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a>. */
++  public static final String
++      HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS =
++          "hadoop.security.groups.cache.background.reload.threads";
++  /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a>. */
++  public static final int
++      HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS_DEFAULT = 3;
++  /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a>.*/
+   public static final String  HADOOP_SECURITY_AUTHENTICATION =
+     "hadoop.security.authentication";
+   /** See <a href="{@docRoot}/../core-default.html">core-default.xml</a> */
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
+index 9fd39b0..6815ab4 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
+@@ -24,8 +24,13 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Ticker;
+@@ -33,6 +38,11 @@
+ import com.google.common.cache.Cache;
+ import com.google.common.cache.CacheLoader;
+ import com.google.common.cache.LoadingCache;
++import com.google.common.util.concurrent.ListenableFuture;
++import com.google.common.util.concurrent.ListeningExecutorService;
++import com.google.common.util.concurrent.MoreExecutors;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+@@ -69,6 +79,17 @@
+   private final long warningDeltaMs;
+   private final Timer timer;
+   private Set<String> negativeCache;
++  private final boolean reloadGroupsInBackground;
++  private final int reloadGroupsThreadCount;
++
++  private final AtomicLong backgroundRefreshSuccess =
++      new AtomicLong(0);
++  private final AtomicLong backgroundRefreshException =
++      new AtomicLong(0);
++  private final AtomicLong backgroundRefreshQueued =
++      new AtomicLong(0);
++  private final AtomicLong backgroundRefreshRunning =
++      new AtomicLong(0);
+ 
+   public Groups(Configuration conf) {
+     this(conf, new Timer());
+@@ -91,6 +112,18 @@ public Groups(Configuration conf, final Timer timer) {
+     warningDeltaMs =
+       conf.getLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_WARN_AFTER_MS,
+         CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_WARN_AFTER_MS_DEFAULT);
++    reloadGroupsInBackground =
++      conf.getBoolean(
++          CommonConfigurationKeys.
++              HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++          CommonConfigurationKeys.
++              HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_DEFAULT);
++    reloadGroupsThreadCount  =
++      conf.getInt(
++          CommonConfigurationKeys.
++              HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS,
++          CommonConfigurationKeys.
++              HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS_DEFAULT);
+     parseStaticMapping(conf);
+ 
+     this.timer = timer;
+@@ -185,6 +218,22 @@ private IOException noGroupsForUser(String user) {
+     }
+   }
+ 
++  public long getBackgroundRefreshSuccess() {
++    return backgroundRefreshSuccess.get();
++  }
++
++  public long getBackgroundRefreshException() {
++    return backgroundRefreshException.get();
++  }
++
++  public long getBackgroundRefreshQueued() {
++    return backgroundRefreshQueued.get();
++  }
++
++  public long getBackgroundRefreshRunning() {
++    return backgroundRefreshRunning.get();
++  }
++
+   /**
+    * Convert millisecond times from hadoop's timer to guava's nanosecond ticker.
+    */
+@@ -206,11 +255,41 @@ public long read() {
+    * Deals with loading data into the cache.
+    */
+   private class GroupCacheLoader extends CacheLoader<String, List<String>> {
++
++    private ListeningExecutorService executorService;
++
++    GroupCacheLoader() {
++      if (reloadGroupsInBackground) {
++        ThreadFactory threadFactory = new ThreadFactoryBuilder()
++            .setNameFormat("Group-Cache-Reload")
++            .setDaemon(true)
++            .build();
++        // With coreThreadCount == maxThreadCount we effectively
++        // create a fixed size thread pool. As allowCoreThreadTimeOut
++        // has been set, all threads will die after 60 seconds of non use
++        ThreadPoolExecutor parentExecutor =  new ThreadPoolExecutor(
++            reloadGroupsThreadCount,
++            reloadGroupsThreadCount,
++            60,
++            TimeUnit.SECONDS,
++            new LinkedBlockingQueue<Runnable>(),
++            threadFactory);
++        parentExecutor.allowCoreThreadTimeOut(true);
++        executorService = MoreExecutors.listeningDecorator(parentExecutor);
++      }
++    }
++
+     /**
+      * This method will block if a cache entry doesn't exist, and
+      * any subsequent requests for the same user will wait on this
+      * request to return. If a user already exists in the cache,
+-     * this will be run in the background.
++     * and when the key expires, the first call to reload the key
++     * will block, but subsequent requests will return the old
++     * value until the blocking thread returns.
++     * If reloadGroupsInBackground is true, then the thread that
++     * needs to refresh an expired key will not block either. Instead
++     * it will return the old cache value and schedule a background
++     * refresh
+      * @param user key of cache
+      * @return List of groups belonging to user
+      * @throws IOException to prevent caching negative entries
+@@ -232,6 +311,44 @@ public long read() {
+     }
+ 
+     /**
++     * Override the reload method to provide an asynchronous implementation. If
++     * reloadGroupsInBackground is false, then this method defers to the super
++     * implementation, otherwise is arranges for the cache to be updated later
++     */
++    @Override
++    public ListenableFuture<List<String>> reload(final String key,
++                                                 List<String> oldValue)
++        throws Exception {
++      if (!reloadGroupsInBackground) {
++        return super.reload(key, oldValue);
++      }
++
++      backgroundRefreshQueued.incrementAndGet();
++      ListenableFuture<List<String>> listenableFuture =
++          executorService.submit(new Callable<List<String>>() {
++            @Override
++            public List<String> call() throws Exception {
++              boolean success = false;
++              try {
++                backgroundRefreshQueued.decrementAndGet();
++                backgroundRefreshRunning.incrementAndGet();
++                List<String> results = load(key);
++                success = true;
++                return results;
++              } finally {
++                backgroundRefreshRunning.decrementAndGet();
++                if (success) {
++                  backgroundRefreshSuccess.incrementAndGet();
++                } else {
++                  backgroundRefreshException.incrementAndGet();
++                }
++              }
++            }
++          });
++      return listenableFuture;
++    }
++
++    /**
+      * Queries impl for groups belonging to the user. This could involve I/O and take awhile.
+      */
+     private List<String> fetchGroupList(String user) throws IOException {
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 57b1cfe..1d920df 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -254,6 +254,28 @@ for ldap providers in the same way as above does.
+ </property>
+ 
+ <property>
++  <name>hadoop.security.groups.cache.background.reload</name>
++  <value>false</value>
++  <description>
++    Whether to reload expired user->group mappings using a background thread
++    pool. If set to true, a pool of
++    hadoop.security.groups.cache.background.reload.threads is created to
++    update the cache in the background.
++  </description>
++</property>
++
++<property>
++  <name>hadoop.security.groups.cache.background.reload.threads</name>
++  <value>3</value>
++  <description>
++    Only relevant if hadoop.security.groups.cache.background.reload is true.
++    Controls the number of concurrent background user->group cache entry
++    refreshes. Pending refresh requests beyond this value are queued and
++    processed when a thread is free.
++  </description>
++</property>
++
++<property>
+   <name>hadoop.security.group.mapping.ldap.url</name>
+   <value></value>
+   <description>
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestGroupsCaching.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestGroupsCaching.java
+index 3686694..5a5596e 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestGroupsCaching.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestGroupsCaching.java
+@@ -50,8 +50,8 @@
+   private Configuration conf;
+ 
+   @Before
+-  public void setup() {
+-    FakeGroupMapping.resetRequestCount();
++  public void setup() throws IOException {
++    FakeGroupMapping.clearAll();
+     ExceptionalGroupMapping.resetRequestCount();
+ 
+     conf = new Configuration();
+@@ -66,13 +66,18 @@ public void setup() {
+     private static Set<String> blackList = new HashSet<String>();
+     private static int requestCount = 0;
+     private static long getGroupsDelayMs = 0;
++    private static boolean throwException;
+ 
+     @Override
+     public List<String> getGroups(String user) throws IOException {
+       LOG.info("Getting groups for " + user);
++      delayIfNecessary();
++
+       requestCount++;
+ 
+-      delayIfNecessary();
++      if (throwException) {
++        throw new IOException("For test");
++      }
+ 
+       if (blackList.contains(user)) {
+         return new LinkedList<String>();
+@@ -102,6 +107,15 @@ public static void clearBlackList() throws IOException {
+       blackList.clear();
+     }
+ 
++    public static void clearAll() throws IOException {
++      LOG.info("Resetting FakeGroupMapping");
++      blackList.clear();
++      allGroups.clear();
++      requestCount = 0;
++      getGroupsDelayMs = 0;
++      throwException = false;
++    }
++
+     @Override
+     public void cacheGroupsAdd(List<String> groups) throws IOException {
+       LOG.info("Adding " + groups + " to groups.");
+@@ -124,6 +138,10 @@ public static void resetRequestCount() {
+     public static void setGetGroupsDelayMs(long delayMs) {
+       getGroupsDelayMs = delayMs;
+     }
++
++    public static void setThrowException(boolean throwIfTrue) {
++      throwException = throwIfTrue;
++    }
+   }
+ 
+   public static class ExceptionalGroupMapping extends ShellBasedUnixGroupsMapping {
+@@ -404,6 +422,251 @@ public void run() {
+   }
+ 
+   @Test
++  public void testThreadNotBlockedWhenExpiredEntryExistsWithBackgroundRefresh()
++      throws Exception {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        true);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // We make an initial request to populate the cache
++    groups.getGroups("me");
++    // Further lookups will have a delay
++    FakeGroupMapping.setGetGroupsDelayMs(100);
++    // add another groups
++    groups.cacheGroupsAdd(Arrays.asList("grp3"));
++    int startingRequestCount = FakeGroupMapping.getRequestCount();
++
++    // Then expire that entry
++    timer.advance(4 * 1000);
++
++    // Now get the cache entry - it should return immediately
++    // with the old value and the cache will not have completed
++    // a request to getGroups yet.
++    assertEquals(groups.getGroups("me").size(), 2);
++    assertEquals(startingRequestCount, FakeGroupMapping.getRequestCount());
++
++    // Now sleep for over the delay time and the request count should
++    // have completed
++    Thread.sleep(110);
++    assertEquals(startingRequestCount + 1, FakeGroupMapping.getRequestCount());
++    // Another call to get groups should give 3 groups instead of 2
++    assertEquals(groups.getGroups("me").size(), 3);
++  }
++
++  @Test
++  public void testThreadBlockedWhenExpiredEntryExistsWithoutBackgroundRefresh()
++      throws Exception {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        false);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // We make an initial request to populate the cache
++    groups.getGroups("me");
++    // Further lookups will have a delay
++    FakeGroupMapping.setGetGroupsDelayMs(100);
++    // add another group
++    groups.cacheGroupsAdd(Arrays.asList("grp3"));
++    int startingRequestCount = FakeGroupMapping.getRequestCount();
++
++    // Then expire that entry
++    timer.advance(4 * 1000);
++
++    // Now get the cache entry - it should block and return the new
++    // 3 group value
++    assertEquals(groups.getGroups("me").size(), 3);
++    assertEquals(startingRequestCount + 1, FakeGroupMapping.getRequestCount());
++  }
++
++  @Test
++  public void testExceptionOnBackgroundRefreshHandled() throws Exception {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        true);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // We make an initial request to populate the cache
++    groups.getGroups("me");
++
++    // add another group
++    groups.cacheGroupsAdd(Arrays.asList("grp3"));
++    int startingRequestCount = FakeGroupMapping.getRequestCount();
++    // Arrange for an exception to occur only on the
++    // second call
++    FakeGroupMapping.setThrowException(true);
++
++    // Then expire that entry
++    timer.advance(4 * 1000);
++
++    // Now get the cache entry - it should return immediately
++    // with the old value and the cache will not have completed
++    // a request to getGroups yet.
++    assertEquals(groups.getGroups("me").size(), 2);
++    assertEquals(startingRequestCount, FakeGroupMapping.getRequestCount());
++
++    // Now sleep for a short time and re-check the request count. It should have
++    // increased, but the exception means the cache will not have updated
++    Thread.sleep(50);
++    FakeGroupMapping.setThrowException(false);
++    assertEquals(startingRequestCount + 1, FakeGroupMapping.getRequestCount());
++    assertEquals(groups.getGroups("me").size(), 2);
++
++    // Now sleep another short time - the 3rd call to getGroups above
++    // will have kicked off another refresh that updates the cache
++    Thread.sleep(50);
++    assertEquals(startingRequestCount + 2, FakeGroupMapping.getRequestCount());
++    assertEquals(groups.getGroups("me").size(), 3);
++  }
++
++
++  @Test
++  public void testEntriesExpireIfBackgroundRefreshFails() throws Exception {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        true);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // We make an initial request to populate the cache
++    groups.getGroups("me");
++
++    // Now make all calls to the FakeGroupMapper throw exceptions
++    FakeGroupMapping.setThrowException(true);
++
++    // The cache entry expires for refresh after 1 second
++    // It expires for eviction after 1 * 10 seconds after it was last written
++    // So if we call getGroups repeatedly over 9 seconds, 9 refreshes should
++    // be triggered which will fail to update the key, but the keys old value
++    // will be retrievable until it is evicted after about 10 seconds.
++    for(int i=0; i<9; i++) {
++      assertEquals(groups.getGroups("me").size(), 2);
++      timer.advance(1 * 1000);
++    }
++    // Wait until the 11th second. The call to getGroups should throw
++    // an exception as the key will have been evicted and FakeGroupMapping
++    // will throw IO Exception when it is asked for new groups. In this case
++    // load must be called synchronously as there is no key present
++    timer.advance(2 * 1000);
++    try {
++      groups.getGroups("me");
++      fail("Should have thrown an exception here");
++    } catch (Exception e) {
++      // pass
++    }
++
++    // Finally check groups are retrieve again after FakeGroupMapping
++    // stops throw exceptions
++    FakeGroupMapping.setThrowException(false);
++    assertEquals(groups.getGroups("me").size(), 2);
++  }
++
++  @Test
++  public void testBackgroundRefreshCounters()
++      throws IOException, InterruptedException {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        true);
++    conf.setInt(
++        CommonConfigurationKeys.
++            HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS,
++        2);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // populate the cache
++    String[] grps = {"one", "two", "three", "four", "five"};
++    for (String g: grps) {
++      groups.getGroups(g);
++    }
++
++    // expire the cache
++    timer.advance(2*1000);
++    FakeGroupMapping.setGetGroupsDelayMs(40);
++
++    // Request all groups again, as there are 2 threads to process them
++    // 3 should get queued and 2 should be running
++    for (String g: grps) {
++      groups.getGroups(g);
++    }
++    Thread.sleep(20);
++    assertEquals(groups.getBackgroundRefreshQueued(), 3);
++    assertEquals(groups.getBackgroundRefreshRunning(), 2);
++
++    // After 120ms all should have completed running
++    Thread.sleep(120);
++    assertEquals(groups.getBackgroundRefreshQueued(), 0);
++    assertEquals(groups.getBackgroundRefreshRunning(), 0);
++    assertEquals(groups.getBackgroundRefreshSuccess(), 5);
++
++    // Now run again, this time throwing exceptions but no delay
++    timer.advance(2*1000);
++    FakeGroupMapping.setGetGroupsDelayMs(0);
++    FakeGroupMapping.setThrowException(true);
++    for (String g: grps) {
++      groups.getGroups(g);
++    }
++    Thread.sleep(20);
++    assertEquals(groups.getBackgroundRefreshQueued(), 0);
++    assertEquals(groups.getBackgroundRefreshRunning(), 0);
++    assertEquals(groups.getBackgroundRefreshSuccess(), 5);
++    assertEquals(groups.getBackgroundRefreshException(), 5);
++  }
++
++  @Test
++  public void testExceptionCallingLoadWithoutBackgroundRefreshReturnsOldValue()
++      throws Exception {
++    conf.setLong(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
++    conf.setBoolean(
++        CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,
++        false);
++    FakeTimer timer = new FakeTimer();
++    final Groups groups = new Groups(conf, timer);
++    groups.cacheGroupsAdd(Arrays.asList(myGroups));
++    groups.refresh();
++    FakeGroupMapping.clearBlackList();
++
++    // First populate the cash
++    assertEquals(groups.getGroups("me").size(), 2);
++
++    // Advance the timer so a refresh is required
++    timer.advance(2 * 1000);
++
++    // This call should throw an exception
++    FakeGroupMapping.setThrowException(true);
++    assertEquals(groups.getGroups("me").size(), 2);
++  }
++
++  @Test
+   public void testCacheEntriesExpire() throws Exception {
+     conf.setLong(
+       CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS, 1);
+-- 
+1.7.9.5
+

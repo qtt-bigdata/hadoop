@@ -1,0 +1,602 @@
+From 104870538b10fe98a94d7c7eb7b8477727173df1 Mon Sep 17 00:00:00 2001
+From: Lei Xu <lei@apache.org>
+Date: Tue, 9 Aug 2016 15:59:22 -0700
+Subject: [PATCH 1720/2848] HDFS-10681. DiskBalancer: query command should
+ report Plan file path apart from PlanID. (Manoj
+ Govindassamy via lei)
+
+(cherry picked from commit 9c6a4383cac29b2893ce14e6c9a75705fabfd522)
+
+Change-Id: Iae014be8589c32e8a2ca29b2b69dd036a3f00065
+---
+ .../hdfs/protocol/ClientDatanodeProtocol.java      |    6 ++--
+ ...ientDatanodeProtocolServerSideTranslatorPB.java |    2 ++
+ .../ClientDatanodeProtocolTranslatorPB.java        |   28 ++++++++++--------
+ .../hadoop/hdfs/server/datanode/DataNode.java      |   12 ++++----
+ .../hadoop/hdfs/server/datanode/DiskBalancer.java  |   24 ++++++++++------
+ .../server/datanode/DiskBalancerWorkStatus.java    |   17 +++++++++--
+ .../diskbalancer/command/ExecuteCommand.java       |   13 +++++----
+ .../server/diskbalancer/command/QueryCommand.java  |    6 ++--
+ .../src/main/proto/ClientDatanodeProtocol.proto    |   16 ++++++-----
+ .../hdfs/server/diskbalancer/TestDiskBalancer.java |    6 ++--
+ .../server/diskbalancer/TestDiskBalancerRPC.java   |   30 +++++++++++---------
+ .../TestDiskBalancerWithMockMover.java             |   21 +++++++-------
+ 12 files changed, 110 insertions(+), 71 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientDatanodeProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientDatanodeProtocol.java
+index 329c249..9e16b2c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientDatanodeProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientDatanodeProtocol.java
+@@ -175,8 +175,10 @@ void triggerBlockReport(BlockReportOptions options)
+   /**
+    * Submit a disk balancer plan for execution.
+    */
+-  void submitDiskBalancerPlan(String planID, long planVersion, String plan,
+-                              boolean skipDateCheck) throws IOException;
++  void submitDiskBalancerPlan(String planID, long planVersion, String planFile,
++                              String planData, boolean skipDateCheck)
++       throws IOException;
++
+   /**
+    * Cancel an executing plan.
+    *
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolServerSideTranslatorPB.java
+index 5dc0499..79185b4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolServerSideTranslatorPB.java
+@@ -298,6 +298,7 @@ public SubmitDiskBalancerPlanResponseProto submitDiskBalancerPlan(
+     try {
+       impl.submitDiskBalancerPlan(request.getPlanID(),
+           request.hasPlanVersion() ? request.getPlanVersion() : 1,
++          request.hasPlanFile() ? request.getPlanFile() : "",
+           request.getPlan(),
+           request.hasIgnoreDateCheck() ? request.getIgnoreDateCheck() : false);
+       SubmitDiskBalancerPlanResponseProto response =
+@@ -341,6 +342,7 @@ public QueryPlanStatusResponseProto queryDiskBalancerPlan(
+           .newBuilder()
+           .setResult(result.getResult().getIntResult())
+           .setPlanID(result.getPlanID())
++          .setPlanFile(result.getPlanFile())
+           .setCurrentStatus(result.currentStateString())
+           .build();
+     } catch (Exception e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolTranslatorPB.java
+index 1b24e4f..19ef9ec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientDatanodeProtocolTranslatorPB.java
+@@ -98,11 +98,11 @@
+     ProtocolTranslator, Closeable {
+   public static final Log LOG = LogFactory
+       .getLog(ClientDatanodeProtocolTranslatorPB.class);
+-  
++
+   /** RpcController is not used and hence is set to null */
+   private final static RpcController NULL_CONTROLLER = null;
+   private final ClientDatanodeProtocolPB rpcProxy;
+-  private final static RefreshNamenodesRequestProto VOID_REFRESH_NAMENODES = 
++  private final static RefreshNamenodesRequestProto VOID_REFRESH_NAMENODES =
+       RefreshNamenodesRequestProto.newBuilder().build();
+   private final static GetDatanodeInfoRequestProto VOID_GET_DATANODE_INFO =
+       GetDatanodeInfoRequestProto.newBuilder().build();
+@@ -117,16 +117,16 @@
+   public ClientDatanodeProtocolTranslatorPB(DatanodeID datanodeid,
+       Configuration conf, int socketTimeout, boolean connectToDnViaHostname,
+       LocatedBlock locatedBlock) throws IOException {
+-    rpcProxy = createClientDatanodeProtocolProxy( datanodeid, conf, 
++    rpcProxy = createClientDatanodeProtocolProxy( datanodeid, conf,
+                   socketTimeout, connectToDnViaHostname, locatedBlock);
+   }
+-  
++
+   public ClientDatanodeProtocolTranslatorPB(InetSocketAddress addr,
+       UserGroupInformation ticket, Configuration conf, SocketFactory factory)
+       throws IOException {
+     rpcProxy = createClientDatanodeProtocolProxy(addr, ticket, conf, factory, 0);
+   }
+-  
++
+   /**
+    * Constructor.
+    * @param datanodeid Datanode to connect to.
+@@ -156,7 +156,7 @@ static ClientDatanodeProtocolPB createClientDatanodeProtocolProxy(
+     if (LOG.isDebugEnabled()) {
+       LOG.debug("Connecting to datanode " + dnAddr + " addr=" + addr);
+     }
+-    
++
+     // Since we're creating a new UserGroupInformation here, we know that no
+     // future RPC proxies will be able to re-use the same connection. And
+     // usages of this proxy tend to be one-off calls.
+@@ -174,7 +174,7 @@ static ClientDatanodeProtocolPB createClientDatanodeProtocolProxy(
+     return createClientDatanodeProtocolProxy(addr, ticket, confWithNoIpcIdle,
+         NetUtils.getDefaultSocketFactory(conf), socketTimeout);
+   }
+-  
++
+   static ClientDatanodeProtocolPB createClientDatanodeProtocolProxy(
+       InetSocketAddress addr, UserGroupInformation ticket, Configuration conf,
+       SocketFactory factory, int socketTimeout) throws IOException {
+@@ -254,13 +254,13 @@ public Object getUnderlyingProxyObject() {
+   public HdfsBlocksMetadata getHdfsBlocksMetadata(String blockPoolId,
+       long[] blockIds,
+       List<Token<BlockTokenIdentifier>> tokens) throws IOException {
+-    List<TokenProto> tokensProtos = 
++    List<TokenProto> tokensProtos =
+         new ArrayList<TokenProto>(tokens.size());
+     for (Token<BlockTokenIdentifier> t : tokens) {
+       tokensProtos.add(PBHelper.convert(t));
+     }
+     // Build the request
+-    GetHdfsBlockLocationsRequestProto request = 
++    GetHdfsBlockLocationsRequestProto request =
+         GetHdfsBlockLocationsRequestProto.newBuilder()
+         .setBlockPoolId(blockPoolId)
+         .addAllBlockIds(Longs.asList(blockIds))
+@@ -382,20 +382,23 @@ public void triggerBlockReport(BlockReportOptions options)
+    *               local copies of these plans.
+    * @param planVersion - The data format of the plans - for future , not
+    *                    used now.
+-   * @param plan - Actual plan.
++   * @param planFile - Plan file name
++   * @param planData - Actual plan data in json format
+    * @param skipDateCheck - Skips the date check.
+    * @throws IOException
+    */
+   @Override
+   public void submitDiskBalancerPlan(String planID, long planVersion,
+-      String plan, boolean skipDateCheck) throws IOException {
++        String planFile, String planData, boolean skipDateCheck)
++      throws IOException {
+     try {
+       SubmitDiskBalancerPlanRequestProto request =
+           SubmitDiskBalancerPlanRequestProto.newBuilder()
+               .setPlanID(planID)
+               .setPlanVersion(planVersion)
++              .setPlanFile(planFile)
+               .setIgnoreDateCheck(skipDateCheck)
+-              .setPlan(plan)
++              .setPlan(planData)
+               .build();
+       rpcProxy.submitDiskBalancerPlan(NULL_CONTROLLER, request);
+     } catch (ServiceException e) {
+@@ -438,6 +441,7 @@ public DiskBalancerWorkStatus queryDiskBalancerPlan() throws IOException {
+ 
+       return new DiskBalancerWorkStatus(result,
+           response.hasPlanID() ? response.getPlanID() : null,
++          response.hasPlanFile() ? response.getPlanFile() : null,
+           response.hasCurrentStatus() ? response.getCurrentStatus() : null);
+     } catch (ServiceException e) {
+       throw ProtobufHelper.getRemoteException(e);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index 144f6c8..31c9400 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -3108,16 +3108,18 @@ public BlockRecoveryWorker getBlockRecoveryWorker() {
+    * @param planID  - Hash value of the plan.
+    * @param planVersion - Plan version, reserved for future use. We have only
+    *                    version 1 now.
+-   * @param plan - Actual plan
++   * @param planFile - Plan file name
++   * @param planData - Actual plan data in json format
+    * @throws IOException
+    */
+   @Override
+-  public void submitDiskBalancerPlan(String planID,
+-      long planVersion, String plan, boolean skipDateCheck) throws IOException {
+-
++  public void submitDiskBalancerPlan(String planID, long planVersion,
++      String planFile, String planData, boolean skipDateCheck)
++      throws IOException {
+     checkSuperuserPrivilege();
+     // TODO : Support force option
+-    this.diskBalancer.submitPlan(planID, planVersion, plan, skipDateCheck);
++    this.diskBalancer.submitPlan(planID, planVersion, planFile, planData,
++            skipDateCheck);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancer.java
+index 32c8b97..c120d7f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancer.java
+@@ -84,6 +84,7 @@
+   private ExecutorService scheduler;
+   private Future future;
+   private String planID;
++  private String planFile;
+   private DiskBalancerWorkStatus.Result currentResult;
+   private long bandwidth;
+ 
+@@ -105,6 +106,7 @@ public DiskBalancer(String dataNodeUUID,
+     lock = new ReentrantLock();
+     workMap = new ConcurrentHashMap<>();
+     this.planID = "";  // to keep protobuf happy.
++    this.planFile = "";  // to keep protobuf happy.
+     this.isDiskBalancerEnabled = conf.getBoolean(
+         DFSConfigKeys.DFS_DISK_BALANCER_ENABLED,
+         DFSConfigKeys.DFS_DISK_BALANCER_ENABLED_DEFAULT);
+@@ -154,15 +156,16 @@ private void shutdownExecutor() {
+    * Takes a client submitted plan and converts into a set of work items that
+    * can be executed by the blockMover.
+    *
+-   * @param planID      - A SHA512 of the plan string
++   * @param planId      - A SHA512 of the plan string
+    * @param planVersion - version of the plan string - for future use.
+-   * @param plan        - Actual Plan
++   * @param planFileName    - Plan file name
++   * @param planData    - Plan data in json format
+    * @param force       - Skip some validations and execute the plan file.
+    * @throws DiskBalancerException
+    */
+-  public void submitPlan(String planID, long planVersion, String plan,
+-                         boolean force) throws DiskBalancerException {
+-
++  public void submitPlan(String planId, long planVersion, String planFileName,
++                         String planData, boolean force)
++          throws DiskBalancerException {
+     lock.lock();
+     try {
+       checkDiskBalancerEnabled();
+@@ -171,9 +174,10 @@ public void submitPlan(String planID, long planVersion, String plan,
+         throw new DiskBalancerException("Executing another plan",
+             DiskBalancerException.Result.PLAN_ALREADY_IN_PROGRESS);
+       }
+-      NodePlan nodePlan = verifyPlan(planID, planVersion, plan, force);
++      NodePlan nodePlan = verifyPlan(planId, planVersion, planData, force);
+       createWorkPlan(nodePlan);
+-      this.planID = planID;
++      this.planID = planId;
++      this.planFile = planFileName;
+       this.currentResult = Result.PLAN_UNDER_PROGRESS;
+       executePlan();
+     } finally {
+@@ -199,7 +203,8 @@ public DiskBalancerWorkStatus queryWorkStatus() throws DiskBalancerException {
+       }
+ 
+       DiskBalancerWorkStatus status =
+-          new DiskBalancerWorkStatus(this.currentResult, this.planID);
++          new DiskBalancerWorkStatus(this.currentResult, this.planID,
++                  this.planFile);
+       for (Map.Entry<VolumePair, DiskBalancerWorkItem> entry :
+           workMap.entrySet()) {
+         DiskBalancerWorkEntry workEntry = new DiskBalancerWorkEntry(
+@@ -484,7 +489,8 @@ private void executePlan() {
+       @Override
+       public void run() {
+         Thread.currentThread().setName("DiskBalancerThread");
+-        LOG.info("Executing Disk balancer plan. Plan ID -  " + planID);
++        LOG.info("Executing Disk balancer plan. Plan File: {}, Plan ID: {}",
++                planFile, planID);
+         try {
+           for (Map.Entry<VolumePair, DiskBalancerWorkItem> entry :
+               workMap.entrySet()) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancerWorkStatus.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancerWorkStatus.java
+index ca5e5f0..f85d7f8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancerWorkStatus.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DiskBalancerWorkStatus.java
+@@ -41,6 +41,7 @@
+   private final List<DiskBalancerWorkEntry> currentState;
+   private Result result;
+   private String planID;
++  private String planFile;
+ 
+   /**
+    * Constructs a default workStatus Object.
+@@ -54,11 +55,13 @@ public DiskBalancerWorkStatus() {
+    *
+    * @param result - int
+    * @param planID - Plan ID
++   * @param planFile - Plan file name
+    */
+-  public DiskBalancerWorkStatus(Result result, String planID) {
++  public DiskBalancerWorkStatus(Result result, String planID, String planFile) {
+     this();
+     this.result = result;
+     this.planID = planID;
++    this.planFile = planFile;
+   }
+ 
+   /**
+@@ -83,10 +86,11 @@ public DiskBalancerWorkStatus(Result result, String planID,
+    * @param planID       - Plan ID
+    * @param currentState - List of WorkEntries.
+    */
+-  public DiskBalancerWorkStatus(Result result, String planID,
++  public DiskBalancerWorkStatus(Result result, String planID, String planFile,
+                                 String currentState) throws IOException {
+     this.result = result;
+     this.planID = planID;
++    this.planFile = planFile;
+     ObjectMapper mapper = new ObjectMapper();
+     this.currentState = mapper.readValue(currentState,
+         defaultInstance().constructCollectionType(
+@@ -113,6 +117,15 @@ public String getPlanID() {
+   }
+ 
+   /**
++   * Returns planFile.
++   *
++   * @return String
++   */
++  public String getPlanFile() {
++    return planFile;
++  }
++
++  /**
+    * Gets current Status.
+    *
+    * @return - Json String
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/ExecuteCommand.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/ExecuteCommand.java
+index 5fd1f0a..eebd276 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/ExecuteCommand.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/ExecuteCommand.java
+@@ -69,16 +69,18 @@ public void execute(CommandLine cmd) throws Exception {
+     try (FSDataInputStream plan = open(planFile)) {
+       planData = IOUtils.toString(plan);
+     }
+-    submitPlan(planData);
++    submitPlan(planFile, planData);
+   }
+ 
+   /**
+    * Submits plan to a given data node.
+    *
+-   * @param planData - PlanData Json String.
++   * @param planFile - Plan file name
++   * @param planData - Plan data in json format
+    * @throws IOException
+    */
+-  private void submitPlan(String planData) throws IOException {
++  private void submitPlan(final String planFile, final String planData)
++          throws IOException {
+     Preconditions.checkNotNull(planData);
+     NodePlan plan = NodePlan.parseJson(planData);
+     String dataNodeAddress = plan.getNodeName() + ":" + plan.getPort();
+@@ -86,8 +88,9 @@ private void submitPlan(String planData) throws IOException {
+     ClientDatanodeProtocol dataNode = getDataNodeProxy(dataNodeAddress);
+     String planHash = DigestUtils.sha512Hex(planData);
+     try {
++      // TODO : Support skipping date check.
+       dataNode.submitDiskBalancerPlan(planHash, DiskBalancer.PLAN_VERSION,
+-          planData, false); // TODO : Support skipping date check.
++                                      planFile, planData, false);
+     } catch (DiskBalancerException ex) {
+       LOG.error("Submitting plan on  {} failed. Result: {}, Message: {}",
+           plan.getNodeName(), ex.getResult().toString(), ex.getMessage());
+@@ -95,8 +98,6 @@ private void submitPlan(String planData) throws IOException {
+     }
+   }
+ 
+-
+-
+   /**
+    * Gets extended help for this command.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/QueryCommand.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/QueryCommand.java
+index 22ee42a..24683be 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/QueryCommand.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/diskbalancer/command/QueryCommand.java
+@@ -73,8 +73,10 @@ public void execute(CommandLine cmd) throws Exception {
+     ClientDatanodeProtocol dataNode = getDataNodeProxy(nodeAddress);
+     try {
+       DiskBalancerWorkStatus workStatus = dataNode.queryDiskBalancerPlan();
+-      System.out.printf("Plan ID: %s %nResult: %s%n", workStatus.getPlanID(),
+-          workStatus.getResult().toString());
++      System.out.printf("Plan File: %s%nPlan ID: %s%nResult: %s%n",
++              workStatus.getPlanFile(),
++              workStatus.getPlanID(),
++              workStatus.getResult().toString());
+ 
+       if(cmd.hasOption(DiskBalancer.VERBOSE)) {
+         System.out.printf("%s", workStatus.currentStateString());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientDatanodeProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientDatanodeProtocol.proto
+index c1a553c..929d235 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientDatanodeProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientDatanodeProtocol.proto
+@@ -168,10 +168,11 @@ message TriggerBlockReportResponseProto {
+  * balancer plan to a data node.
+  */
+ message SubmitDiskBalancerPlanRequestProto {
+-    required string planID = 1; // A hash of the plan like SHA512
+-    required string plan = 2; // Json String that describes the plan
+-    optional uint64 planVersion = 3; // Plan version number
+-    optional bool ignoreDateCheck = 4; // Ignore date checks on this plan.
++  required string planID = 1;         // A hash of the plan like SHA512
++  required string plan = 2;           // Plan file data in Json format
++  optional uint64 planVersion = 3;    // Plan version number
++  optional bool ignoreDateCheck = 4;  // Ignore date checks on this plan.
++  required string planFile = 5;       // Plan file path
+ }
+ 
+ /**
+@@ -206,9 +207,10 @@ message QueryPlanStatusRequestProto {
+  * This message describes a plan if it is in progress
+  */
+ message QueryPlanStatusResponseProto {
+-    optional uint32 result = 1;
+-    optional string planID = 2;
+-    optional string currentStatus = 3;
++  optional uint32 result = 1;
++  optional string planID = 2;
++  optional string currentStatus = 3;
++  optional string planFile = 4;
+ }
+ 
+ /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancer.java
+index d470f63..9a73d14 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancer.java
+@@ -57,6 +57,8 @@
+ 
+ public class TestDiskBalancer {
+ 
++  private static final String PLAN_FILE = "/system/current.plan.json";
++
+   @Test
+   public void TestDiskBalancerNameNodeConnectivity() throws Exception {
+     Configuration conf = new HdfsConfiguration();
+@@ -191,7 +193,7 @@ public void TestDiskBalancerEndToEnd() throws Exception {
+       plan.getVolumeSetPlans().get(0).setTolerancePercent(10);
+ 
+       // Submit the plan and wait till the execution is done.
+-      newDN.submitDiskBalancerPlan(planID, 1, planJson, false);
++      newDN.submitDiskBalancerPlan(planID, 1, PLAN_FILE, planJson, false);
+       String jmxString = newDN.getDiskBalancerStatus();
+       assertNotNull(jmxString);
+       DiskBalancerWorkStatus status =
+@@ -304,7 +306,7 @@ public void testBalanceDataBetweenMultiplePairsOfVolumes()
+       String planJson = plan.toJson();
+       String planID = DigestUtils.sha512Hex(planJson);
+ 
+-      dataNode.submitDiskBalancerPlan(planID, 1, planJson, false);
++      dataNode.submitDiskBalancerPlan(planID, 1, PLAN_FILE, planJson, false);
+ 
+       GenericTestUtils.waitFor(new Supplier<Boolean>() {
+         @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerRPC.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerRPC.java
+index 81a0609..8e520fb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerRPC.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerRPC.java
+@@ -57,6 +57,7 @@
+   @Rule
+   public ExpectedException thrown = ExpectedException.none();
+ 
++  private static final String PLAN_FILE = "/system/current.plan.json";
+   private MiniDFSCluster cluster;
+   private Configuration conf;
+ 
+@@ -82,8 +83,8 @@ public void testSubmitPlan() throws Exception {
+     String planHash = rpcTestHelper.getPlanHash();
+     int planVersion = rpcTestHelper.getPlanVersion();
+     NodePlan plan = rpcTestHelper.getPlan();
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+   }
+ 
+   @Test
+@@ -98,8 +99,8 @@ public void testSubmitPlanWithInvalidHash() throws Exception {
+     NodePlan plan = rpcTestHelper.getPlan();
+     thrown.expect(DiskBalancerException.class);
+     thrown.expect(new DiskBalancerResultVerifier(Result.INVALID_PLAN_HASH));
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+   }
+ 
+   @Test
+@@ -112,8 +113,8 @@ public void testSubmitPlanWithInvalidVersion() throws Exception {
+     NodePlan plan = rpcTestHelper.getPlan();
+     thrown.expect(DiskBalancerException.class);
+     thrown.expect(new DiskBalancerResultVerifier(Result.INVALID_PLAN_VERSION));
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+   }
+ 
+   @Test
+@@ -125,8 +126,9 @@ public void testSubmitPlanWithInvalidPlan() throws Exception {
+     NodePlan plan = rpcTestHelper.getPlan();
+     thrown.expect(DiskBalancerException.class);
+     thrown.expect(new DiskBalancerResultVerifier(Result.INVALID_PLAN));
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, "",
+-        false);  }
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, "", "",
++        false);
++  }
+ 
+   @Test
+   public void testCancelPlan() throws Exception {
+@@ -135,8 +137,8 @@ public void testCancelPlan() throws Exception {
+     String planHash = rpcTestHelper.getPlanHash();
+     int planVersion = rpcTestHelper.getPlanVersion();
+     NodePlan plan = rpcTestHelper.getPlan();
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+     dataNode.cancelDiskBalancePlan(planHash);
+   }
+ 
+@@ -199,8 +201,8 @@ public void testgetDiskBalancerBandwidth() throws Exception {
+     int planVersion = rpcTestHelper.getPlanVersion();
+     NodePlan plan = rpcTestHelper.getPlan();
+ 
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+     String bandwidthString = dataNode.getDiskBalancerSetting(
+         DiskBalancerConstants.DISKBALANCER_BANDWIDTH);
+     long value = Long.decode(bandwidthString);
+@@ -215,8 +217,8 @@ public void testQueryPlan() throws Exception {
+     int planVersion = rpcTestHelper.getPlanVersion();
+     NodePlan plan = rpcTestHelper.getPlan();
+ 
+-    dataNode.submitDiskBalancerPlan(planHash, planVersion, plan.toJson(),
+-        false);
++    dataNode.submitDiskBalancerPlan(planHash, planVersion, PLAN_FILE,
++        plan.toJson(), false);
+     DiskBalancerWorkStatus status = dataNode.queryDiskBalancerPlan();
+     Assert.assertTrue(status.getResult() == PLAN_UNDER_PROGRESS ||
+         status.getResult() == PLAN_DONE);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerWithMockMover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerWithMockMover.java
+index 491fccb..d58a1fa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerWithMockMover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/diskbalancer/TestDiskBalancerWithMockMover.java
+@@ -65,13 +65,14 @@
+   @Rule
+   public ExpectedException thrown = ExpectedException.none();
+ 
+-  MiniDFSCluster cluster;
+-  String sourceName;
+-  String destName;
+-  String sourceUUID;
+-  String destUUID;
+-  String nodeID;
+-  DataNode dataNode;
++  private static final String PLAN_FILE = "/system/current.plan.json";
++  private MiniDFSCluster cluster;
++  private String sourceName;
++  private String destName;
++  private String sourceUUID;
++  private String destUUID;
++  private String nodeID;
++  private DataNode dataNode;
+ 
+   /**
+    * Checks that we return the right error if diskbalancer is not enabled.
+@@ -122,7 +123,7 @@ private void executeSubmitPlan(NodePlan plan, DiskBalancer balancer,
+                                  int version) throws IOException {
+     String planJson = plan.toJson();
+     String planID = DigestUtils.sha512Hex(planJson);
+-    balancer.submitPlan(planID, version, planJson, false);
++    balancer.submitPlan(planID, version, PLAN_FILE, planJson, false);
+   }
+ 
+   private void executeSubmitPlan(NodePlan plan, DiskBalancer balancer)
+@@ -216,7 +217,7 @@ public void testSubmitWithNullPlan() throws Exception {
+     thrown.expect(new DiskBalancerResultVerifier(DiskBalancerException
+         .Result.INVALID_PLAN));
+ 
+-    balancer.submitPlan(planID, 1, null, false);
++    balancer.submitPlan(planID, 1, "no-plan-file.json", null, false);
+   }
+ 
+   @Test
+@@ -235,7 +236,7 @@ public void testSubmitWithInvalidHash() throws Exception {
+     thrown.expect(new DiskBalancerResultVerifier(DiskBalancerException
+         .Result.INVALID_PLAN_HASH));
+     balancer.submitPlan(planID.replace(planID.charAt(0), repChar),
+-        1, planJson, false);
++        1, PLAN_FILE, planJson, false);
+ 
+   }
+ 
+-- 
+1.7.9.5
+

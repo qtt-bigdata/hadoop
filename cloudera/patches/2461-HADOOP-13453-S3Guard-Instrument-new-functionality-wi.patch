@@ -1,0 +1,325 @@
+From 95a011d65f38bddccf331cb6170ceaa38f4be81e Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Wed, 3 May 2017 20:51:46 +0100
+Subject: [PATCH 2461/2848] HADOOP-13453 S3Guard: Instrument new functionality
+ with Hadoop metrics. Contributed by Ai Deng.
+
+(cherry picked from commit 80613da0134c3bb2e9337b9ecaaf47d71be27e0f)
+
+Change-Id: I9e1916703149f8526c9c79ba4847fb7ae4993584
+---
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |    7 +-
+ .../apache/hadoop/fs/s3a/S3AInstrumentation.java   |   81 +++++++++++++++++++-
+ .../java/org/apache/hadoop/fs/s3a/Statistic.java   |   13 +++-
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |    8 ++
+ .../org/apache/hadoop/fs/s3a/s3guard/S3Guard.java  |   11 ++-
+ 5 files changed, 113 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 1ab1eee..39fb51f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -31,8 +31,8 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.concurrent.ExecutorService;
+ import java.util.Objects;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+@@ -1752,7 +1752,8 @@ S3AFileStatus innerGetFileStatus(final Path f,
+         return S3AFileStatus.fromFileStatus(msStatus, pm.isEmptyDirectory());
+       }
+     }
+-    return S3Guard.putAndReturn(metadataStore, s3GetFileStatus(path, key));
++    return S3Guard.putAndReturn(metadataStore, s3GetFileStatus(path, key),
++        instrumentation);
+   }
+ 
+   /**
+@@ -2134,7 +2135,7 @@ public void finishedWrite(String key, long length) {
+         S3AFileStatus status = createUploadFileStatus(p,
+             S3AUtils.objectRepresentsDirectory(key, length), length,
+             getDefaultBlockSize(p), username);
+-        metadataStore.put(new PathMetadata(status));
++        S3Guard.putAndReturn(metadataStore, status, instrumentation);
+       }
+     } catch (IOException e) {
+       LOG.error("s3guard: Error updating MetadataStore for write to {}:",
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java
+index d2e7a88..77804fe 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java
+@@ -23,6 +23,7 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.fs.FileSystem.Statistics;
+ import org.apache.hadoop.metrics2.MetricStringBuilder;
+ import org.apache.hadoop.metrics2.annotation.Metrics;
+ import org.apache.hadoop.metrics2.lib.Interns;
+@@ -30,6 +31,7 @@
+ import org.apache.hadoop.metrics2.lib.MutableCounterLong;
+ import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
+ import org.apache.hadoop.metrics2.lib.MutableMetric;
++import org.apache.hadoop.metrics2.lib.MutableQuantiles;
+ 
+ import java.io.Closeable;
+ import java.net.URI;
+@@ -38,7 +40,6 @@
+ import java.util.UUID;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+-import org.apache.hadoop.fs.FileSystem.Statistics;
+ 
+ import static org.apache.hadoop.fs.s3a.Statistic.*;
+ 
+@@ -90,6 +91,10 @@
+   private final Map<String, MutableCounterLong> streamMetrics =
+       new HashMap<>(30);
+ 
++  /** Instantiate this without caring whether or not s3guard is enabled. */
++  private final S3GuardInstrumentation s3GuardInstrumentation
++      = new S3GuardInstrumentation();
++
+   private static final Statistic[] COUNTERS_TO_CREATE = {
+       INVOCATION_COPY_FROM_LOCAL_FILE,
+       INVOCATION_EXISTS,
+@@ -117,6 +122,8 @@
+       STREAM_WRITE_BLOCK_UPLOADS_ABORTED,
+       STREAM_WRITE_TOTAL_TIME,
+       STREAM_WRITE_TOTAL_DATA,
++      S3GUARD_METADATASTORE_PUT_PATH_REQUEST,
++      S3GUARD_METADATASTORE_INITIALIZATION
+   };
+ 
+ 
+@@ -171,6 +178,9 @@ public S3AInstrumentation(URI name) {
+     for (Statistic statistic : GAUGES_TO_CREATE) {
+       gauge(statistic.getSymbol(), statistic.getDescription());
+     }
++    //todo need a config for the quantiles interval?
++    quantiles(S3GUARD_METADATASTORE_PUT_PATH_LATENCY,
++        "ops", "latency", 1);
+   }
+ 
+   /**
+@@ -227,6 +237,22 @@ protected final MutableGaugeLong gauge(String name, String desc) {
+   }
+ 
+   /**
++   * Create a quantiles in the registry.
++   * @param op  statistic to collect
++   * @param sampleName sample name of the quantiles
++   * @param valueName value name of the quantiles
++   * @param interval interval of the quantiles in seconds
++   * @return the created quantiles metric
++   */
++  protected final MutableQuantiles quantiles(Statistic op,
++      String sampleName,
++      String valueName,
++      int interval) {
++    return registry.newQuantiles(op.getSymbol(), op.getDescription(),
++        sampleName, valueName, interval);
++  }
++
++  /**
+    * Get the metrics registry.
+    * @return the registry
+    */
+@@ -311,6 +337,20 @@ public MutableGaugeLong lookupGauge(String name) {
+   }
+ 
+   /**
++   * Look up a quantiles.
++   * @param name quantiles name
++   * @return the quantiles or null
++   * @throws ClassCastException if the metric is not a Quantiles.
++   */
++  public MutableQuantiles lookupQuantiles(String name) {
++    MutableMetric metric = lookupMetric(name);
++    if (metric == null) {
++        LOG.debug("No quantiles {}", name);
++    }
++    return (MutableQuantiles) metric;
++  }
++
++  /**
+    * Look up a metric from both the registered set and the lighter weight
+    * stream entries.
+    * @param name metric name
+@@ -391,6 +431,21 @@ public void incrementCounter(Statistic op, long count) {
+       counter.incr(count);
+     }
+   }
++
++  /**
++   * Add a value to a quantiles statistic. No-op if the quantile
++   * isn't found.
++   * @param op operation to look up.
++   * @param value value to add.
++   * @throws ClassCastException if the metric is not a Quantiles.
++   */
++  public void addValueToQuantiles(Statistic op, long value) {
++    MutableQuantiles quantiles = lookupQuantiles(op.getSymbol());
++    if (quantiles != null) {
++      quantiles.add(value);
++    }
++  }
++
+   /**
+    * Increment a specific counter.
+    * No-op if not defined.
+@@ -442,6 +497,15 @@ InputStreamStatistics newInputStreamStatistics() {
+   }
+ 
+   /**
++   * Create a S3Guard instrumentation instance.
++   * There's likely to be at most one instance of this per FS instance.
++   * @return the S3Guard instrumentation point.
++   */
++  public S3GuardInstrumentation getS3GuardInstrumentation() {
++    return s3GuardInstrumentation;
++  }
++
++  /**
+    * Merge in the statistics of a single input stream into
+    * the filesystem-wide statistics.
+    * @param statistics stream statistics
+@@ -840,4 +904,19 @@ public String toString() {
+       return sb.toString();
+     }
+   }
++
++  /**
++   * Instrumentation exported to S3Guard.
++   */
++  public final class S3GuardInstrumentation {
++
++    /** Initialized event. */
++    public void initialized() {
++      incrementCounter(S3GUARD_METADATASTORE_INITIALIZATION, 1);
++    }
++
++    public void storeClosed() {
++
++    }
++  }
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Statistic.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Statistic.java
+index 789c6d7..bfc3d35 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Statistic.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Statistic.java
+@@ -140,7 +140,18 @@
+   STREAM_WRITE_TOTAL_DATA("stream_write_total_data",
+       "Count of total data uploaded in block output"),
+   STREAM_WRITE_QUEUE_DURATION("stream_write_queue_duration",
+-      "Total queue duration of all block uploads");
++      "Total queue duration of all block uploads"),
++
++  // S3guard stats
++  S3GUARD_METADATASTORE_PUT_PATH_REQUEST(
++      "s3guard_metadatastore_put_path_request",
++      "s3guard metadata store put one metadata path request"),
++  S3GUARD_METADATASTORE_PUT_PATH_LATENCY(
++      "s3guard_metadatastore_put_path_latency",
++      "s3guard metadata store put one metadata path lantency"),
++  S3GUARD_METADATASTORE_INITIALIZATION("s3guard_metadatastore_initialization",
++      "s3guard metadata store initialization times");
++
+ 
+   private static final Map<String, Statistic> SYMBOL_MAP =
+       new HashMap<>(Statistic.values().length);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index 71f2497..302541c 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -58,6 +58,7 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.s3a.Constants;
++import org.apache.hadoop.fs.s3a.S3AInstrumentation;
+ import org.apache.hadoop.fs.s3a.Tristate;
+ import org.apache.hadoop.io.retry.RetryPolicies;
+ import org.apache.hadoop.io.retry.RetryPolicy;
+@@ -192,6 +193,7 @@
+   private String username;
+ 
+   private RetryPolicy dataAccessRetryPolicy;
++  private S3AInstrumentation.S3GuardInstrumentation instrumentation;
+ 
+   /**
+    * A utility function to create DynamoDB instance.
+@@ -217,6 +219,7 @@ public void initialize(FileSystem fs) throws IOException {
+     Preconditions.checkArgument(fs instanceof S3AFileSystem,
+         "DynamoDBMetadataStore only supports S3A filesystem.");
+     final S3AFileSystem s3afs = (S3AFileSystem) fs;
++    instrumentation = s3afs.getInstrumentation().getS3GuardInstrumentation();
+     final String bucket = s3afs.getBucket();
+     String confRegion = s3afs.getConf().getTrimmed(S3GUARD_DDB_REGION_KEY);
+     if (!StringUtils.isEmpty(confRegion)) {
+@@ -236,6 +239,8 @@ public void initialize(FileSystem fs) throws IOException {
+     setMaxRetries(conf);
+ 
+     initTable();
++
++    instrumentation.initialized();
+   }
+ 
+   /**
+@@ -605,6 +610,9 @@ public void put(DirListingMetadata meta) throws IOException {
+ 
+   @Override
+   public synchronized void close() {
++    if (instrumentation != null) {
++      instrumentation.storeClosed();
++    }
+     if (dynamoDB != null) {
+       LOG.debug("Shutting down {}", this);
+       dynamoDB.shutdown();
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+index a393bfb..53dc991 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+@@ -28,6 +28,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.s3a.S3AFileStatus;
++import org.apache.hadoop.fs.s3a.S3AInstrumentation;
+ import org.apache.hadoop.fs.s3a.S3AUtils;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.slf4j.Logger;
+@@ -40,6 +41,7 @@
+ import java.util.List;
+ 
+ import static org.apache.hadoop.fs.s3a.Constants.*;
++import static org.apache.hadoop.fs.s3a.Statistic.*;
+ 
+ /**
+  * Logic for integrating MetadataStore with S3A.
+@@ -124,13 +126,18 @@ public static MetadataStore getMetadataStore(FileSystem fs)
+    * returns the same S3AFileStatus.
+    * @param ms MetadataStore to put() into.
+    * @param status status to store
++   * @param instrumentation instrumentation of the s3a file system
+    * @return The same status as passed in
+    * @throws IOException if metadata store update failed
+    */
+   public static S3AFileStatus putAndReturn(MetadataStore ms,
+-      S3AFileStatus status) throws IOException {
+-
++      S3AFileStatus status,
++      S3AInstrumentation instrumentation) throws IOException {
++    long startTimeNano = System.nanoTime();
+     ms.put(new PathMetadata(status));
++    instrumentation.addValueToQuantiles(S3GUARD_METADATASTORE_PUT_PATH_LATENCY,
++        (System.nanoTime() - startTimeNano));
++    instrumentation.incrementCounter(S3GUARD_METADATASTORE_PUT_PATH_REQUEST, 1);
+     return status;
+   }
+ 
+-- 
+1.7.9.5
+

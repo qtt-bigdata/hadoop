@@ -1,0 +1,313 @@
+From 1636f45cc89381d31bd476d30f749c6db0987891 Mon Sep 17 00:00:00 2001
+From: Yongjun Zhang <yzhang@cloudera.com>
+Date: Fri, 19 May 2017 21:11:38 -0700
+Subject: [PATCH 2469/2848] HADOOP-14407. DistCp - Introduce a configurable
+ copy buffer size. (Omkar Aradhya K S via Yongjun
+ Zhang)
+
+(cherry picked from commit dd552a97b7633a50055dc1529b52a276e1f1af0e)
+
+Conflicts:
+	hadoop-tools/hadoop-distcp/src/site/markdown/DistCp.md.vm
+
+Change-Id: I33e700985304a38672119ee54668c559c05e4ec3
+---
+ .../src/site/markdown/DistCp.md.vm                 |    1 +
+ .../org/apache/hadoop/tools/DistCpConstants.java   |    6 +++
+ .../apache/hadoop/tools/DistCpOptionSwitch.java    |    8 ++++
+ .../org/apache/hadoop/tools/DistCpOptions.java     |   21 +++++++++-
+ .../org/apache/hadoop/tools/OptionsParser.java     |   27 ++++++++++++-
+ .../tools/mapred/RetriableFileCopyCommand.java     |   11 +++--
+ .../org/apache/hadoop/tools/TestDistCpOptions.java |    4 +-
+ .../org/apache/hadoop/tools/TestOptionsParser.java |   42 +++++++++++++++++++-
+ 8 files changed, 110 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/site/markdown/DistCp.md.vm b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/site/markdown/DistCp.md.vm
+index 4fbc7de..9418cc3 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/site/markdown/DistCp.md.vm
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/site/markdown/DistCp.md.vm
+@@ -237,6 +237,7 @@ Flag              | Description                          | Notes
+ `-numListstatusThreads` | Number of threads to use for building file listing | At most 40 threads.
+ `-skipcrccheck` | Whether to skip CRC checks between source and target paths. |
+ `-blocksperchunk <blocksperchunk>` | Number of blocks per chunk. When specified, split files into chunks to copy in parallel | If set to a positive value, files with more blocks than this value will be split into chunks of `<blocksperchunk>` blocks to be transferred in parallel, and reassembled on the destination. By default, `<blocksperchunk>` is 0 and the files will be transmitted in their entirety without splitting. This switch is only applicable when the source file system implements getBlockLocations method and the target file system implements concat method. |
++`-copybuffersize <copybuffersize>` | Size of the copy buffer to use. By default, `<copybuffersize>` is set to 8192B |
+ 
+ Architecture of DistCp
+ ----------------------
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpConstants.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpConstants.java
+index db9f6b0..4f4182f 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpConstants.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpConstants.java
+@@ -111,6 +111,10 @@
+   /* DistCp CopyListing class override param */
+   public static final String CONF_LABEL_COPY_LISTING_CLASS = "distcp.copy.listing.class";
+ 
++  /* DistCp Copy Buffer Size */
++  public static final String CONF_LABEL_COPY_BUFFER_SIZE =
++      "distcp.copy.buffer.size";
++
+   /**
+    * Conf label for SSL Trust-store location.
+    */
+@@ -147,4 +151,6 @@
+   static final String HDFS_RESERVED_RAW_DIRECTORY_NAME = "/.reserved/raw";
+ 
+   static final String HDFS_DISTCP_DIFF_DIRECTORY_NAME = ".distcp.diff.tmp";
++
++  public static final int COPY_BUFFER_SIZE_DEFAULT = 8 * 1024;
+ }
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptionSwitch.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptionSwitch.java
+index 1f4bc42..160ba3f 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptionSwitch.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptionSwitch.java
+@@ -189,6 +189,14 @@
+           + "system implements concat method")),
+ 
+   /**
++   * Configurable copy buffer size.
++   */
++  COPY_BUFFER_SIZE(DistCpConstants.CONF_LABEL_COPY_BUFFER_SIZE,
++      new Option("copybuffersize", true, "Size of the copy buffer to use. "
++          + "By default <copybuffersize> is "
++          + DistCpConstants.COPY_BUFFER_SIZE_DEFAULT + "B.")),
++
++  /**
+    * Specify bandwidth per map in MB
+    */
+   BANDWIDTH(DistCpConstants.CONF_LABEL_BANDWIDTH_MB,
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptions.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptions.java
+index 2efb96b..b3c843f 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptions.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/DistCpOptions.java
+@@ -104,6 +104,11 @@
+   // to copy in parallel. Default is 0 and file are not splitted.
+   private int blocksPerChunk = 0;
+ 
++  /**
++   * The copyBufferSize to use in RetriableFileCopyCommand
++   */
++  private int copyBufferSize = DistCpConstants.COPY_BUFFER_SIZE_DEFAULT;
++
+   public static enum FileAttribute{
+     REPLICATION, BLOCKSIZE, USER, GROUP, PERMISSION, CHECKSUMTYPE, ACL, XATTR, TIMES;
+ 
+@@ -174,6 +179,7 @@ public DistCpOptions(DistCpOptions that) {
+       this.targetPathExists = that.getTargetPathExists();
+       this.filtersFile = that.getFiltersFile();
+       this.blocksPerChunk = that.blocksPerChunk;
++      this.copyBufferSize = that.copyBufferSize;
+     }
+   }
+ 
+@@ -464,7 +470,7 @@ public void setSslConfigurationFile(String sslConfigurationFile) {
+   }
+ 
+   /**
+-   * Checks if the input attribute should be preserved or not
++   * Checks if the input attribute should be preserved or not.
+    *
+    * @param attribute - Attribute to check
+    * @return True if attribute should be preserved, false otherwise
+@@ -640,6 +646,16 @@ public final boolean splitLargeFile() {
+     return blocksPerChunk > 0;
+   }
+ 
++  public final void setCopyBufferSize(int newCopyBufferSize) {
++    this.copyBufferSize =
++        newCopyBufferSize > 0 ? newCopyBufferSize
++            : DistCpConstants.COPY_BUFFER_SIZE_DEFAULT;
++  }
++
++  public int getCopyBufferSize() {
++    return this.copyBufferSize;
++  }
++
+   public void validate(DistCpOptionSwitch option, boolean value) {
+ 
+     boolean syncFolder = (option == DistCpOptionSwitch.SYNC_FOLDERS ?
+@@ -736,6 +752,8 @@ public void appendToConf(Configuration conf) {
+     }
+     DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.BLOCKS_PER_CHUNK,
+         String.valueOf(blocksPerChunk));
++    DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.COPY_BUFFER_SIZE,
++        String.valueOf(copyBufferSize));
+   }
+ 
+   /**
+@@ -773,6 +791,7 @@ public String toString() {
+         ", targetPathExists=" + targetPathExists +
+         ", filtersFile='" + filtersFile + '\'' +
+         ", blocksPerChunk=" + blocksPerChunk +
++        ", copyBufferSize=" + copyBufferSize +
+         '}';
+   }
+ 
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/OptionsParser.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/OptionsParser.java
+index 1c4ae24..3ce6310 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/OptionsParser.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/OptionsParser.java
+@@ -186,6 +186,8 @@ public static DistCpOptions parse(String[] args)
+ 
+     parseBlocksPerChunk(command, option);
+ 
++    parseCopyBufferSize(command, option);
++
+     return option;
+   }
+ 
+@@ -221,8 +223,29 @@ private static void parseBlocksPerChunk(CommandLine command,
+   }
+ 
+   /**
+-   * parseSizeLimit is a helper method for parsing the deprecated
+-   * argument SIZE_LIMIT.
++   * A helper method to parse copyBufferSize.
++   *
++   * @param command command line arguments
++   */
++  private static void parseCopyBufferSize(CommandLine command,
++      DistCpOptions option) {
++    if (command.hasOption(DistCpOptionSwitch.COPY_BUFFER_SIZE.getSwitch())) {
++      String copyBufferSizeStr =
++          getVal(command, DistCpOptionSwitch.COPY_BUFFER_SIZE.getSwitch()
++              .trim());
++      try {
++        int copyBufferSize = Integer.parseInt(copyBufferSizeStr);
++        option.setCopyBufferSize(copyBufferSize);
++      } catch (NumberFormatException e) {
++        throw new IllegalArgumentException("copyBufferSize is invalid: "
++            + copyBufferSizeStr, e);
++      }
++    }
++  }
++
++  /**
++   * parseSizeLimit is a helper method for parsing the deprecated argument
++   * SIZE_LIMIT.
+    *
+    * @param command command line arguments
+    */
+diff --git a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/RetriableFileCopyCommand.java b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/RetriableFileCopyCommand.java
+index fb96085..e6125af 100644
+--- a/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/RetriableFileCopyCommand.java
++++ b/hadoop-tools/hadoop-distcp/src/main/java/org/apache/hadoop/tools/mapred/RetriableFileCopyCommand.java
+@@ -38,6 +38,7 @@
+ import org.apache.hadoop.mapreduce.Mapper;
+ import org.apache.hadoop.tools.CopyListingFileStatus;
+ import org.apache.hadoop.tools.DistCpConstants;
++import org.apache.hadoop.tools.DistCpOptionSwitch;
+ import org.apache.hadoop.tools.DistCpOptions.FileAttribute;
+ import org.apache.hadoop.tools.mapred.CopyMapper.FileAction;
+ import org.apache.hadoop.tools.util.DistCpUtils;
+@@ -53,7 +54,6 @@
+ public class RetriableFileCopyCommand extends RetriableCommand {
+ 
+   private static Log LOG = LogFactory.getLog(RetriableFileCopyCommand.class);
+-  private static int BUFFER_SIZE = 8 * 1024;
+   private boolean skipCrc = false;
+   private FileAction action;
+ 
+@@ -170,6 +170,9 @@ private long copyToFile(Path targetPath, FileSystem targetFS,
+       throws IOException {
+     FsPermission permission = FsPermission.getFileDefault().applyUMask(
+         FsPermission.getUMask(targetFS.getConf()));
++    int copyBufferSize = context.getConfiguration().getInt(
++        DistCpOptionSwitch.COPY_BUFFER_SIZE.getConfigLabel(),
++        DistCpConstants.COPY_BUFFER_SIZE_DEFAULT);
+     final OutputStream outStream;
+     if (action == FileAction.OVERWRITE) {
+       final short repl = getReplicationFactor(fileAttributes, source,
+@@ -178,14 +181,14 @@ private long copyToFile(Path targetPath, FileSystem targetFS,
+           targetFS, targetPath);
+       FSDataOutputStream out = targetFS.create(targetPath, permission,
+           EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
+-          BUFFER_SIZE, repl, blockSize, context,
++          copyBufferSize, repl, blockSize, context,
+           getChecksumOpt(fileAttributes, sourceChecksum));
+       outStream = new BufferedOutputStream(out);
+     } else {
+       outStream = new BufferedOutputStream(targetFS.append(targetPath,
+-          BUFFER_SIZE));
++          copyBufferSize));
+     }
+-    return copyBytes(source, sourceOffset, outStream, BUFFER_SIZE,
++    return copyBytes(source, sourceOffset, outStream, copyBufferSize,
+         context);
+   }
+ 
+diff --git a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestDistCpOptions.java b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestDistCpOptions.java
+index 707d867..de75e7d 100644
+--- a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestDistCpOptions.java
++++ b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestDistCpOptions.java
+@@ -312,8 +312,8 @@ public void testToString() {
+         + "copyStrategy='uniformsize', preserveStatus=[], "
+         + "preserveRawXattrs=false, atomicWorkPath=null, logPath=null, "
+         + "sourceFileListing=abc, sourcePaths=null, targetPath=xyz, "
+-        + "targetPathExists=true, filtersFile='null'," +
+-        " blocksPerChunk=0}";
++        + "targetPathExists=true, filtersFile='null', blocksPerChunk=0, "
++        + "copyBufferSize=8192}";
+     String optionString = option.toString();
+     Assert.assertEquals(val, optionString);
+     Assert.assertNotSame(DistCpOptionSwitch.ATOMIC_COMMIT.toString(),
+diff --git a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestOptionsParser.java b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestOptionsParser.java
+index acffb76..d1ef56a 100644
+--- a/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestOptionsParser.java
++++ b/hadoop-tools/hadoop-distcp/src/test/java/org/apache/hadoop/tools/TestOptionsParser.java
+@@ -407,7 +407,8 @@ public void testToString() {
+         + "copyStrategy='uniformsize', preserveStatus=[], "
+         + "preserveRawXattrs=false, atomicWorkPath=null, logPath=null, "
+         + "sourceFileListing=abc, sourcePaths=null, targetPath=xyz, "
+-        + "targetPathExists=true, filtersFile='null', blocksPerChunk=0}";
++        + "targetPathExists=true, filtersFile='null', blocksPerChunk=0, "
++        + "copyBufferSize=8192}";
+     String optionString = option.toString();
+     Assert.assertEquals(val, optionString);
+     Assert.assertNotSame(DistCpOptionSwitch.ATOMIC_COMMIT.toString(),
+@@ -773,4 +774,43 @@ public void testExclusionsOption() {
+         "hdfs://localhost:8020/target/"});
+     Assert.assertEquals(options.getFiltersFile(), "/tmp/filters.txt");
+   }
++
++  @Test
++  public void testParseCopyBufferSize() {
++    DistCpOptions options =
++        OptionsParser.parse(new String[] {
++            "hdfs://localhost:8020/source/first",
++            "hdfs://localhost:8020/target/" });
++    Assert.assertEquals(options.getCopyBufferSize(),
++        DistCpConstants.COPY_BUFFER_SIZE_DEFAULT);
++
++    options =
++        OptionsParser.parse(new String[] { "-copybuffersize", "0",
++            "hdfs://localhost:8020/source/first",
++            "hdfs://localhost:8020/target/" });
++    Assert.assertEquals(options.getCopyBufferSize(),
++        DistCpConstants.COPY_BUFFER_SIZE_DEFAULT);
++
++    options =
++        OptionsParser.parse(new String[] { "-copybuffersize", "-1",
++            "hdfs://localhost:8020/source/first",
++            "hdfs://localhost:8020/target/" });
++    Assert.assertEquals(options.getCopyBufferSize(),
++        DistCpConstants.COPY_BUFFER_SIZE_DEFAULT);
++
++    options =
++        OptionsParser.parse(new String[] { "-copybuffersize", "4194304",
++            "hdfs://localhost:8020/source/first",
++            "hdfs://localhost:8020/target/" });
++    Assert.assertEquals(options.getCopyBufferSize(), 4194304);
++
++    try {
++      OptionsParser
++          .parse(new String[] { "-copybuffersize", "hello",
++              "hdfs://localhost:8020/source/first",
++              "hdfs://localhost:8020/target/" });
++      Assert.fail("Non numberic copybuffersize parsed successfully!");
++    } catch (IllegalArgumentException ignore) {
++    }
++  }
+ }
+-- 
+1.7.9.5
+

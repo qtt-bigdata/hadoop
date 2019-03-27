@@ -1,0 +1,674 @@
+From 0244e5d7b44aab5923140179730a114fadb01b97 Mon Sep 17 00:00:00 2001
+From: Mingliang Liu <liuml07@apache.org>
+Date: Thu, 20 Apr 2017 17:06:53 -0700
+Subject: [PATCH 2603/2848] HADOOP-14324. Refine S3 server-side-encryption key
+ as encryption secret; improve error reporting and
+ diagnostics. Contributed by Steve Loughran
+
+Changes to TestSSEConfiguration were edited to not require Lambda
+support.
+
+(cherry picked from commit 3b7bb7b94b1974e74556e787e6bec7549040b3a5)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+	hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+	hadoop-common-project/hadoop-common/src/site/markdown/DeprecatedProperties.md
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+
+Change-Id: I9cf028962f9481fea0cd20eb766cd55d73f0b1af
+
+Fixing compilation
+
+Change-Id: I6b06563ccb2fd98c61c09325ed49856c9ed13805
+---
+ .../hadoop/fs/CommonConfigurationKeysPublic.java   |    1 +
+ .../src/main/resources/core-default.xml            |    3 +-
+ .../org/apache/hadoop/conf/TestConfigRedactor.java |    5 +-
+ .../java/org/apache/hadoop/fs/s3a/Constants.java   |   29 +--
+ .../apache/hadoop/fs/s3a/S3AEncryptionMethods.java |   13 +-
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   30 +--
+ .../java/org/apache/hadoop/fs/s3a/S3AUtils.java    |  120 ++++++++++-
+ .../src/site/markdown/tools/hadoop-aws/index.md    |    2 +-
+ .../src/site/markdown/tools/hadoop-aws/testing.md  |    4 +-
+ .../s3a/ITestS3AEncryptionAlgorithmValidation.java |    4 +-
+ .../apache/hadoop/fs/s3a/TestSSEConfiguration.java |  221 ++++++++++++++++++++
+ 11 files changed, 395 insertions(+), 37 deletions(-)
+ create mode 100644 hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestSSEConfiguration.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+index 256a5d0..af4c488 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+@@ -314,6 +314,7 @@
+           "password$",
+           "ssl.keystore.pass$",
+           "fs.s3.*[Ss]ecret.?[Kk]ey",
++          "fs.s3a.*.server-side-encryption.key",
+           "fs.azure\\.account.key.*",
+           "credential$",
+           "oauth.*token$",
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index c0b14b3..c68cd8b 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -1123,7 +1123,7 @@ for ldap providers in the same way as above does.
+ </property>
+ 
+ <property>
+-  <name>fs.s3a.server-side-encryption-key</name>
++  <name>fs.s3a.server-side-encryption.key</name>
+   <description>Specific encryption key to use if fs.s3a.server-side-encryption-algorithm
+     has been set to 'SSE-KMS' or 'SSE-C'. In the case of SSE-C, the value of this property
+     should be the Base64 encoded key. If you are using SSE-KMS and leave this property empty,
+@@ -2298,6 +2298,7 @@ for ldap providers in the same way as above does.
+       password$
+       ssl.keystore.pass$
+       fs.s3.*[Ss]ecret.?[Kk]ey
++      fs.s3a.*.server-side-encryption.key
+       fs.azure.account.key.*
+       credential$
+       oauth.*token$
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/conf/TestConfigRedactor.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/conf/TestConfigRedactor.java
+index ba08de4..4790f7c 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/conf/TestConfigRedactor.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/conf/TestConfigRedactor.java
+@@ -52,6 +52,8 @@ private void testRedact(Configuration conf) throws Exception {
+     List<String> sensitiveKeys = Arrays.asList(
+         "fs.s3a.secret.key",
+         "fs.s3a.bucket.BUCKET.secret.key",
++        "fs.s3a.server-side-encryption.key",
++        "fs.s3a.bucket.engineering.server-side-encryption.key",
+         "fs.s3n.awsSecretKey",
+         "fs.azure.account.key.abcdefg.blob.core.windows.net",
+         "fs.adl.oauth2.refresh.token",
+@@ -77,7 +79,8 @@ private void testRedact(Configuration conf) throws Exception {
+         "dfs.replication",
+         "ssl.server.keystore.location",
+         "httpfs.config.dir",
+-        "hadoop.security.credstore.java-keystore-provider.password-file"
++        "hadoop.security.credstore.java-keystore-provider.password-file",
++        "fs.s3a.bucket.engineering.server-side-encryption-algorithm"
+     );
+     for (String key : normalKeys) {
+       processedText = redactor.redact(key, ORIGINAL_VALUE);
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+index 1d61f67..748a118 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Constants.java
+@@ -230,18 +230,30 @@ private Constants() {
+    * Different implementations may support others (or none).
+    * Use the S3AEncryptionMethods instead when configuring
+    * which Server Side Encryption to use.
++   * Value: "{@value}".
+    */
+   @Deprecated
+   public static final String SERVER_SIDE_ENCRYPTION_AES256 =
+       "AES256";
+ 
+   /**
+-   *  Used to specify which AWS KMS key to use if
+-   *  SERVER_SIDE_ENCRYPTION_ALGORITHM is AWS_KMS (will default to aws/s3
+-   *  master key if left blank) or with SSE_C, the actual AES 256 key.
++   * Used to specify which AWS KMS key to use if
++   * {@link #SERVER_SIDE_ENCRYPTION_ALGORITHM} is
++   * {@code SSE-KMS} (will default to aws/s3
++   * master key if left blank).
++   * With with {@code SSE_C}, the base-64 encoded AES 256 key.
++   * May be set within a JCEKS file.
++   * Value: "{@value}".
+    */
+   public static final String SERVER_SIDE_ENCRYPTION_KEY =
+-      "fs.s3a.server-side-encryption-key";
++      "fs.s3a.server-side-encryption.key";
++
++  /**
++   * The original key name. Never used in ASF releases,
++   * but did get into downstream products.
++   */
++  static final String OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY
++      = "fs.s3a.server-side-encryption-key";
+ 
+   //override signature algorithm used for signing requests
+   public static final String SIGNING_ALGORITHM = "fs.s3a.signing-algorithm";
+@@ -318,15 +330,6 @@ private Constants() {
+   @InterfaceAudience.Private
+   public static final int MAX_MULTIPART_COUNT = 10000;
+ 
+-  @InterfaceAudience.Private
+-  public static final String SSE_C_NO_KEY_ERROR = S3AEncryptionMethods.SSE_C
+-      .getMethod() +" is enabled and no encryption key is provided.";
+-
+-
+-  @InterfaceAudience.Private
+-  public static final String SSE_S3_WITH_KEY_ERROR = S3AEncryptionMethods.SSE_S3
+-      .getMethod() +" is configured and an " + "encryption key is provided";
+-
+   /**
+    * Classname of the S3A-specific output committer factory. This
+    * is what must be declared when attempting to use
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AEncryptionMethods.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AEncryptionMethods.java
+index 9b347b0..dd0675f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AEncryptionMethods.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AEncryptionMethods.java
+@@ -33,6 +33,9 @@
+   SSE_C("SSE-C"),
+   NONE("");
+ 
++  static final String UNKNOWN_ALGORITHM
++      = "Unknown Server Side Encryption algorithm ";
++
+   private String method;
+ 
+   S3AEncryptionMethods(String method) {
+@@ -43,6 +46,13 @@ public String getMethod() {
+     return method;
+   }
+ 
++
++  /**
++   * Get the encryption mechanism from the value provided.
++   * @param name algorithm name
++   * @return the method
++   * @throws IOException if the algorithm is unknown
++   */
+   public static S3AEncryptionMethods getMethod(String name) throws IOException {
+     if(StringUtils.isBlank(name)) {
+       return NONE;
+@@ -55,7 +65,8 @@ public static S3AEncryptionMethods getMethod(String name) throws IOException {
+     case "SSE-C":
+       return SSE_C;
+     default:
+-      throw new IOException("Unknown Server Side algorithm "+name);
++      throw new IOException(UNKNOWN_ALGORITHM + name);
+     }
+   }
++
+ }
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index c1b9805..264e546 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -174,6 +174,23 @@
+   static final String DEPRECATED_ACCESS_KEY = "fs.s3a.awsAccessKeyId";
+   static final String DEPRECATED_SECRET_KEY = "fs.s3a.awsSecretAccessKey";
+ 
++  /** Add any deprecated keys. */
++  @SuppressWarnings("deprecation")
++  private static void addDeprecatedKeys() {
++    Configuration.addDeprecations(
++        new Configuration.DeprecationDelta[]{
++            // never shipped in an ASF release, but did get into the wild.
++            new Configuration.DeprecationDelta(
++                OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY,
++                SERVER_SIDE_ENCRYPTION_KEY)
++        });
++    Configuration.reloadExistingConfigurations();
++  }
++
++  static {
++    addDeprecatedKeys();
++  }
++
+   /** Called after a new FileSystem instance is constructed.
+    * @param name a uri whose authority section names the host, port, etc.
+    *   for this FileSystem
+@@ -265,18 +282,7 @@ public StorageStatistics provide() {
+ 
+       initMultipartUploads(conf);
+ 
+-      serverSideEncryptionAlgorithm = S3AEncryptionMethods.getMethod(
+-          conf.getTrimmed(SERVER_SIDE_ENCRYPTION_ALGORITHM));
+-      if(S3AEncryptionMethods.SSE_C.equals(serverSideEncryptionAlgorithm) &&
+-          StringUtils.isBlank(getServerSideEncryptionKey(getConf()))) {
+-        throw new IOException(Constants.SSE_C_NO_KEY_ERROR);
+-      }
+-      if(S3AEncryptionMethods.SSE_S3.equals(serverSideEncryptionAlgorithm) &&
+-          StringUtils.isNotBlank(getServerSideEncryptionKey(
+-            getConf()))) {
+-        throw new IOException(Constants.SSE_S3_WITH_KEY_ERROR);
+-      }
+-      LOG.debug("Using encryption {}", serverSideEncryptionAlgorithm);
++      serverSideEncryptionAlgorithm = getEncryptionAlgorithm(conf);
+       inputPolicy = S3AInputPolicy.getPolicy(
+           conf.getTrimmed(INPUT_FADVISE, INPUT_FADV_NORMAL));
+ 
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+index 1298ec6..d25722f 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+@@ -81,6 +81,22 @@
+   static final String CREDENTIAL_PROVIDER_PATH =
+       "hadoop.security.credential.provider.path";
+ 
++  /**
++   * Encryption SSE-C used but the config lacks an encryption key.
++   */
++  public static final String SSE_C_NO_KEY_ERROR =
++      S3AEncryptionMethods.SSE_C.getMethod()
++          + " is enabled but no encryption key was declared in "
++          + SERVER_SIDE_ENCRYPTION_KEY;
++  /**
++   * Encryption SSE-S3 is used but the caller also set an encryption key.
++   */
++  public static final String SSE_S3_WITH_KEY_ERROR =
++      S3AEncryptionMethods.SSE_S3.getMethod()
++          + " is enabled but an encryption key was set in "
++          + SERVER_SIDE_ENCRYPTION_KEY;
++
++
+   private S3AUtils() {
+   }
+ 
+@@ -496,8 +512,27 @@ private static String getPasswordLegacy(Configuration conf, String key,
+    */
+   static String getPassword(Configuration conf, String key, String val)
+       throws IOException {
++    String defVal = "";
++    return getPassword(conf, key, val, defVal);
++  }
++
++  /**
++   * Get a password from a configuration, or, if a value is passed in,
++   * pick that up instead.
++   * @param conf configuration
++   * @param key key to look up
++   * @param val current value: if non empty this is used instead of
++   * querying the configuration.
++   * @param defVal default value if nothing is set
++   * @return a password or "".
++   * @throws IOException on any problem
++   */
++  private static String getPassword(Configuration conf,
++      String key,
++      String val,
++      String defVal) throws IOException {
+     return StringUtils.isEmpty(val)
+-        ? lookupPassword(conf, key, "")
++        ? lookupPassword(conf, key, defVal)
+         : val;
+   }
+ 
+@@ -755,14 +790,91 @@ static void patchSecurityCredentialProviders(Configuration conf) {
+     }
+   }
+ 
++  /**
++   * Get any SSE key from a configuration/credential provider.
++   * This operation handles the case where the option has been
++   * set in the provider or configuration to the option
++   * {@code OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY}.
++   * @param conf configuration to examine
++   * @return the encryption key or null
++   */
+   static String getServerSideEncryptionKey(Configuration conf) {
+     try {
+-      return getPassword(conf, Constants.SERVER_SIDE_ENCRYPTION_KEY,
+-        conf.getTrimmed(SERVER_SIDE_ENCRYPTION_KEY));
++      return lookupPassword(conf, SERVER_SIDE_ENCRYPTION_KEY,
++          getPassword(conf, OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY,
++              null, null));
+     } catch (IOException e) {
+       LOG.error("Cannot retrieve SERVER_SIDE_ENCRYPTION_KEY", e);
++      return "";
++    }
++  }
++
++  /**
++   * Get the server-side encryption algorithm.
++   * This includes validation of the configuration, checking the state of
++   * the encryption key given the chosen algorithm.
++   * @param conf configuration to scan
++   * @return the encryption mechanism (which will be {@code NONE} unless
++   * one is set.
++   * @throws IOException on any validation problem.
++   */
++  static S3AEncryptionMethods getEncryptionAlgorithm(Configuration conf)
++      throws IOException {
++    S3AEncryptionMethods sse = S3AEncryptionMethods.getMethod(
++        conf.getTrimmed(SERVER_SIDE_ENCRYPTION_ALGORITHM));
++    String sseKey = getServerSideEncryptionKey(conf);
++    int sseKeyLen = StringUtils.isBlank(sseKey) ? 0 : sseKey.length();
++    String diagnostics = passwordDiagnostics(sseKey, "key");
++    switch (sse) {
++    case SSE_C:
++      if (sseKeyLen == 0) {
++        throw new IOException(SSE_C_NO_KEY_ERROR);
++      }
++      break;
++
++    case SSE_S3:
++      if (sseKeyLen != 0) {
++        throw new IOException(SSE_S3_WITH_KEY_ERROR
++            + " (" + diagnostics + ")");
++      }
++      break;
++
++    case SSE_KMS:
++      LOG.debug("Using SSE-KMS with {}",
++          diagnostics);
++      break;
++
++    case NONE:
++    default:
++      LOG.debug("Data is unencrypted");
++      break;
++    }
++    LOG.debug("Using SSE-C with {}", diagnostics);
++    return sse;
++  }
++
++  /**
++   * Provide a password diagnostics string.
++   * This aims to help diagnostics without revealing significant password details
++   * @param pass password
++   * @param description description for text, e.g "key" or "password"
++   * @return text for use in messages.
++   */
++  private static String passwordDiagnostics(String pass, String description) {
++    if (pass == null) {
++      return "null " + description;
++    }
++    int len = pass.length();
++    switch (len) {
++    case 0:
++      return "empty " + description;
++    case 1:
++      return description + " of length 1";
++
++    default:
++      return description + " of length " + len + " ending with "
++          + pass.charAt(len - 1);
+     }
+-    return null;
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+index 705657c..823fbf9 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/index.md
+@@ -882,7 +882,7 @@ from placing its declaration on the command line.
+     </property>
+ 
+     <property>
+-        <name>fs.s3a.server-side-encryption-key</name>
++        <name>fs.s3a.server-side-encryption.key</name>
+         <description>Specific encryption key to use if fs.s3a.server-side-encryption-algorithm
+         has been set to 'SSE-KMS' or 'SSE-C'. In the case of SSE-C, the value of this property
+         should be the Base64 encoded key. If you are using SSE-KMS and leave this property empty,
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/testing.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/testing.md
+index 626c066..99dd33e 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/testing.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/testing.md
+@@ -270,7 +270,7 @@ source code tree, it is not going to get accidentally committed.
+ ### Configuring S3a Encryption
+ 
+ For S3a encryption tests to run correctly, the
+-`fs.s3a.server-side-encryption-key` must be configured in the s3a contract xml
++`fs.s3a.server-side-encryption.key` must be configured in the s3a contract xml
+ file with a AWS KMS encryption key arn as this value is different for each AWS
+ KMS.
+ 
+@@ -278,7 +278,7 @@ Example:
+ 
+ ```xml
+ <property>
+-  <name>fs.s3a.server-side-encryption-key</name>
++  <name>fs.s3a.server-side-encryption.key</name>
+   <value>arn:aws:kms:us-west-2:360379543683:key/071a86ff-8881-4ba0-9230-95af6d01ca01</value>
+ </property>
+ ```
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionAlgorithmValidation.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionAlgorithmValidation.java
+index bad55ee..8e328c3 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionAlgorithmValidation.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AEncryptionAlgorithmValidation.java
+@@ -91,7 +91,7 @@ public void testEncryptionAlgorithmSSECWithNoEncryptionKey() throws
+   public void testEncryptionAlgorithmSSECWithBlankEncryptionKey() throws
+     Throwable {
+     expectedException.expect(IOException.class);
+-    expectedException.expectMessage(Constants.SSE_C_NO_KEY_ERROR);
++    expectedException.expectMessage(S3AUtils.SSE_C_NO_KEY_ERROR);
+ 
+     Configuration conf = super.createConfiguration();
+     //SSE-C must be configured with an encryption key
+@@ -115,7 +115,7 @@ public void testEncryptionAlgorithmSSECWithBlankEncryptionKey() throws
+   public void testEncryptionAlgorithmSSES3WithEncryptionKey() throws
+     Throwable {
+     expectedException.expect(IOException.class);
+-    expectedException.expectMessage(Constants.SSE_S3_WITH_KEY_ERROR);
++    expectedException.expectMessage(S3AUtils.SSE_S3_WITH_KEY_ERROR);
+ 
+     Configuration conf = super.createConfiguration();
+     //SSE-S3 cannot be configured with an encryption key
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestSSEConfiguration.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestSSEConfiguration.java
+new file mode 100644
+index 0000000..98c773e
+--- /dev/null
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestSSEConfiguration.java
+@@ -0,0 +1,221 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs.s3a;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.URI;
++import java.util.concurrent.Callable;
++
++import org.apache.hadoop.test.GenericTestUtils;
++import org.junit.Assert;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++import org.junit.rules.Timeout;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.security.ProviderUtils;
++import org.apache.hadoop.security.alias.CredentialProvider;
++import org.apache.hadoop.security.alias.CredentialProviderFactory;
++
++import static org.apache.hadoop.fs.s3a.Constants.*;
++import static org.apache.hadoop.fs.s3a.S3AEncryptionMethods.*;
++import static org.apache.hadoop.fs.s3a.S3AUtils.*;
++
++/**
++ * Test SSE setup operations and errors raised.
++ */
++public class TestSSEConfiguration extends Assert {
++
++  @Rule
++  public Timeout testTimeout = new Timeout(
++      S3ATestConstants.S3A_TEST_TIMEOUT
++  );
++
++  @Rule
++  public final TemporaryFolder tempDir = new TemporaryFolder();
++
++  @Test
++  public void testSSECNoKey() throws Throwable {
++    assertExceptionTextEquals(SSE_C_NO_KEY_ERROR, SSE_C.getMethod(), null);
++  }
++
++  @Test
++  public void testSSECBlankKey() throws Throwable {
++    assertExceptionTextEquals(SSE_C_NO_KEY_ERROR, SSE_C.getMethod(), "");
++  }
++
++  @Test
++  public void testSSECGoodKey() throws Throwable {
++    assertEquals(SSE_C, getAlgorithm(SSE_C, "sseckey"));
++  }
++
++  @Test
++  public void testKMSGoodKey() throws Throwable {
++    assertEquals(SSE_KMS, getAlgorithm(SSE_KMS, "kmskey"));
++  }
++
++  @Test
++  public void testKMSGoodOldOptionName() throws Throwable {
++    Configuration conf = new Configuration(false);
++    conf.set(SERVER_SIDE_ENCRYPTION_ALGORITHM, SSE_KMS.getMethod());
++    conf.set(OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY, "kmskeyID");
++    // verify key round trip
++    assertEquals("kmskeyID", getServerSideEncryptionKey(conf));
++    // and that KMS lookup finds it
++    assertEquals(SSE_KMS, getEncryptionAlgorithm(conf));
++  }
++
++  @Test
++  public void testAESKeySet() throws Throwable {
++    assertExceptionTextEquals(SSE_S3_WITH_KEY_ERROR,
++        SSE_S3.getMethod(), "setkey");
++  }
++
++  @Test
++  public void testSSEEmptyKey() throws Throwable {
++    // test the internal logic of the test setup code
++    Configuration c = buildConf(SSE_C.getMethod(), "");
++    assertEquals("", getServerSideEncryptionKey(c));
++  }
++
++  @Test
++  public void testSSEKeyNull() throws Throwable {
++    // test the internal logic of the test setup code
++    final Configuration c = buildConf(SSE_C.getMethod(), null);
++    assertNull("", getServerSideEncryptionKey(c));
++
++    try {
++      getEncryptionAlgorithm(c);
++      throw new AssertionError("Expected an exception");
++    } catch (IOException e) {
++      GenericTestUtils.assertExceptionContains(SSE_C_NO_KEY_ERROR, e);
++    }
++  }
++
++  @Test
++  public void testSSEKeyFromCredentialProvider() throws Exception {
++    // set up conf to have a cred provider
++    final Configuration conf = new Configuration();
++    addFileProvider(conf);
++    String key = "provisioned";
++    provisionSSEKey(conf, SERVER_SIDE_ENCRYPTION_KEY, key);
++    // let's set the password in config and ensure that it uses the credential
++    // provider provisioned value instead.
++    conf.set(SERVER_SIDE_ENCRYPTION_KEY, "keyInConfObject");
++
++    String sseKey = getServerSideEncryptionKey(conf);
++    assertNotNull("Proxy password should not retrun null.", sseKey);
++    assertEquals("Proxy password override did NOT work.", key, sseKey);
++  }
++
++  /**
++   * Very that the old key is picked up via the properties
++   * @throws Exception failure
++   */
++  @Test
++  public void testOldKeyFromCredentialProvider() throws Exception {
++    // set up conf to have a cred provider
++    final Configuration conf = new Configuration();
++    addFileProvider(conf);
++    String key = "provisioned";
++    provisionSSEKey(conf, OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY, key);
++    // let's set the password in config and ensure that it uses the credential
++    // provider provisioned value instead.
++    //conf.set(OLD_S3A_SERVER_SIDE_ENCRYPTION_KEY, "oldKeyInConf");
++    String sseKey = getServerSideEncryptionKey(conf);
++    assertNotNull("Proxy password should not retrun null.", sseKey);
++    assertEquals("Proxy password override did NOT work.", key, sseKey);
++  }
++
++  /**
++   * Add a temp file provider to the config.
++   * @param conf config
++   * @throws Exception failure
++   */
++  private void addFileProvider(Configuration conf)
++      throws Exception {
++    final File file = tempDir.newFile("test.jks");
++    final URI jks = ProviderUtils.nestURIForLocalJavaKeyStoreProvider(
++        file.toURI());
++    conf.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,
++        jks.toString());
++  }
++
++  /**
++   * Set the SSE Key via the provision API, not the config itself.
++   * @param conf config
++   * @param option option name
++   * @param key key to set
++   * @throws Exception failure
++   */
++  void provisionSSEKey(final Configuration conf,
++      String option, String key) throws Exception {
++    // add our password to the provider
++    final CredentialProvider provider =
++        CredentialProviderFactory.getProviders(conf).get(0);
++    provider.createCredentialEntry(option,
++        key.toCharArray());
++    provider.flush();
++  }
++
++  /**
++   * Assert that the exception text from a config contains the expected string
++   * @param expected expected substring
++   * @param alg algorithm to ask for
++   * @param key optional key value
++   * @throws Exception anything else which gets raised
++   */
++  public void assertExceptionTextEquals(String expected,
++      final String alg, final String key) throws Exception {
++    try {
++      getAlgorithm(alg, key);
++      throw new AssertionError("Expected an exception");
++    } catch (IOException e) {
++      GenericTestUtils.assertExceptionContains(expected, e);
++    }
++  }
++
++  private S3AEncryptionMethods getAlgorithm(S3AEncryptionMethods algorithm,
++      String key)
++      throws IOException {
++    return getAlgorithm(algorithm.getMethod(), key);
++  }
++
++  private S3AEncryptionMethods getAlgorithm(String algorithm, String key)
++      throws IOException {
++    return getEncryptionAlgorithm(buildConf(algorithm, key));
++  }
++
++  private Configuration buildConf(String algorithm, String key) {
++    Configuration conf = new Configuration(false);
++    if (algorithm != null) {
++      conf.set(SERVER_SIDE_ENCRYPTION_ALGORITHM, algorithm);
++    } else {
++      conf.unset(SERVER_SIDE_ENCRYPTION_ALGORITHM);
++    }
++    if (key != null) {
++      conf.set(SERVER_SIDE_ENCRYPTION_KEY, key);
++    } else {
++      conf.unset(SERVER_SIDE_ENCRYPTION_KEY);
++    }
++    return conf;
++  }
++}
+-- 
+1.7.9.5
+

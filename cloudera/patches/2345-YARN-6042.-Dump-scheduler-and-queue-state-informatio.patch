@@ -1,0 +1,405 @@
+From bd4a9b08b95f53b695e1bd88a72cf8f3b7480e0e Mon Sep 17 00:00:00 2001
+From: Yufei Gu <yufei.gu@cloudera.com>
+Date: Tue, 14 Mar 2017 16:20:45 -0700
+Subject: [PATCH 2345/2848] YARN-6042. Dump scheduler and queue state
+ information into FairScheduler DEBUG log. (Yufei
+ Gu via rchiang)
+
+(cherry picked from commit fa59f4e4907d2c37841d59656d79b3162e774310)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/main/conf/log4j.properties
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+
+Detailed Conflicts:
+	Without YARN-5642, so we need to set/get queue properties by using allocationConfiguration.
+	AppSchedulingInfo doesn't have method getNextPendingAsk yet, return to old way to get AM resource request in class FSAppAttempt.
+
+Change-Id: I556b96d3d839a3f0d0e9bbca1aeb5823d395271a
+---
+ .../hadoop-common/src/main/conf/log4j.properties   |    9 +++
+ .../scheduler/fair/FSAppAttempt.java               |   23 ++++--
+ .../scheduler/fair/FSLeafQueue.java                |   31 ++++++++
+ .../scheduler/fair/FSParentQueue.java              |   31 ++++++++
+ .../resourcemanager/scheduler/fair/FSQueue.java    |   43 ++++++++++--
+ .../scheduler/fair/FairScheduler.java              |   28 +++++---
+ .../scheduler/fair/TestFairScheduler.java          |   74 ++++++++++++++++++++
+ 7 files changed, 223 insertions(+), 16 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/conf/log4j.properties b/hadoop-common-project/hadoop-common/src/main/conf/log4j.properties
+index 5fa21fa..f297c71 100644
+--- a/hadoop-common-project/hadoop-common/src/main/conf/log4j.properties
++++ b/hadoop-common-project/hadoop-common/src/main/conf/log4j.properties
+@@ -268,3 +268,12 @@ log4j.appender.RMSUMMARY.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+ #log4j.appender.nodemanagerrequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+ #log4j.appender.nodemanagerrequestlog.Filename=${hadoop.log.dir}/jetty-nodemanager-yyyy_mm_dd.log
+ #log4j.appender.nodemanagerrequestlog.RetainDays=3
++
++# Fair scheduler requests log on state dump
++log4j.logger.org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.statedump=DEBUG,FSLOGGER
++log4j.appender.FSLOGGER=org.apache.log4j.RollingFileAppender
++log4j.appender.FSLOGGER.File=${hadoop.log.dir}/fairscheduler-statedump.log
++log4j.appender.FSLOGGER.layout=org.apache.log4j.PatternLayout
++log4j.appender.FSLOGGER.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
++log4j.appender.FSLOGGER.MaxFileSize=${hadoop.log.maxfilesize}
++log4j.appender.FSLOGGER.MaxBackupIndex=${hadoop.log.maxbackupindex}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+index b632eff..d04b6f3 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+@@ -742,14 +742,22 @@ private Resource assignContainer(
+       return capability;
+     }
+ 
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Resource request: " + capability + " exceeds the available"
++          + " resources of the node.");
++    }
++
+     // The desired container won't fit here, so reserve
+     if (isReservable(capability) &&
+         reserve(request, node, reservedContainer, type)) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(getName() + "'s resource request is reserved.");
++      }
+       return FairScheduler.CONTAINER_RESERVED;
+     } else {
+       if (LOG.isDebugEnabled()) {
+-        LOG.debug("Couldn't creating reservation for " +
+-            getName() + ",at priority " +  request.getPriority());
++        LOG.debug("Couldn't create reservation for app:  " + getName()
++            + ", at priority " +  request.getPriority());
+       }
+       return Resources.none();
+     }
+@@ -1155,10 +1163,17 @@ public void updateDemand() {
+   @Override
+   public Resource assignContainer(FSSchedulerNode node) {
+     if (isOverAMShareLimit()) {
++      List<ResourceRequest> ask = appSchedulingInfo.getAllResourceRequests();
++      Resource amResourceRequest = Resources.none();
++      if (!ask.isEmpty()) {
++        amResourceRequest = ask.get(0).getCapability();
++      }
+       if (LOG.isDebugEnabled()) {
+-        LOG.debug("Skipping allocation because maxAMShare limit would " +
+-            "be exceeded");
++        LOG.debug("AM resource request: " + amResourceRequest
++            + " exceeds maximum AM resource allowed, "
++            + getQueue().dumpState());
+       }
++
+       return Resources.none();
+     }
+     return assignContainer(node, false);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+index d50f5a5..2b09fcd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+@@ -37,6 +37,7 @@
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceWeights;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
+@@ -620,4 +621,34 @@ private boolean isStarvedForFairShare() {
+   boolean isStarved() {
+     return isStarvedForMinShare() || isStarvedForFairShare();
+   }
++
++  @Override
++  protected void dumpStateInternal(StringBuilder sb) {
++    ResourceWeights weights =
++        scheduler.getAllocationConfiguration().getQueueWeight(getName());
++    Resource maxShare =
++        scheduler.getAllocationConfiguration().getMaxResources(getName());
++    Resource minShare =
++        scheduler.getAllocationConfiguration().getMinResources(getName());
++    float maxAMShare=
++        scheduler.getAllocationConfiguration().getQueueMaxAMShare(getName());
++
++    sb.append("{Name: " + getName() +
++        ", Weight: " + weights +
++        ", Policy: " + policy.getName() +
++        ", FairShare: " + getFairShare() +
++        ", SteadyFairShare: " + getSteadyFairShare() +
++        ", MaxShare: " + maxShare +
++        ", MinShare: " + minShare +
++        ", ResourceUsage: " + getResourceUsage() +
++        ", Demand: " + getDemand() +
++        ", Runnable: " + getNumRunnableApps() +
++        ", NumPendingApps: " + getNumPendingApps() +
++        ", NonRunnable: " + getNumNonRunnableApps() +
++        ", MaxAMShare: " + maxAMShare +
++        ", MaxAMResource: " + computeMaxAMResource() +
++        ", AMResourceUsage: " + getAmResourceUsage() +
++        ", LastTimeAtMinShare: " + lastTimeAtMinShare +
++        "}");
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
+index ccfb647..8390012 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSParentQueue.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+ import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceWeights;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.util.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
+@@ -322,4 +323,34 @@ public void recoverContainer(Resource clusterResource,
+     // TODO Auto-generated method stub
+     
+   }
++
++  @Override
++  protected void dumpStateInternal(StringBuilder sb) {
++    ResourceWeights weights =
++        scheduler.getAllocationConfiguration().getQueueWeight(getName());
++    Resource maxShare =
++        scheduler.getAllocationConfiguration().getMaxResources(getName());
++    Resource minShare =
++        scheduler.getAllocationConfiguration().getMinResources(getName());
++    float maxAMShare=
++        scheduler.getAllocationConfiguration().getQueueMaxAMShare(getName());
++
++    sb.append("{Name: " + getName() +
++        ", Weight: " + weights +
++        ", Policy: " + policy.getName() +
++        ", FairShare: " + getFairShare() +
++        ", SteadyFairShare: " + getSteadyFairShare() +
++        ", MaxShare: " + maxShare +
++        ", MinShare: " + minShare +
++        ", ResourceUsage: " + getResourceUsage() +
++        ", Demand: " + getDemand() +
++        ", MaxAMShare: " + maxAMShare +
++        ", Runnable: " + getNumRunnableApps() +
++        "}");
++
++    for(FSQueue child : getChildQueues()) {
++      sb.append(", ");
++      child.dumpStateInternal(sb);
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+index 1ac807e..f56b08a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+@@ -317,12 +317,23 @@ public abstract void collectSchedulerApplications(
+    * @return true if check passes (can assign) or false otherwise
+    */
+   boolean assignContainerPreCheck(FSSchedulerNode node) {
+-    if (!Resources.fitsIn(getResourceUsage(),
+-        scheduler.getAllocationConfiguration().getMaxResources(getName()))
+-        || node.getReservedContainer() != null) {
++    if (node.getReservedContainer() != null) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Assigning container failed on node '" + node.getNodeName()
++            + " because it has reserved containers.");
++      }
++      return false;
++    } else if (!Resources.fitsIn(getResourceUsage(),
++        scheduler.getAllocationConfiguration().getMaxResources(getName()))) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Assigning container failed on node '" + node.getNodeName()
++            + " because queue resource usage is larger than MaxShare: "
++            + dumpState());
++      }
+       return false;
++    } else {
++      return true;
+     }
+-    return true;
+   }
+ 
+   /**
+@@ -356,6 +367,11 @@ boolean fitsInMaxShare(Resource additionalResource) {
+         Resources.add(getResourceUsage(), additionalResource);
+ 
+     if (!Resources.fitsIn(usagePlusAddition, getMaxShare())) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Resource usage plus resource request: " + usagePlusAddition
++            + " exceeds maximum resource allowed:" + getMaxShare()
++            + " in queue " + getName());
++      }
+       return false;
+     }
+ 
+@@ -365,4 +381,23 @@ boolean fitsInMaxShare(Resource additionalResource) {
+     }
+     return true;
+   }
++
++  /**
++   * Recursively dump states of all queues.
++   *
++   * @return a string which holds all queue states
++   */
++  public String dumpState() {
++    StringBuilder sb = new StringBuilder();
++    dumpStateInternal(sb);
++    return sb.toString();
++  }
++
++
++  /**
++   * Recursively dump states of all queues.
++   *
++   * @param sb the {code StringBuilder} which holds queue states
++   */
++  protected abstract void dumpStateInternal(StringBuilder sb);
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index dda91cb..1a729c1 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -133,7 +133,9 @@
+   private boolean usePortForNodeName;
+ 
+   private static final Log LOG = LogFactory.getLog(FairScheduler.class);
+-  
++  private static final Log STATE_DUMP_LOG =
++      LogFactory.getLog(FairScheduler.class.getName() + ".statedump");
++
+   private static final ResourceCalculator RESOURCE_CALCULATOR =
+       new DefaultResourceCalculator();
+   private static final ResourceCalculator DOMINANT_RESOURCE_CALCULATOR =
+@@ -145,7 +147,7 @@
+ 
+   // How often fair shares are re-calculated (ms)
+   protected long updateInterval;
+-  private final int UPDATE_DEBUG_FREQUENCY = 5;
++  private final int UPDATE_DEBUG_FREQUENCY = 25;
+   private int updatesToSkipForDebug = UPDATE_DEBUG_FREQUENCY;
+ 
+   @VisibleForTesting
+@@ -324,6 +326,21 @@ public void run() {
+   }
+ 
+   /**
++   * Dump scheduler state including states of all queues.
++   */
++  private void dumpSchedulerState() {
++    FSQueue rootQueue = queueMgr.getRootQueue();
++    Resource clusterResource = getClusterResource();
++    LOG.debug("FairScheduler state: Cluster Capacity: " + clusterResource +
++        "  Allocations: " + rootMetrics.getAllocatedResources() +
++        "  Availability: " + Resource.newInstance(
++        rootMetrics.getAvailableMB(), rootMetrics.getAvailableVirtualCores()) +
++        "  Demand: " + rootQueue.getDemand());
++
++    STATE_DUMP_LOG.debug(rootQueue.dumpState());
++  }
++
++  /**
+    * Recompute the internal variables used by the scheduler - per-job weights,
+    * fair shares, deficits, minimum slot allocations, and amount of used and
+    * required resources per job.
+@@ -345,12 +362,7 @@ public synchronized void update() {
+     if (LOG.isDebugEnabled()) {
+       if (--updatesToSkipForDebug < 0) {
+         updatesToSkipForDebug = UPDATE_DEBUG_FREQUENCY;
+-        LOG.debug("Cluster Capacity: " + clusterResource +
+-            "  Allocations: " + rootMetrics.getAllocatedResources() +
+-            "  Availability: " + Resource.newInstance(
+-            rootMetrics.getAvailableMB(),
+-            rootMetrics.getAvailableVirtualCores()) +
+-            "  Demand: " + rootQueue.getDemand());
++        dumpSchedulerState();
+       }
+     }
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 99125e9..27b482c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -5388,4 +5388,78 @@ public void testReservationMetrics() throws IOException {
+     assertEquals(0, metrics.getReservedMB());
+     assertEquals(0, metrics.getReservedVirtualCores());
+   }
++
++  @Test
++  public void testDumpState() throws IOException {
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
++
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
++    out.println("<queue name=\"parent\">");
++    out.println("  <queue name=\"child1\">");
++    out.println("    <weight>1</weight>");
++    out.println("  </queue>");
++    out.println("</queue>");
++    out.println("</allocations>");
++    out.close();
++
++    ControlledClock clock = new ControlledClock();
++    scheduler.setClock(clock);
++
++    scheduler.init(conf);
++    scheduler.start();
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++
++    FSLeafQueue child1 =
++        scheduler.getQueueManager().getLeafQueue("parent.child1", false);
++    Resource resource = Resource.newInstance(4 * GB, 4);
++    scheduler.getAllocationConfiguration().
++        setMaxResources(child1.getName(), resource);
++    FSAppAttempt app = mock(FSAppAttempt.class);
++    Mockito.when(app.getDemand()).thenReturn(resource);
++    Mockito.when(app.getResourceUsage()).thenReturn(resource);
++    child1.addAppSchedulable(app);
++    child1.updateDemand();
++
++    String childQueueString = "{Name: root.parent.child1,"
++        + " Weight: <memory weight=1.0, cpu weight=1.0>,"
++        + " Policy: fair,"
++        + " FairShare: <memory:0, vCores:0>,"
++        + " SteadyFairShare: <memory:0, vCores:0>,"
++        + " MaxShare: <memory:4096, vCores:4>,"
++        + " MinShare: <memory:0, vCores:0>,"
++        + " ResourceUsage: <memory:4096, vCores:4>,"
++        + " Demand: <memory:4096, vCores:4>,"
++        + " Runnable: 1,"
++        + " NumPendingApps: 0,"
++        + " NonRunnable: 0,"
++        + " MaxAMShare: 0.5,"
++        + " MaxAMResource: <memory:0, vCores:0>,"
++        + " AMResourceUsage: <memory:0, vCores:0>,"
++        + " LastTimeAtMinShare: " + clock.getTime()
++        + "}";
++
++    assertTrue(child1.dumpState().equals(childQueueString));
++    FSParentQueue parent =
++        scheduler.getQueueManager().getParentQueue("parent", false);
++    scheduler.getAllocationConfiguration()
++        .setMaxResources(parent.getName(), resource);
++    parent.updateDemand();
++
++    String parentQueueString = "{Name: root.parent,"
++        + " Weight: <memory weight=1.0, cpu weight=1.0>,"
++        + " Policy: fair,"
++        + " FairShare: <memory:0, vCores:0>,"
++        + " SteadyFairShare: <memory:0, vCores:0>,"
++        + " MaxShare: <memory:4096, vCores:4>,"
++        + " MinShare: <memory:0, vCores:0>,"
++        + " ResourceUsage: <memory:4096, vCores:4>,"
++        + " Demand: <memory:4096, vCores:4>,"
++        + " MaxAMShare: 0.5,"
++        + " Runnable: 0}";
++
++    assertTrue(parent.dumpState().equals(
++        parentQueueString + ", " + childQueueString));
++  }
+ }
+-- 
+1.7.9.5
+

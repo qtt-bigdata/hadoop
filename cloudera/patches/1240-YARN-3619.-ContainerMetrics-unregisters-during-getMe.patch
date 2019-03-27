@@ -1,0 +1,333 @@
+From af5116e51e5380d27a5f34bd1baf19836de1f1f1 Mon Sep 17 00:00:00 2001
+From: Jason Lowe <jlowe@apache.org>
+Date: Fri, 2 Oct 2015 20:09:13 +0000
+Subject: [PATCH 1240/2848] YARN-3619. ContainerMetrics unregisters during
+ getMetrics and leads to
+ ConcurrentModificationException. Contributed by
+ Zhihai Xu (cherry picked from commit
+ fdf02d1f26cea372bf69e071f57b8bfc09c092c4)
+
+(cherry picked from commit 3e3733437fbfa94800e2cb2d77a2b5592b9a8add)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainerMetrics.java
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
+
+Change-Id: I1788d5c95a34c21719080f18efe6d8d3a93c3599
+---
+ .../hadoop/metrics2/impl/MetricsSystemImpl.java    |    3 +-
+ .../apache/hadoop/yarn/conf/YarnConfiguration.java |   10 ++++-
+ .../src/main/resources/yarn-default.xml            |   10 ++++-
+ .../containermanager/monitor/ContainerMetrics.java |   40 +++++++++++++----
+ .../monitor/ContainersMonitorImpl.java             |   19 ++++++---
+ .../monitor/TestContainerMetrics.java              |   45 +++++++++++++++++++-
+ 6 files changed, 108 insertions(+), 19 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/impl/MetricsSystemImpl.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/impl/MetricsSystemImpl.java
+index 4507e35..4dcd96a 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/impl/MetricsSystemImpl.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/metrics2/impl/MetricsSystemImpl.java
+@@ -397,7 +397,8 @@ public void publishMetricsNow() {
+    * Sample all the sources for a snapshot of metrics/tags
+    * @return  the metrics buffer containing the snapshot
+    */
+-  synchronized MetricsBuffer sampleMetrics() {
++  @VisibleForTesting
++  public synchronized MetricsBuffer sampleMetrics() {
+     collector.clear();
+     MetricsBufferBuilder bufferBuilder = new MetricsBufferBuilder();
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index b41a423..bff657e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -921,7 +921,15 @@ private static void addDeprecatedKeys() {
+       NM_PREFIX + "container-metrics.period-ms";
+   @Private
+   public static final int DEFAULT_NM_CONTAINER_METRICS_PERIOD_MS = -1;
+-  
++
++  /** The delay time ms to unregister container metrics after completion. */
++  @Private
++  public static final String NM_CONTAINER_METRICS_UNREGISTER_DELAY_MS =
++      NM_PREFIX + "container-metrics.unregister-delay-ms";
++  @Private
++  public static final int DEFAULT_NM_CONTAINER_METRICS_UNREGISTER_DELAY_MS =
++      10000;
++
+   /** Prefix for all node manager disk health checker configs. */
+   private static final String NM_DISK_HEALTH_CHECK_PREFIX =
+       "yarn.nodemanager.disk-health-checker.";
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 524f94f..6abbd4f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -1164,7 +1164,15 @@
+     <value>${hadoop.tmp.dir}/yarn-nm-recovery</value>
+   </property>
+ 
+-  <!--Docker configuration-->
++  <property>
++    <description>
++    The delay time ms to unregister container metrics after completion.
++    </description>
++    <name>yarn.nodemanager.container-metrics.unregister-delay-ms</name>
++    <value>10000</value>
++  </property>
++
++  <!-- Docker Configuration -->
+ 
+   <property>
+     <name>yarn.nodemanager.docker-container-executor.exec-name</name>
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainerMetrics.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainerMetrics.java
+index a8828f4..c13e54f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainerMetrics.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainerMetrics.java
+@@ -100,22 +100,29 @@
+   private boolean flushOnPeriod = false; // true if period elapsed
+   private boolean finished = false; // true if container finished
+   private boolean unregister = false; // unregister
++  private long unregisterDelayMs;
+   private Timer timer; // lazily initialized
+ 
+   /**
+    * Simple metrics cache to help prevent re-registrations.
+    */
+   protected final static Map<ContainerId, ContainerMetrics>
+-      usageMetrics = new HashMap<ContainerId, ContainerMetrics>();
++      usageMetrics = new HashMap<>();
++  // Create a timer to unregister container metrics,
++  // whose associated thread run as a daemon.
++  private final static Timer unregisterContainerMetricsTimer =
++      new Timer("Container metrics unregistration", true);
+ 
+   ContainerMetrics(
+-      MetricsSystem ms, ContainerId containerId, long flushPeriodMs) {
++      MetricsSystem ms, ContainerId containerId, long flushPeriodMs,
++      long delayMs) {
+     this.recordInfo =
+         info(sourceName(containerId), RECORD_INFO.description());
+     this.registry = new MetricsRegistry(recordInfo);
+     this.metricsSystem = ms;
+     this.containerId = containerId;
+     this.flushPeriodMs = flushPeriodMs;
++    this.unregisterDelayMs = delayMs < 0 ? 0 : delayMs;
+     scheduleTimerTaskIfRequired();
+ 
+     this.pMemMBsStat = registry.newStat(
+@@ -148,17 +155,18 @@ static String sourceName(ContainerId containerId) {
+   }
+ 
+   public static ContainerMetrics forContainer(
+-      ContainerId containerId, long flushPeriodMs) {
++      ContainerId containerId, long flushPeriodMs, long delayMs) {
+     return forContainer(
+-        DefaultMetricsSystem.instance(), containerId, flushPeriodMs);
++        DefaultMetricsSystem.instance(), containerId, flushPeriodMs, delayMs);
+   }
+ 
+   synchronized static ContainerMetrics forContainer(
+-      MetricsSystem ms, ContainerId containerId, long flushPeriodMs) {
++      MetricsSystem ms, ContainerId containerId, long flushPeriodMs,
++      long delayMs) {
+     ContainerMetrics metrics = usageMetrics.get(containerId);
+     if (metrics == null) {
+-      metrics = new ContainerMetrics(
+-          ms, containerId, flushPeriodMs).tag(RECORD_INFO, containerId);
++      metrics = new ContainerMetrics(ms, containerId, flushPeriodMs,
++          delayMs).tag(RECORD_INFO, containerId);
+ 
+       // Register with the MetricsSystems
+       if (ms != null) {
+@@ -172,12 +180,15 @@ synchronized static ContainerMetrics forContainer(
+     return metrics;
+   }
+ 
++  synchronized static void unregisterContainerMetrics(ContainerMetrics cm) {
++    cm.metricsSystem.unregisterSource(cm.recordInfo.name());
++    usageMetrics.remove(cm.containerId);
++  }
++
+   @Override
+   public synchronized void getMetrics(MetricsCollector collector, boolean all) {
+     //Container goes through registered -> finished -> unregistered.
+     if (unregister) {
+-      metricsSystem.unregisterSource(recordInfo.name());
+-      usageMetrics.remove(containerId);
+       return;
+     }
+ 
+@@ -199,6 +210,7 @@ public synchronized void finished() {
+       timer.cancel();
+       timer = null;
+     }
++    scheduleTimerTaskForUnregistration();
+   }
+ 
+   public void recordMemoryUsage(int memoryMBs) {
+@@ -246,4 +258,14 @@ public void run() {
+       timer.schedule(timerTask, flushPeriodMs);
+     }
+   }
++
++  private void scheduleTimerTaskForUnregistration() {
++    TimerTask timerTask = new TimerTask() {
++      @Override
++      public void run() {
++        ContainerMetrics.unregisterContainerMetrics(ContainerMetrics.this);
++      }
++    };
++    unregisterContainerMetricsTimer.schedule(timerTask, unregisterDelayMs);
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
+index 1f277ba..c201452 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
+@@ -54,6 +54,7 @@
+   private MonitoringThread monitoringThread;
+   private boolean containerMetricsEnabled;
+   private long containerMetricsPeriodMs;
++  private long containerMetricsUnregisterDelayMs;
+ 
+   final List<ContainerId> containersToBeRemoved;
+   final Map<ContainerId, ProcessTreeInfo> containersToBeAdded;
+@@ -116,6 +117,9 @@ protected void serviceInit(Configuration conf) throws Exception {
+     this.containerMetricsPeriodMs =
+         conf.getLong(YarnConfiguration.NM_CONTAINER_METRICS_PERIOD_MS,
+             YarnConfiguration.DEFAULT_NM_CONTAINER_METRICS_PERIOD_MS);
++    this.containerMetricsUnregisterDelayMs = conf.getLong(
++        YarnConfiguration.NM_CONTAINER_METRICS_UNREGISTER_DELAY_MS,
++        YarnConfiguration.DEFAULT_NM_CONTAINER_METRICS_UNREGISTER_DELAY_MS);
+ 
+     long configuredPMemForContainers = conf.getLong(
+         YarnConfiguration.NM_PMEM_MB,
+@@ -379,7 +383,8 @@ public void run() {
+           for (ContainerId containerId : containersToBeRemoved) {
+             if (containerMetricsEnabled) {
+               ContainerMetrics.forContainer(
+-                  containerId, containerMetricsPeriodMs).finished();
++                  containerId, containerMetricsPeriodMs,
++                  containerMetricsUnregisterDelayMs).finished();
+             }
+             trackingContainers.remove(containerId);
+             LOG.info("Stopping resource-monitoring for " + containerId);
+@@ -417,7 +422,8 @@ public void run() {
+ 
+                 if (containerMetricsEnabled) {
+                   ContainerMetrics usageMetrics = ContainerMetrics
+-                      .forContainer(containerId, containerMetricsPeriodMs);
++                      .forContainer(containerId, containerMetricsPeriodMs,
++                      containerMetricsUnregisterDelayMs);
+                   int cpuVcores = ptInfo.getCpuVcores();
+                   final int vmemLimit = (int) (ptInfo.getVmemLimit() >> 20);
+                   final int pmemLimit = (int) (ptInfo.getPmemLimit() >> 20);
+@@ -464,10 +470,12 @@ public void run() {
+             // Add usage to container metrics
+             if (containerMetricsEnabled) {
+               ContainerMetrics.forContainer(
+-                  containerId, containerMetricsPeriodMs).recordMemoryUsage(
++                  containerId, containerMetricsPeriodMs,
++                  containerMetricsUnregisterDelayMs).recordMemoryUsage(
+                   (int) (currentPmemUsage >> 20));
+               ContainerMetrics.forContainer(
+-                  containerId, containerMetricsPeriodMs).recordCpuUsage
++                  containerId, containerMetricsPeriodMs,
++                  containerMetricsUnregisterDelayMs).recordCpuUsage
+                   ((int)cpuUsagePercentPerCore, milliVcoresUsed);
+             }
+ 
+@@ -617,7 +625,8 @@ public void handle(ContainersMonitorEvent monitoringEvent) {
+ 
+       if (containerMetricsEnabled) {
+         ContainerMetrics usageMetrics = ContainerMetrics
+-            .forContainer(containerId, containerMetricsPeriodMs);
++            .forContainer(containerId, containerMetricsPeriodMs,
++                containerMetricsUnregisterDelayMs);
+         usageMetrics.recordStateChangeDurations(
+             startEvent.getLaunchDuration(),
+             startEvent.getLocalizationDuration());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainerMetrics.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainerMetrics.java
+index bdf9994..2beb927 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainerMetrics.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainerMetrics.java
+@@ -22,11 +22,15 @@
+ import org.apache.hadoop.metrics2.MetricsSystem;
+ import org.apache.hadoop.metrics2.impl.MetricsCollectorImpl;
+ import org.apache.hadoop.metrics2.impl.MetricsRecords;
++import org.apache.hadoop.metrics2.impl.MetricsSystemImpl;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
+ import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.anyString;
+ import static org.mockito.Mockito.doReturn;
+@@ -44,7 +48,8 @@ public void testContainerMetricsFlow() throws InterruptedException {
+ 
+     MetricsCollectorImpl collector = new MetricsCollectorImpl();
+     ContainerId containerId = mock(ContainerId.class);
+-    ContainerMetrics metrics = ContainerMetrics.forContainer(containerId, 100);
++    ContainerMetrics metrics = ContainerMetrics.forContainer(containerId,
++        100, 1);
+ 
+     metrics.recordMemoryUsage(1024);
+     metrics.getMetrics(collector, true);
+@@ -82,7 +87,8 @@ public void testContainerMetricsLimit() throws InterruptedException {
+ 
+     MetricsCollectorImpl collector = new MetricsCollectorImpl();
+     ContainerId containerId = mock(ContainerId.class);
+-    ContainerMetrics metrics = ContainerMetrics.forContainer(containerId, 100);
++    ContainerMetrics metrics = ContainerMetrics.forContainer(containerId,
++        100, 1);
+ 
+     int anyPmemLimit = 1024;
+     int anyVmemLimit = 2048;
+@@ -117,4 +123,39 @@ public void testContainerMetricsLimit() throws InterruptedException {
+ 
+     collector.clear();
+   }
++
++  @Test
++  public void testContainerMetricsFinished() throws InterruptedException {
++    MetricsSystemImpl system = new MetricsSystemImpl();
++    system.init("test");
++    MetricsCollectorImpl collector = new MetricsCollectorImpl();
++    ApplicationId appId = ApplicationId.newInstance(1234, 3);
++    ApplicationAttemptId appAttemptId =
++        ApplicationAttemptId.newInstance(appId, 4);
++    ContainerId containerId1 = ContainerId.newContainerId(appAttemptId, 1);
++    ContainerMetrics metrics1 = ContainerMetrics.forContainer(system,
++        containerId1, 1, 0);
++    ContainerId containerId2 = ContainerId.newContainerId(appAttemptId, 2);
++    ContainerMetrics metrics2 = ContainerMetrics.forContainer(system,
++        containerId2, 1, 0);
++    ContainerId containerId3 = ContainerId.newContainerId(appAttemptId, 3);
++    ContainerMetrics metrics3 = ContainerMetrics.forContainer(system,
++        containerId3, 1, 0);
++    metrics1.finished();
++    metrics2.finished();
++    system.sampleMetrics();
++    system.sampleMetrics();
++    Thread.sleep(100);
++    system.stop();
++    // verify metrics1 is unregistered
++    assertTrue(metrics1 != ContainerMetrics.forContainer(
++        system, containerId1, 1, 0));
++    // verify metrics2 is unregistered
++    assertTrue(metrics2 != ContainerMetrics.forContainer(
++        system, containerId2, 1, 0));
++    // verify metrics3 is still registered
++    assertTrue(metrics3 == ContainerMetrics.forContainer(
++        system, containerId3, 1, 0));
++    system.shutdown();
++  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,222 @@
+From 846eb6743bfe4fc57e452f6abe531a3ce188f33b Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Thu, 16 Feb 2017 14:54:51 -0800
+Subject: [PATCH 2259/2848] YARN-6171. ConcurrentModificationException on
+ FSAppAttempt.containersToPreempt. (Miklos Szegedi
+ via kasha)
+
+(cherry picked from commit a77f432449aad67da31bd8bf8644b71def741bde)
+
+(cherry picked from commit afc8124)
+
+Detailed conflicts:
+FairScheduler.java: do not backport locking change, where the lock was different, keep CDH blacklisting logic that was removed upstream
+FSAppAttempt.java: do not backport a newline in a log message that is missing from CDH
+
+Change-Id: I28648a5ad5835a8d420372bbe3706cdf97dace33
+---
+ .../scheduler/fair/FSAppAttempt.java               |   46 +++++++++++---------
+ .../scheduler/fair/FairScheduler.java              |   35 +++++++--------
+ 2 files changed, 41 insertions(+), 40 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+index 5614330..78f26cd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSAppAttempt.java
+@@ -83,8 +83,10 @@
+   private Resource fairShare = Resources.createResource(0, 0);
+ 
+   // Preemption related variables
++  private final Object preemptionVariablesLock = new Object();
+   private final Resource preemptedResources = Resources.clone(Resources.none());
+   private final Set<RMContainer> containersToPreempt = new HashSet<>();
++
+   private Resource fairshareStarvation = Resources.none();
+   private long lastTimeAtFairShare;
+ 
+@@ -473,29 +475,29 @@ void resetMinshareStarvation() {
+   }
+ 
+   void trackContainerForPreemption(RMContainer container) {
+-    if (containersToPreempt.add(container)) {
+-      synchronized (preemptedResources) {
++    synchronized (preemptionVariablesLock) {
++      if (containersToPreempt.add(container)) {
+         Resources.addTo(preemptedResources, container.getAllocatedResource());
+       }
+     }
+   }
+ 
+   private void untrackContainerForPreemption(RMContainer container) {
+-    if (containersToPreempt.remove(container)) {
+-      synchronized (preemptedResources) {
++    synchronized (preemptionVariablesLock) {
++      if (containersToPreempt.remove(container)) {
+         Resources.subtractFrom(preemptedResources,
+             container.getAllocatedResource());
+       }
+     }
+   }
+ 
+-  Set<RMContainer> getPreemptionContainers() {
+-    return containersToPreempt;
+-  }
+-
+-  private Resource getPreemptedResources() {
+-    synchronized (preemptedResources) {
+-      return preemptedResources;
++  Set<ContainerId> getPreemptionContainerIds() {
++    synchronized (preemptionVariablesLock) {
++      Set<ContainerId> preemptionContainerIds = new HashSet<>();
++      for (RMContainer container : containersToPreempt) {
++        preemptionContainerIds.add(container.getContainerId());
++      }
++      return preemptionContainerIds;
+     }
+   }
+ 
+@@ -508,9 +510,11 @@ boolean canContainerBePreempted(RMContainer container) {
+       return false;
+     }
+ 
+-    if (containersToPreempt.contains(container)) {
+-      // The container is already under consideration for preemption
+-      return false;
++    synchronized (preemptionVariablesLock) {
++      if (containersToPreempt.contains(container)) {
++        // The container is already under consideration for preemption
++        return false;
++      }
+     }
+ 
+     // Check if any of the parent queues are not preemptable
+@@ -990,13 +994,13 @@ public Resource getMaxShare() {
+ 
+   @Override
+   public Resource getResourceUsage() {
+-    /*
+-     * getResourcesToPreempt() returns zero, except when there are containers
+-     * to preempt. Avoid creating an object in the common case.
+-     */
+-    return getPreemptedResources().equals(Resources.none())
+-        ? getCurrentConsumption()
+-        : Resources.subtract(getCurrentConsumption(), getPreemptedResources());
++    // Subtract copies the object, so that we have a snapshot,
++    // in case usage changes, while the caller is using the value
++    synchronized (preemptionVariablesLock) {
++      return containersToPreempt.isEmpty()
++          ? getCurrentConsumption()
++          : Resources.subtract(getCurrentConsumption(), preemptedResources);
++    }
+   }
+ 
+   @Override
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 94ed9ef..87fb381 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -463,7 +463,7 @@ protected synchronized void addApplication(ApplicationId applicationId,
+           .handle(new RMAppRejectedEvent(applicationId, msg));
+       return;
+     }
+-  
++
+     SchedulerApplication<FSAppAttempt> application =
+         new SchedulerApplication<FSAppAttempt>(queue, user);
+     applications.put(applicationId, application);
+@@ -512,7 +512,7 @@ protected synchronized void addApplicationAttempt(
+     } else {
+       maxRunningEnforcer.trackNonRunnableApp(attempt);
+     }
+-    
++
+     queue.getMetrics().submitAppAttempt(user);
+ 
+     LOG.info("Added Application Attempt " + applicationAttemptId
+@@ -788,21 +788,18 @@ public Allocation allocate(ApplicationAttemptId appAttemptId,
+         application.showRequests();
+       }
+ 
++      Set<ContainerId> preemptionContainerIds =
++          application.getPreemptionContainerIds();
+       if (LOG.isDebugEnabled()) {
+-        LOG.debug("allocate: post-update" +
+-            " applicationAttemptId=" + appAttemptId +
+-            " #ask=" + ask.size() +
+-            " reservation= " + application.getCurrentReservation());
++        LOG.debug(
++            "allocate: post-update" + " applicationAttemptId=" + appAttemptId
++                + " #ask=" + ask.size() + " reservation= " + application
++                .getCurrentReservation());
+ 
+-        LOG.debug("Preempting " + application.getPreemptionContainers().size()
++        LOG.debug("Preempting " + preemptionContainerIds.size()
+             + " container(s)");
+       }
+ 
+-      Set<ContainerId> preemptionContainerIds = new HashSet<ContainerId>();
+-      for (RMContainer container : application.getPreemptionContainers()) {
+-        preemptionContainerIds.add(container.getContainerId());
+-      }
+-
+       if (application.isWaitingForAMContainer(application.getApplicationId())) {
+         // Allocate is for AM and update AM blacklist for this
+         application.updateAMBlacklist(
+@@ -824,7 +821,7 @@ public Allocation allocate(ApplicationAttemptId appAttemptId,
+         allocation.getNMTokenList());
+     }
+   }
+-  
++
+   /**
+    * Process a heartbeat update from a node.
+    */
+@@ -836,14 +833,14 @@ private synchronized void nodeUpdate(RMNode nm) {
+     }
+     eventLog.log("HEARTBEAT", nm.getHostName());
+     FSSchedulerNode node = getFSSchedulerNode(nm.getNodeID());
+-    
++
+     List<UpdatedContainerInfo> containerInfoList = nm.pullContainerUpdates();
+     List<ContainerStatus> newlyLaunchedContainers = new ArrayList<ContainerStatus>();
+     List<ContainerStatus> completedContainers = new ArrayList<ContainerStatus>();
+     for(UpdatedContainerInfo containerInfo : containerInfoList) {
+       newlyLaunchedContainers.addAll(containerInfo.getNewlyLaunchedContainers());
+       completedContainers.addAll(containerInfo.getCompletedContainers());
+-    } 
++    }
+     // Processing the newly launched containers
+     for (ContainerStatus launchedContainer : newlyLaunchedContainers) {
+       containerLaunchedOnNode(launchedContainer.getContainerId(), node);
+@@ -1421,16 +1418,16 @@ public synchronized String moveApplication(ApplicationId appId,
+       if (targetQueue == oldQueue) {
+         return oldQueue.getQueueName();
+       }
+-      
++
+       if (oldQueue.isRunnableApp(attempt)) {
+         verifyMoveDoesNotViolateConstraints(attempt, oldQueue, targetQueue);
+       }
+-      
++
+       executeMove(app, attempt, oldQueue, targetQueue);
+       return targetQueue.getQueueName();
+     }
+   }
+-  
++
+   private void verifyMoveDoesNotViolateConstraints(FSAppAttempt app,
+       FSLeafQueue oldQueue, FSLeafQueue targetQueue) throws YarnException {
+     String queueName = targetQueue.getQueueName();
+@@ -1530,7 +1527,7 @@ FSQueue findLowestCommonAncestorQueue(FSQueue queue1, FSQueue queue2) {
+    * Process resource update on a node and update Queue.
+    */
+   @Override
+-  public synchronized void updateNodeResource(RMNode nm, 
++  public synchronized void updateNodeResource(RMNode nm,
+       ResourceOption resourceOption) {
+     super.updateNodeResource(nm, resourceOption);
+     updateRootQueueMetrics();
+-- 
+1.7.9.5
+

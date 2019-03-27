@@ -1,0 +1,574 @@
+From 23c5d7daf779f43344c017ffe74deef62ce068a9 Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Fri, 27 Jan 2017 09:42:09 +0000
+Subject: [PATCH 2270/2848] HADOOP-13985 s3guard: add a version marker to
+ every table. Contributed by Steve Loughran.
+
+A reference to LambdaTestUtils was removed when cherry picking this to
+CDH 5 to support Java 7.
+
+(cherry picked from commit b22c0d6bb44a3a5cc4e7099adf07d242b52cc38d)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/LambdaTestUtils.java
+	hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+
+Change-Id: I00bab96b41df19d319b03c7dffa85ad41d133ca6
+---
+ .../org/apache/hadoop/fs/AbstractFileSystem.java   |    8 ++
+ .../java/org/apache/hadoop/fs/FileContext.java     |    9 ++
+ .../fs/s3a/s3guard/DynamoDBMetadataStore.java      |  134 +++++++++++++++-----
+ .../s3guard/PathMetadataDynamoDBTranslation.java   |   69 +++++++++-
+ .../src/site/markdown/tools/hadoop-aws/s3guard.md  |   50 ++++++++
+ .../fs/s3a/s3guard/TestDynamoDBMetadataStore.java  |   62 ++++++++-
+ .../TestPathMetadataDynamoDBTranslation.java       |   27 ++--
+ 7 files changed, 315 insertions(+), 44 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/AbstractFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/AbstractFileSystem.java
+index 92d4eca..a3d71e2 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/AbstractFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/AbstractFileSystem.java
+@@ -20,6 +20,7 @@
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.ArrayList;
+@@ -131,6 +132,13 @@ public boolean isValidName(String src) {
+         CONSTRUCTOR_CACHE.put(theClass, meth);
+       }
+       result = meth.newInstance(uri, conf);
++    } catch (InvocationTargetException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof RuntimeException) {
++        throw (RuntimeException) cause;
++      } else {
++        throw new RuntimeException(cause);
++      }
+     } catch (Exception e) {
+       throw new RuntimeException(e);
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+index 0855c97..64a5248 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+@@ -338,6 +338,15 @@ public AbstractFileSystem run() throws UnsupportedFileSystemException {
+           return AbstractFileSystem.get(uri, conf);
+         }
+       });
++    } catch (RuntimeException ex) {
++      // RTEs can wrap other exceptions; if there is an IOException inner,
++      // throw it direct.
++      Throwable cause = ex.getCause();
++      if (cause instanceof IOException) {
++        throw (IOException) cause;
++      } else {
++        throw ex;
++      }
+     } catch (InterruptedException ex) {
+       LOG.error(ex);
+       throw new IOException("Failed to get the AbstractFileSystem for path: "
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+index f5da22b..589b5c2 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+@@ -24,6 +24,7 @@
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Date;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -34,6 +35,7 @@
+ import com.amazonaws.services.dynamodbv2.document.Item;
+ import com.amazonaws.services.dynamodbv2.document.ItemCollection;
+ import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
++import com.amazonaws.services.dynamodbv2.document.PutItemOutcome;
+ import com.amazonaws.services.dynamodbv2.document.QueryOutcome;
+ import com.amazonaws.services.dynamodbv2.document.Table;
+ import com.amazonaws.services.dynamodbv2.document.TableWriteItems;
+@@ -155,6 +157,20 @@
+   public static final Logger LOG = LoggerFactory.getLogger(
+       DynamoDBMetadataStore.class);
+ 
++  /** parent/child name to use in the version marker. */
++  public static final String VERSION_MARKER = "../VERSION";
++
++  /** Current version number. */
++  public static final int VERSION = 100;
++
++  /** Error: version marker not found in table. */
++  public static final String E_NO_VERSION_MARKER
++      = "S3Guard table lacks version marker.";
++
++  /** Error: version mismatch. */
++  public static final String E_INCOMPATIBLE_VERSION
++      = "Database table is from an incompatible S3Guard version.";
++
+   private DynamoDB dynamoDB;
+   private String region;
+   private Table table;
+@@ -560,55 +576,111 @@ public String toString() {
+    */
+   @VisibleForTesting
+   void initTable() throws IOException {
+-    final ProvisionedThroughput capacity = new ProvisionedThroughput(
+-        conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
+-            S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
+-        conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY,
+-            S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT));
+-
+     table = dynamoDB.getTable(tableName);
+     try {
+       try {
++        LOG.debug("Binding to table {}", tableName);
+         table.describe();
+-        LOG.debug("Using existing DynamoDB table {} in region {}",
+-            tableName, region);
++        final Item versionMarker = table.getItem(
++            createVersionMarkerPrimaryKey(VERSION_MARKER));
++        verifyVersionCompatibility(tableName, versionMarker);
++        Long created = extractCreationTimeFromMarker(versionMarker);
++        LOG.debug("Using existing DynamoDB table {} in region {} created {}",
++            tableName, region,
++            created != null ? new Date(created) : null);
++
+       } catch (ResourceNotFoundException rnfe) {
+         if (conf.getBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, false)) {
+-          try {
+-            LOG.info("Creating non-existent DynamoDB table {} in region {}",
+-                tableName, region);
+-            dynamoDB.createTable(new CreateTableRequest()
+-                .withTableName(tableName)
+-                .withKeySchema(keySchema())
+-                .withAttributeDefinitions(attributeDefinitions())
+-                .withProvisionedThroughput(capacity));
+-          } catch (ResourceInUseException e) {
+-            LOG.debug("ResourceInUseException while creating DynamoDB table {} "
+-                    + "in region {}.  This may indicate that the table was "
+-                    + "created by another concurrent thread or process.",
+-                tableName, region);
+-          }
++          final ProvisionedThroughput capacity = new ProvisionedThroughput(
++              conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY,
++                  S3GUARD_DDB_TABLE_CAPACITY_READ_DEFAULT),
++              conf.getLong(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY,
++                  S3GUARD_DDB_TABLE_CAPACITY_WRITE_DEFAULT));
++
++          createTable(capacity);
+         } else {
+           throw new IOException("DynamoDB table '" + tableName + "' does not "
+               + "exist in region " + region + "; auto-creation is turned off");
+         }
+       }
+ 
+-      try {
+-        table.waitForActive();
+-      } catch (InterruptedException e) {
+-        LOG.warn("Interrupted while waiting for DynamoDB table {} active",
+-            tableName, e);
+-        Thread.currentThread().interrupt();
+-        throw new InterruptedIOException("DynamoDB table '" + tableName + "'" +
+-            " is not active yet in region " + region);
+-      }
+     } catch (AmazonClientException e) {
+       throw translateException("initTable", (String) null, e);
+     }
+   }
+ 
+   /**
++   * Verify that a table version is compatible with this S3Guard client.
++   * @param tableName name of the table (for error messages)
++   * @param versionMarker the version marker retrieved from the table
++   * @throws IOException on any incompatibility
++   */
++  @VisibleForTesting
++  static void verifyVersionCompatibility(String tableName,
++      Item versionMarker) throws IOException {
++    if (versionMarker == null) {
++      LOG.warn("Table {} contains no version marker", tableName);
++      throw new IOException(E_NO_VERSION_MARKER
++      + " Table: " + tableName);
++    } else {
++      final int version = extractVersionFromMarker(versionMarker);
++      if (VERSION != version) {
++        // version mismatch. Unless/until there is support for
++        // upgrading versions, treat this as an incompatible change
++        // and fail.
++        throw new IOException(E_INCOMPATIBLE_VERSION
++            + " Table "+  tableName
++            + " Expected version " + VERSION + " actual " + version);
++      }
++    }
++  }
++
++  /**
++   * Create a table, wait for it to become active, then add the version
++   * marker.
++   * @param capacity capacity to provision
++   * @throws IOException on an failure.
++   */
++  private void createTable(ProvisionedThroughput capacity) throws IOException {
++    try {
++      LOG.info("Creating non-existent DynamoDB table {} in region {}",
++          tableName, region);
++      table = dynamoDB.createTable(new CreateTableRequest()
++          .withTableName(tableName)
++          .withKeySchema(keySchema())
++          .withAttributeDefinitions(attributeDefinitions())
++          .withProvisionedThroughput(capacity));
++      LOG.debug("Awaiting table becoming active");
++      table.waitForActive();
++    } catch (ResourceInUseException e) {
++      LOG.warn("ResourceInUseException while creating DynamoDB table {} "
++              + "in region {}.  This may indicate that the table was "
++              + "created by another concurrent thread or process.",
++          tableName, region);
++    } catch (InterruptedException e) {
++      LOG.warn("Interrupted while waiting for DynamoDB table {} active",
++          tableName, e);
++      Thread.currentThread().interrupt();
++      throw (IOException) new InterruptedIOException(
++          "DynamoDB table '" + tableName + "' "
++              + "is not active yet in region " + region).initCause(e);
++    }
++    final Item marker = createVersionMarker(VERSION_MARKER, VERSION,
++        System.currentTimeMillis());
++    putItem(marker);
++  }
++
++  /**
++   * PUT a single item to the table.
++   * @param item item to put
++   * @return the outcome.
++   */
++  PutItemOutcome putItem(Item item) {
++    LOG.debug("Putting item {}", item);
++    return table.putItem(item);
++  }
++
++  /**
+    * Provision the table with given read and write capacity units.
+    */
+   void provisionTable(Long readCapacity, Long writeCapacity)
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+index ad89cf9..a30fee2 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+@@ -62,6 +62,17 @@
+   @VisibleForTesting
+   static final String BLOCK_SIZE = "block_size";
+ 
++  /** Table version field {@value} in version marker item. */
++  @VisibleForTesting
++  static final String TABLE_VERSION = "table_version";
++
++  /** Table creation timestampfield {@value} in version marker item. */
++  @VisibleForTesting
++  static final String TABLE_CREATED = "table_created";
++
++  /** The version marker field is invalid. */
++  static final String E_NOT_VERSION_MARKER = "Not a version marker: ";
++
+   /**
+    * Returns the key schema for the DynamoDB table.
+    *
+@@ -96,7 +107,11 @@ static PathMetadata itemToPathMetadata(URI s3aUri, Item item, String username)
+       return null;
+     }
+ 
+-    Path path = new Path(item.getString(PARENT), item.getString(CHILD));
++    String parent = item.getString(PARENT);
++    Preconditions.checkNotNull(parent, "No parent entry in item %s", item);
++    String child = item.getString(CHILD);
++    Preconditions.checkNotNull(child, "No child entry in item %s", item);
++    Path path = new Path(parent, child);
+     if (!path.isAbsoluteAndSchemeAuthorityNull()) {
+       return null;
+     }
+@@ -136,11 +151,61 @@ static Item pathMetadataToItem(PathMetadata meta) {
+           .withLong(MOD_TIME, status.getModificationTime())
+           .withLong(BLOCK_SIZE, status.getBlockSize());
+     }
+-
+     return item;
+   }
+ 
+   /**
++   * The version marker has a primary key whose PARENT is {@code name};
++   * this MUST NOT be a value which represents an absolute path.
++   * @param name name of the version marker
++   * @param version version number
++   * @param timestamp creation timestamp
++   * @return an item representing a version marker.
++   */
++  static Item createVersionMarker(String name, int version, long timestamp) {
++    return new Item().withPrimaryKey(createVersionMarkerPrimaryKey(name))
++        .withInt(TABLE_VERSION, version)
++        .withLong(TABLE_CREATED, timestamp);
++  }
++
++  /**
++   * Create the primary key of the version marker.
++   * @param name key name
++   * @return the key to use when registering or resolving version markers
++   */
++  static PrimaryKey createVersionMarkerPrimaryKey(String name) {
++    return new PrimaryKey(PARENT, name, CHILD, name);
++  }
++
++  /**
++   * Extract the version from a version marker item.
++   * @param marker version marker item
++   * @return the extracted version field
++   * @throws IOException if the item is not a version marker
++   */
++  static int extractVersionFromMarker(Item marker) throws IOException {
++    if (marker.hasAttribute(TABLE_VERSION)) {
++      return marker.getInt(TABLE_VERSION);
++    } else {
++      throw new IOException(E_NOT_VERSION_MARKER + marker);
++    }
++  }
++
++  /**
++   * Extract the creation time, if present.
++   * @param marker version marker item
++   * @return the creation time, or null
++   * @throws IOException if the item is not a version marker
++   */
++  static Long extractCreationTimeFromMarker(Item marker) throws IOException {
++    if (marker.hasAttribute(TABLE_CREATED)) {
++      return marker.getLong(TABLE_CREATED);
++    } else {
++      return null;
++    }
++  }
++
++  /**
+    * Converts a collection {@link PathMetadata} to a collection DynamoDB items.
+    *
+    * @see #pathMetadataToItem(PathMetadata)
+diff --git a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+index 3068f53..1a2d86f 100644
+--- a/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
++++ b/hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+@@ -241,6 +241,56 @@ operations succeed, and the subsequent MetadataStore updates fail, the S3
+ changes will *not* be rolled back.  In this case, an error message will be
+ logged.
+ 
++### Versioning
++
++S3Guard tables are created with a version marker, an entry with the primary
++key and child entry of `../VERSION`; the use of a relative path guarantees
++that it will not be resolved.
++
++#### Versioning policy.
++
++1. The version number of an S3Guard table will only be incremented when
++an incompatible change is made to the table structure —that is, the structure
++has changed so that it is no longer readable by older versions, or because
++it has added new mandatory fields which older versions do not create.
++1. The version number of S3Guard tables will only be changed by incrementing
++the value.
++1. Updated versions of S3Guard MAY continue to support older version tables.
++1. If an incompatible change is made such that existing tables are not compatible,
++then a means shall be provided to update existing tables. For example:
++an option in the Command Line Interface, or an option to upgrade tables
++during S3Guard initialization.
++
++*Note*: this policy does not indicate any intent to upgrade table structures
++in an incompatible manner. The version marker in tables exists to support
++such an option if it ever becomes necessary, by ensuring that all S3Guard
++client can recognise any version mismatch.
++
++#### Error: `S3Guard table lacks version marker.`
++
++The table which was intended to be used as a S3guard metadata store
++does not have any version marker indicating that it is a S3Guard table.
++
++It may be that this is not a S3Guard table.
++
++* Make sure that this is the correct table name.
++* Delete the table, so it can be rebuilt.
++
++#### Error: `Database table is from an incompatible S3Guard version`
++
++This indicates that the version of S3Guard which created (or possibly updated)
++the database table is from a different version that that expected by the S3A
++client.
++
++This error will also include the expected and actual version numbers.
++
++If the expected version is lower than the actual version, then the version
++of the S3A client library is too old to interact with this S3Guard-managed
++bucket. Upgrade the application/library.
++
++If the expected version is higher than the actual version, then the table
++itself will need upgrading.
++
+ ## Testing S3Guard
+ 
+ The basic strategy for testing S3Guard correctness consists of:
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+index d757a8e..8b4cbd1 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDynamoDBMetadataStore.java
+@@ -25,6 +25,8 @@
+ 
+ import com.amazonaws.AmazonServiceException;
+ import com.amazonaws.services.dynamodbv2.document.DynamoDB;
++import com.amazonaws.services.dynamodbv2.document.Item;
++import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
+ import com.amazonaws.services.dynamodbv2.document.Table;
+ import com.amazonaws.services.dynamodbv2.local.main.ServerRunner;
+ import com.amazonaws.services.dynamodbv2.local.server.DynamoDBProxyServer;
+@@ -59,6 +61,7 @@
+ 
+ import static org.apache.hadoop.fs.s3a.Constants.*;
+ import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.*;
++import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.*;
+ 
+ /**
+  * Test that {@link DynamoDBMetadataStore} implements {@link MetadataStore}.
+@@ -80,6 +83,9 @@
+   private static final String BUCKET = "TestDynamoDBMetadataStore";
+   private static final String S3URI =
+       URI.create(Constants.FS_S3A + "://" + BUCKET).toString();
++  public static final PrimaryKey
++      VERSION_MARKER_PRIMARY_KEY = createVersionMarkerPrimaryKey(
++          DynamoDBMetadataStore.VERSION_MARKER);
+ 
+   /** The DynamoDBLocal dynamoDBLocalServer instance for testing. */
+   private static DynamoDBProxyServer dynamoDBLocalServer;
+@@ -331,6 +337,58 @@ public void testInitExistingTable() throws IOException {
+   }
+ 
+   /**
++   * Test the low level version check code.
++   */
++  @Test
++  public void testItemVersionCompatibility() throws Throwable {
++    verifyVersionCompatibility("table",
++        createVersionMarker(VERSION_MARKER, VERSION, 0));
++  }
++
++  /**
++   * Test that a version marker entry without the version number field
++   * is rejected as incompatible with a meaningful error message.
++   */
++  @Test
++  public void testItemLacksVersion() throws Throwable {
++    intercept(IOException.class, E_NOT_VERSION_MARKER,
++        () -> verifyVersionCompatibility("table",
++            new Item().withPrimaryKey(
++                createVersionMarkerPrimaryKey(VERSION_MARKER))));
++  }
++
++  /**
++   * Delete the version marker and verify that table init fails.
++   */
++  @Test
++  public void testTableVersionRequired() throws Exception {
++    final DynamoDBMetadataStore ddbms = createContract().getMetadataStore();
++    Table table = verifyTableInitialized(BUCKET);
++    table.deleteItem(VERSION_MARKER_PRIMARY_KEY);
++
++    // create existing table
++    intercept(IOException.class, E_NO_VERSION_MARKER,
++        () -> ddbms.initTable());
++  }
++
++  /**
++   * Set the version value to a different number and verify that
++   * table init fails.
++   */
++  @Test
++  public void testTableVersionMismatch() throws Exception {
++    final DynamoDBMetadataStore ddbms = createContract().getMetadataStore();
++    Table table = verifyTableInitialized(BUCKET);
++    table.deleteItem(VERSION_MARKER_PRIMARY_KEY);
++    Item v200 = createVersionMarker(VERSION_MARKER, 200, 0);
++    table.putItem(v200);
++
++    // create existing table
++    intercept(IOException.class, E_INCOMPATIBLE_VERSION,
++        () -> ddbms.initTable());
++  }
++
++  /**
+    * Test that initTable fails with IOException when table does not exist and
+    * table auto-creation is disabled.
+    */
+@@ -421,12 +479,14 @@ public void testDeleteTable() throws IOException {
+    * This validates the table is created and ACTIVE in DynamoDB.
+    *
+    * This should not rely on the {@link DynamoDBMetadataStore} implementation.
++   * Return the table
+    */
+-  private static void verifyTableInitialized(String tableName) {
++  private static Table verifyTableInitialized(String tableName) {
+     final Table table = dynamoDB.getTable(tableName);
+     final TableDescription td = table.describe();
+     assertEquals(tableName, td.getTableName());
+     assertEquals("ACTIVE", td.getTableStatus());
++    return table;
+   }
+ 
+   /**
+diff --git a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestPathMetadataDynamoDBTranslation.java b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestPathMetadataDynamoDBTranslation.java
+index 7518d7c..b9caaea 100644
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestPathMetadataDynamoDBTranslation.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestPathMetadataDynamoDBTranslation.java
+@@ -39,10 +39,6 @@
+ import static com.amazonaws.services.dynamodbv2.model.KeyType.HASH;
+ import static com.amazonaws.services.dynamodbv2.model.KeyType.RANGE;
+ import static com.amazonaws.services.dynamodbv2.model.ScalarAttributeType.S;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.BLOCK_SIZE;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.FILE_LENGTH;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.MOD_TIME;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.pathToParentKeyAttribute;
+ import static org.hamcrest.CoreMatchers.anyOf;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.junit.Assert.assertEquals;
+@@ -51,12 +47,9 @@
+ import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.fail;
+ 
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.CHILD;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.IS_DIR;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.PARENT;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.itemToPathMetadata;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.pathMetadataToItem;
+-import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.pathToKey;
++import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.*;
++import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.VERSION_MARKER;
++import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.VERSION;
+ 
+ /**
+  * Test the PathMetadataDynamoDBTranslation is able to translate between domain
+@@ -216,4 +209,18 @@ private static void doTestPathToKey(Path path) {
+     }
+   }
+ 
++  @Test
++  public void testVersionRoundTrip() throws Throwable {
++    final Item marker = createVersionMarker(VERSION_MARKER, VERSION, 0);
++    assertEquals("Extracted version from " + marker,
++        VERSION, extractVersionFromMarker(marker));
++  }
++
++  @Test
++  public void testVersionMarkerNotStatusIllegalPath() throws Throwable {
++    final Item marker = createVersionMarker(VERSION_MARKER, VERSION, 0);
++    assertNull("Path metadata fromfrom " + marker,
++        itemToPathMetadata(null, marker, "alice"));
++  }
++
+ }
+-- 
+1.7.9.5
+

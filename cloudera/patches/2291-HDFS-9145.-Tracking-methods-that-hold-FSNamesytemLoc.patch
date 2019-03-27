@@ -1,0 +1,162 @@
+From 54154216576fd7e671968b4f19bf95f2ea3d1756 Mon Sep 17 00:00:00 2001
+From: Haohui Mai <wheat9@apache.org>
+Date: Tue, 13 Oct 2015 13:20:11 -0700
+Subject: [PATCH 2291/2848] HDFS-9145. Tracking methods that hold
+ FSNamesytemLock for too long. Contributed by
+ Mingliang Liu.
+
+(cherry picked from commit 5c5362980c429a5ad0b58e0dd1933de9cde7f369)
+(cherry picked from commit 0d8a1636ef292c67d0537581552ce03024c2d04d)
+
+Change-Id: I647d47b18b202d0a3b8df3a7367aada608ab3d5f
+---
+ .../org/apache/hadoop/test/GenericTestUtils.java   |    4 ++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   22 ++++++++
+ .../hdfs/server/namenode/TestFSNamesystem.java     |   56 ++++++++++++++++++++
+ 3 files changed, 82 insertions(+)
+
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
+index 6d48478..022d823 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
+@@ -279,6 +279,10 @@ public void stopCapturing() {
+       logger.removeAppender(appender);
+ 
+     }
++
++    public void clearOutput() {
++      sw.getBuffer().setLength(0);
++    }
+   }
+   
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index c54f92e..3e4d994 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -92,6 +92,7 @@
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_SUPPORT_APPEND_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_SUPPORT_APPEND_KEY;
+ import static org.apache.hadoop.hdfs.server.common.HdfsServerConstants.SECURITY_XATTR_UNREADABLE_BY_SUPERUSER;
++import static org.apache.hadoop.util.Time.monotonicNow;
+ import static org.apache.hadoop.util.Time.now;
+ 
+ import java.io.BufferedWriter;
+@@ -1604,6 +1605,11 @@ private boolean shouldRetrySafeMode(SafeModeInfo safeMode) {
+     return Util.stringCollectionAsURIs(dirNames);
+   }
+ 
++  /** Threshold (ms) for long holding write lock report. */
++  static final short WRITELOCK_REPORTING_THRESHOLD = 1000;
++  /** Last time stamp for write lock. Keep the longest one for multi-entrance.*/
++  private long writeLockHeldTimeStamp;
++
+   @Override
+   public void readLock() {
+     this.fsLock.readLock().lock();
+@@ -1615,14 +1621,30 @@ public void readUnlock() {
+   @Override
+   public void writeLock() {
+     this.fsLock.writeLock().lock();
++    if (fsLock.getWriteHoldCount() == 1) {
++      writeLockHeldTimeStamp = monotonicNow();
++    }
+   }
+   @Override
+   public void writeLockInterruptibly() throws InterruptedException {
+     this.fsLock.writeLock().lockInterruptibly();
++    if (fsLock.getWriteHoldCount() == 1) {
++      writeLockHeldTimeStamp = monotonicNow();
++    }
+   }
+   @Override
+   public void writeUnlock() {
++    final boolean needReport = fsLock.getWriteHoldCount() == 1 &&
++        fsLock.isWriteLockedByCurrentThread();
+     this.fsLock.writeLock().unlock();
++
++    if (needReport) {
++      long writeLockInterval = monotonicNow() - writeLockHeldTimeStamp;
++      if (writeLockInterval >= WRITELOCK_REPORTING_THRESHOLD) {
++        LOG.info("FSNamesystem write lock held for " + writeLockInterval +
++            " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()));
++      }
++    }
+   }
+   @Override
+   public boolean hasWriteLock() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+index 2453542..5705922 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSNamesystem.java
+@@ -36,6 +36,9 @@
+ import org.apache.hadoop.hdfs.server.namenode.ha.HAContext;
+ import org.apache.hadoop.hdfs.server.namenode.ha.HAState;
+ import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
++import org.apache.hadoop.test.GenericTestUtils;
++import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
++import org.apache.log4j.Level;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Test;
+@@ -241,4 +244,57 @@ public void run() {
+     Assert.assertEquals("Expected number of blocked thread not found",
+                         threadCount, rwLock.getQueueLength());
+   }
++
++  /**
++   * Test when FSNamesystem lock is held for a long time, logger will report it.
++   */
++  @Test(timeout=45000)
++  public void testFSLockLongHoldingReport() throws Exception {
++    Configuration conf = new Configuration();
++    FSImage fsImage = Mockito.mock(FSImage.class);
++    FSEditLog fsEditLog = Mockito.mock(FSEditLog.class);
++    Mockito.when(fsImage.getEditLog()).thenReturn(fsEditLog);
++    FSNamesystem fsn = new FSNamesystem(conf, fsImage);
++
++    LogCapturer logs = LogCapturer.captureLogs(FSNamesystem.LOG);
++    GenericTestUtils.setLogLevel(FSNamesystem.LOG, Level.INFO);
++
++    // Don't report if the write lock is held for a short time
++    fsn.writeLock();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD / 2);
++    fsn.writeUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++
++
++    // Report if the write lock is held for a long time
++    fsn.writeLock();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD + 100);
++    logs.clearOutput();
++    fsn.writeUnlock();
++    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++
++    // Report if the write lock is held (interruptibly) for a long time
++    fsn.writeLockInterruptibly();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD + 100);
++    logs.clearOutput();
++    fsn.writeUnlock();
++    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++
++    // Report if it's held for a long time when re-entering write lock
++    fsn.writeLock();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD / 2 + 1);
++    fsn.writeLockInterruptibly();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD / 2 + 1);
++    fsn.writeLock();
++    Thread.sleep(FSNamesystem.WRITELOCK_REPORTING_THRESHOLD / 2);
++    logs.clearOutput();
++    fsn.writeUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++    logs.clearOutput();
++    fsn.writeUnlock();
++    assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++    logs.clearOutput();
++    fsn.writeUnlock();
++    assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()));
++  }
+ }
+-- 
+1.7.9.5
+

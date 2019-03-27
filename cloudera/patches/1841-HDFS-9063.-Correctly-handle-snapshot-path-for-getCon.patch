@@ -1,0 +1,573 @@
+From ef9462dea892e61366fb13765c78bfd7452c466f Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@cloudera.com>
+Date: Tue, 6 Sep 2016 14:28:18 -0700
+Subject: [PATCH 1841/2848] HDFS-9063. Correctly handle snapshot path for
+ getContentSummary. Contributed by Jing Zhao.
+
+(cherry picked from commit 3f4275310203de4ccfb15337f3c503e25408a265)
+(cherry picked from commit b4e1279217d5797812a33991bfe49b493b32fb7c)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirStatAndListingOp.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+
+Change-Id: I0f568354c023d7f1f0a86026418ceb125b764bd5
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    5 +-
+ .../apache/hadoop/hdfs/server/namenode/INode.java  |   16 ++-
+ .../hdfs/server/namenode/INodeDirectory.java       |   20 ++--
+ .../hadoop/hdfs/server/namenode/INodeFile.java     |   10 +-
+ .../hadoop/hdfs/server/namenode/INodeMap.java      |    2 +-
+ .../hdfs/server/namenode/INodeReference.java       |   27 +++--
+ .../hadoop/hdfs/server/namenode/INodeSymlink.java  |    2 +-
+ .../snapshot/DirectorySnapshottableFeature.java    |   13 +-
+ .../snapshot/DirectoryWithSnapshotFeature.java     |   16 ++-
+ .../hdfs/server/namenode/snapshot/Snapshot.java    |    3 +-
+ .../TestGetContentSummaryWithSnapshot.java         |  126 ++++++++++++++++++++
+ 11 files changed, 187 insertions(+), 53 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestGetContentSummaryWithSnapshot.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 58d2d1d..853efd3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -2230,7 +2230,10 @@ ContentSummary getContentSummary(String src)
+ 
+             new ContentSummaryComputationContext(this, getFSNamesystem(),
+             contentCountLimit, contentSleepMicroSec);
+-        ContentSummary cs = targetNode.computeAndConvertContentSummary(cscc);
++        final byte[][] components = INode.getPathComponents(src);
++        final INodesInPath iip = INodesInPath.resolve(rootDir, components);
++        ContentSummary cs = targetNode.computeAndConvertContentSummary(
++            iip.getPathSnapshotId(), cscc);
+         yieldCount += cscc.getYieldCount();
+         return cs;
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+index 512fefc..b41c950 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INode.java
+@@ -494,16 +494,17 @@ public abstract void destroyAndCollectBlocks(
+ 
+   /** Compute {@link ContentSummary}. Blocking call */
+   public final ContentSummary computeContentSummary() {
+-    return computeAndConvertContentSummary(
++    return computeAndConvertContentSummary(Snapshot.CURRENT_STATE_ID,
+         new ContentSummaryComputationContext());
+   }
+ 
+   /**
+    * Compute {@link ContentSummary}. 
+    */
+-  public final ContentSummary computeAndConvertContentSummary(
++  public final ContentSummary computeAndConvertContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+-    Content.Counts counts = computeContentSummary(summary).getCounts();
++    Content.Counts counts = computeContentSummary(snapshotId, summary)
++        .getCounts();
+     final Quota.Counts q = getQuotaCounts();
+     return new ContentSummary(counts.get(Content.LENGTH),
+         counts.get(Content.FILE) + counts.get(Content.SYMLINK),
+@@ -514,11 +515,16 @@ public final ContentSummary computeAndConvertContentSummary(
+   /**
+    * Count subtree content summary with a {@link Content.Counts}.
+    *
++   * @param snapshotId Specify the time range for the calculation. If this
++   *                   parameter equals to {@link Snapshot#CURRENT_STATE_ID},
++   *                   the result covers both the current states and all the
++   *                   snapshots. Otherwise the result only covers all the
++   *                   files/directories contained in the specific snapshot.
+    * @param summary the context object holding counts for the subtree.
+    * @return The same objects as summary.
+    */
+   public abstract ContentSummaryComputationContext computeContentSummary(
+-      ContentSummaryComputationContext summary);
++      int snapshotId, ContentSummaryComputationContext summary);
+ 
+ 
+   /**
+@@ -861,7 +867,7 @@ public BlocksMapUpdateInfo() {
+     public List<BlockInfo> getToDeleteList() {
+       return toDeleteList;
+     }
+-    
++
+     /**
+      * Add a to-be-deleted block into the
+      * {@link BlocksMapUpdateInfo#toDeleteList}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+index 7048954..ab1f765 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeDirectory.java
+@@ -152,7 +152,7 @@ void setQuota(long nsQuota, long dsQuota) {
+   }
+ 
+   @Override
+-  public void addSpaceConsumed(long nsDelta, long dsDelta, boolean verify) 
++  public void addSpaceConsumed(long nsDelta, long dsDelta, boolean verify)
+       throws QuotaExceededException {
+     final DirectoryWithQuotaFeature q = getDirectoryWithQuotaFeature();
+     if (q != null) {
+@@ -548,7 +548,7 @@ private void addChild(final INode node, final int insertionPoint) {
+     children.add(-insertionPoint - 1, node);
+ 
+     if (node.getFsimageGroupName() == null) {
+-      // CDH-34072: Cusotmized Provider (Sentry)'s setGroup API will 
++      // CDH-34072: Cusotmized Provider (Sentry)'s setGroup API will
+       // fall through to set Fsimage's group
+       node.setGroup(getFsimageGroupName());
+     }
+@@ -558,7 +558,7 @@ private void addChild(final INode node, final int insertionPoint) {
+   public Quota.Counts computeQuotaUsage(Quota.Counts counts, boolean useCache,
+       int lastSnapshotId) {
+     final DirectoryWithSnapshotFeature sf = getDirectoryWithSnapshotFeature();
+-    
++
+     // we are computing the quota usage for a specific snapshot here, i.e., the
+     // computation only includes files/directories that exist at the time of the
+     // given snapshot
+@@ -604,17 +604,19 @@ private void addChild(final INode node, final int insertionPoint) {
+   }
+ 
+   @Override
+-  public ContentSummaryComputationContext computeContentSummary(
++  public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+     final DirectoryWithSnapshotFeature sf = getDirectoryWithSnapshotFeature();
+-    if (sf != null) {
++    if (sf != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
++      // if the getContentSummary call is against a non-snapshot path, the
++      // computation should include all the deleted files/directories
+       sf.computeContentSummary4Snapshot(summary.getCounts());
+     }
+     final DirectoryWithQuotaFeature q = getDirectoryWithQuotaFeature();
+-    if (q != null) {
++    if (q != null && snapshotId == Snapshot.CURRENT_STATE_ID) {
+       return q.computeContentSummary(this, summary);
+     } else {
+-      return computeDirectoryContentSummary(summary, Snapshot.CURRENT_STATE_ID);
++      return computeDirectoryContentSummary(summary, snapshotId);
+     }
+   }
+ 
+@@ -628,7 +630,7 @@ protected ContentSummaryComputationContext computeDirectoryContentSummary(
+       byte[] childName = child.getLocalNameBytes();
+ 
+       long lastYieldCount = summary.getYieldCount();
+-      child.computeContentSummary(summary);
++      child.computeContentSummary(snapshotId, summary);
+ 
+       // Check whether the computation was paused in the subtree.
+       // The counts may be off, but traversing the rest of children
+@@ -783,7 +785,7 @@ public void destroyAndCollectBlocks(final BlocksMapUpdateInfo collectedBlocks,
+       Quota.Counts counts = Quota.Counts.newInstance();
+       this.computeQuotaUsage(counts, true);
+       destroyAndCollectBlocks(collectedBlocks, removedINodes);
+-      return counts; 
++      return counts;
+     } else {
+       // process recursively down the subtree
+       Quota.Counts counts = cleanSubtreeRecursively(snapshotId, priorSnapshotId,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+index c37101b..a5fd9d9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+@@ -554,9 +554,9 @@ public String getName() {
+ 
+   @Override
+   public final ContentSummaryComputationContext computeContentSummary(
+-      final ContentSummaryComputationContext summary) {
++      int snapshotId, final ContentSummaryComputationContext summary) {
+     computeContentSummary4Snapshot(summary.getCounts());
+-    computeContentSummary4Current(summary.getCounts());
++    computeContentSummary4Current(snapshotId, summary.getCounts());
+     return summary;
+   }
+ 
+@@ -579,14 +579,16 @@ private void computeContentSummary4Snapshot(final Content.Counts counts) {
+     }
+   }
+ 
+-  private void computeContentSummary4Current(final Content.Counts counts) {
++  private void computeContentSummary4Current(
++      int snapshotId, final Content.Counts counts) {
+     FileWithSnapshotFeature sf = this.getFileWithSnapshotFeature();
+     if (sf != null && sf.isCurrentFileDeleted()) {
+       return;
+     }
+ 
+-    counts.add(Content.LENGTH, computeFileSize());
+     counts.add(Content.FILE, 1);
++    final long fileLen = computeFileSize(snapshotId);
++    counts.add(Content.LENGTH, fileLen);
+     counts.add(Content.DISKSPACE, diskspaceConsumed());
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeMap.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeMap.java
+index 8629bf8..a69aaa5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeMap.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeMap.java
+@@ -110,7 +110,7 @@ public Counts computeQuotaUsage(Counts counts, boolean useCache,
+       
+       @Override
+       public ContentSummaryComputationContext computeContentSummary(
+-          ContentSummaryComputationContext summary) {
++          int snapshotId, ContentSummaryComputationContext summary) {
+         return null;
+       }
+       
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
+index f82c58a..0820914 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeReference.java
+@@ -341,9 +341,9 @@ public void destroyAndCollectBlocks(
+   }
+ 
+   @Override
+-  public ContentSummaryComputationContext computeContentSummary(
++  public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       ContentSummaryComputationContext summary) {
+-    return referred.computeContentSummary(summary);
++    return referred.computeContentSummary(snapshotId, summary);
+   }
+ 
+   @Override
+@@ -351,7 +351,7 @@ public ContentSummaryComputationContext computeContentSummary(
+       int lastSnapshotId) {
+     return referred.computeQuotaUsage(counts, useCache, lastSnapshotId);
+   }
+-  
++
+   @Override
+   public final INodeAttributes getSnapshotINode(int snapshotId) {
+     return referred.getSnapshotINode(snapshotId);
+@@ -394,9 +394,9 @@ public int getDstSnapshotId() {
+   
+   /** An anonymous reference with reference count. */
+   public static class WithCount extends INodeReference {
+-    
++
+     private final List<WithName> withNameList = new ArrayList<WithName>();
+-    
++
+     /**
+      * Compare snapshot with IDs, where null indicates the current status thus
+      * is greater than any non-null snapshot.
+@@ -530,10 +530,11 @@ public int getLastSnapshotId() {
+     
+     @Override
+     public final ContentSummaryComputationContext computeContentSummary(
+-        ContentSummaryComputationContext summary) {
++        int snapshotId, ContentSummaryComputationContext summary) {
++      final int s = snapshotId < lastSnapshotId ? snapshotId : lastSnapshotId;
+       //only count diskspace for WithName
+       final Quota.Counts q = Quota.Counts.newInstance();
+-      computeQuotaUsage(q, false, lastSnapshotId);
++      computeQuotaUsage(q, false, s);
+       summary.getCounts().add(Content.DISKSPACE, q.get(Quota.DISKSPACE));
+       return summary;
+     }
+@@ -541,10 +542,10 @@ public final ContentSummaryComputationContext computeContentSummary(
+     @Override
+     public final Quota.Counts computeQuotaUsage(Quota.Counts counts,
+         boolean useCache, int lastSnapshotId) {
+-      // if this.lastSnapshotId < lastSnapshotId, the rename of the referred 
+-      // node happened before the rename of its ancestor. This should be 
+-      // impossible since for WithName node we only count its children at the 
+-      // time of the rename. 
++      // if this.lastSnapshotId < lastSnapshotId, the rename of the referred
++      // node happened before the rename of its ancestor. This should be
++      // impossible since for WithName node we only count its children at the
++      // time of the rename.
+       Preconditions.checkState(lastSnapshotId == Snapshot.CURRENT_STATE_ID
+           || this.lastSnapshotId >= lastSnapshotId);
+       final INode referred = this.getReferredINode().asReference()
+@@ -608,7 +609,7 @@ public void destroyAndCollectBlocks(BlocksMapUpdateInfo collectedBlocks,
+       } else {
+         int prior = getPriorSnapshot(this);
+         INode referred = getReferredINode().asReference().getReferredINode();
+-        
++
+         if (snapshot != Snapshot.NO_SNAPSHOT_ID) {
+           if (prior != Snapshot.NO_SNAPSHOT_ID && snapshot <= prior) {
+             // the snapshot to be deleted has been deleted while traversing 
+@@ -759,7 +760,7 @@ public void destroyAndCollectBlocks(
+         }
+       }
+     }
+-    
++
+     private int getSelfSnapshot(final int prior) {
+       WithCount wc = (WithCount) getReferredINode().asReference();
+       INode referred = wc.getReferredINode();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
+index 617c99a..8c20be9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeSymlink.java
+@@ -96,7 +96,7 @@ public void destroyAndCollectBlocks(final BlocksMapUpdateInfo collectedBlocks,
+   }
+ 
+   @Override
+-  public ContentSummaryComputationContext computeContentSummary(
++  public ContentSummaryComputationContext computeContentSummary(int snapshotId,
+       final ContentSummaryComputationContext summary) {
+     summary.getCounts().add(Content.SYMLINK, 1);
+     return summary;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+index 0ed99e6..a2e7bd0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectorySnapshottableFeature.java
+@@ -30,7 +30,6 @@
+ import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+ import org.apache.hadoop.hdfs.protocol.SnapshotException;
+ import org.apache.hadoop.hdfs.server.namenode.Content;
+-import org.apache.hadoop.hdfs.server.namenode.ContentSummaryComputationContext;
+ import org.apache.hadoop.hdfs.server.namenode.INode;
+ import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo;
+ import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
+@@ -232,13 +231,11 @@ public Snapshot removeSnapshot(INodeDirectory snapshotRoot,
+     }
+   }
+ 
+-  public ContentSummaryComputationContext computeContentSummary(
+-      final INodeDirectory snapshotRoot,
+-      final ContentSummaryComputationContext summary) {
+-    snapshotRoot.computeContentSummary(summary);
+-    summary.getCounts().add(Content.SNAPSHOT, snapshotsByNames.size());
+-    summary.getCounts().add(Content.SNAPSHOTTABLE_DIRECTORY, 1);
+-    return summary;
++  @Override
++  public void computeContentSummary4Snapshot(final Content.Counts counts) {
++    counts.add(Content.SNAPSHOT, snapshotsByNames.size());
++    counts.add(Content.SNAPSHOTTABLE_DIRECTORY, 1);
++    super.computeContentSummary4Snapshot(counts);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+index fab61c0..689f0a3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+@@ -406,7 +406,7 @@ public static void destroyDstSubtree(INode inode, final int snapshot,
+         // this inode has been renamed before the deletion of the DstReference
+         // subtree
+         inode.cleanSubtree(snapshot, prior, collectedBlocks, removedINodes);
+-      } else { 
++      } else {
+         // for DstReference node, continue this process to its subtree
+         destroyDstSubtree(inode.asReference().getReferredINode(), snapshot,
+             prior, collectedBlocks, removedINodes);
+@@ -497,7 +497,7 @@ public static void destroyDstSubtree(INode inode, final int snapshot,
+                 collectedBlocks, removedINodes));
+           }
+         }
+-        
++
+         for (INode child : dir.getChildrenList(prior)) {
+           if (priorChildrenDiff != null
+               && priorChildrenDiff.search(ListType.DELETED,
+@@ -623,7 +623,7 @@ public INode saveChild2Snapshot(INodeDirectory currentINode,
+     diff.diff.modify(snapshotCopy, child);
+     return child;
+   }
+-  
++
+   public void clear(INodeDirectory currentINode,
+       final BlocksMapUpdateInfo collectedBlocks, final List<INode> removedINodes) {
+     // destroy its diff list
+@@ -633,7 +633,7 @@ public void clear(INodeDirectory currentINode,
+     }
+     diffs.clear();
+   }
+-  
++
+   public Quota.Counts computeQuotaUsage4CurrentDirectory(Quota.Counts counts) {
+     for(DirectoryDiff d : diffs) {
+       for(INode deleted : d.getChildrenDiff().getList(ListType.DELETED)) {
+@@ -642,20 +642,18 @@ public void clear(INodeDirectory currentINode,
+     }
+     return counts;
+   }
+-  
++
+   public void computeContentSummary4Snapshot(final Content.Counts counts) {
+     // Create a new blank summary context for blocking processing of subtree.
+     ContentSummaryComputationContext summary = 
+         new ContentSummaryComputationContext();
+     for(DirectoryDiff d : diffs) {
+       for(INode deleted : d.getChildrenDiff().getList(ListType.DELETED)) {
+-        deleted.computeContentSummary(summary);
++        deleted.computeContentSummary(Snapshot.CURRENT_STATE_ID, summary);
+       }
+     }
+     // Add the counts from deleted trees.
+     counts.add(summary.getCounts());
+-    // Add the deleted directory count.
+-    counts.add(Content.DIRECTORY, diffs.asList().size());
+   }
+   
+   /**
+@@ -741,7 +739,7 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+           priorDeleted = cloneDiffList(dList);
+         }
+       }
+-      
++
+       counts.add(getDiffs().deleteSnapshotDiff(snapshot, prior,
+           currentINode, collectedBlocks, removedINodes));
+       counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+index 03a29b0..1d1948a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/Snapshot.java
+@@ -176,8 +176,7 @@ public INode getChild(byte[] name, int snapshotId) {
+     
+     @Override
+     public ContentSummaryComputationContext computeContentSummary(
+-        ContentSummaryComputationContext summary) {
+-      int snapshotId = getParent().getSnapshot(getLocalNameBytes()).getId();
++        int snapshotId, ContentSummaryComputationContext summary) {
+       return computeDirectoryContentSummary(summary, snapshotId);
+     }
+     
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestGetContentSummaryWithSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestGetContentSummaryWithSnapshot.java
+new file mode 100644
+index 0000000..21f2db5
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestGetContentSummaryWithSnapshot.java
+@@ -0,0 +1,126 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode.snapshot;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.ContentSummary;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DFSTestUtil;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
++import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.ExpectedException;
++
++import java.io.FileNotFoundException;
++import java.io.IOException;
++
++/**
++ * Verify content summary is computed correctly when
++ * 1. There are snapshots taken under the directory
++ * 2. The given path is a snapshot path
++ */
++public class TestGetContentSummaryWithSnapshot {
++  protected static final short REPLICATION = 3;
++  protected static final long BLOCKSIZE = 1024;
++
++  protected Configuration conf;
++  protected MiniDFSCluster cluster;
++  protected FSNamesystem fsn;
++  protected FSDirectory fsdir;
++  protected DistributedFileSystem dfs;
++
++  @Rule
++  public ExpectedException exception = ExpectedException.none();
++
++  @Before
++  public void setUp() throws Exception {
++    conf = new Configuration();
++    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, BLOCKSIZE);
++    cluster = new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
++    cluster.waitActive();
++
++    fsn = cluster.getNamesystem();
++    fsdir = fsn.getFSDirectory();
++    dfs = cluster.getFileSystem();
++  }
++
++  @After
++  public void tearDown() throws Exception {
++    if (cluster != null) {
++      cluster.shutdown();
++    }
++  }
++
++  /**
++   * Calculate against a snapshot path.
++   * 1. create dirs /foo/bar
++   * 2. take snapshot s1 on /foo
++   * 3. create a 10 byte file /foo/bar/baz
++   * Make sure for "/foo/bar" and "/foo/.snapshot/s1/bar" have correct results:
++   * the 1 byte file is not included in snapshot s1.
++   */
++  @Test
++  public void testGetContentSummary() throws IOException {
++    final Path foo = new Path("/foo");
++    final Path bar = new Path(foo, "bar");
++    final Path baz = new Path(bar, "baz");
++
++    dfs.mkdirs(bar);
++    dfs.allowSnapshot(foo);
++    dfs.createSnapshot(foo, "s1");
++
++    DFSTestUtil.createFile(dfs, baz, 10, REPLICATION, 0L);
++
++    ContentSummary summary = cluster.getNameNodeRpc().getContentSummary(
++        bar.toString());
++    Assert.assertEquals(1, summary.getDirectoryCount());
++    Assert.assertEquals(1, summary.getFileCount());
++    Assert.assertEquals(10, summary.getLength());
++
++    final Path barS1 = SnapshotTestHelper.getSnapshotPath(foo, "s1", "bar");
++    summary = cluster.getNameNodeRpc().getContentSummary(barS1.toString());
++    Assert.assertEquals(1, summary.getDirectoryCount());
++    Assert.assertEquals(0, summary.getFileCount());
++    Assert.assertEquals(0, summary.getLength());
++
++    // also check /foo and /foo/.snapshot/s1
++    summary = cluster.getNameNodeRpc().getContentSummary(foo.toString());
++    Assert.assertEquals(2, summary.getDirectoryCount());
++    Assert.assertEquals(1, summary.getFileCount());
++    Assert.assertEquals(10, summary.getLength());
++
++    final Path fooS1 = SnapshotTestHelper.getSnapshotRoot(foo, "s1");
++    summary = cluster.getNameNodeRpc().getContentSummary(fooS1.toString());
++    Assert.assertEquals(2, summary.getDirectoryCount());
++    Assert.assertEquals(0, summary.getFileCount());
++    Assert.assertEquals(0, summary.getLength());
++
++    final Path bazS1 = SnapshotTestHelper.getSnapshotPath(foo, "s1", "bar/baz");
++    try {
++      cluster.getNameNodeRpc().getContentSummary(bazS1.toString());
++      Assert.fail("should get FileNotFoundException");
++    } catch (FileNotFoundException ignored) {}
++  }
++}
+-- 
+1.7.9.5
+

@@ -1,0 +1,336 @@
+From 3a95b14bf546c31c2bdcc254c4127a5a9b18a0a9 Mon Sep 17 00:00:00 2001
+From: Zhe Zhang <zhz@apache.org>
+Date: Fri, 23 Oct 2015 13:58:26 -0700
+Subject: [PATCH 0938/2848] HDFS-8808. dfs.image.transfer.bandwidthPerSec
+ should not apply to -bootstrapStandby.
+ Contributed by Zhe Zhang.
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+
+Change-Id: I6e55dfaa735e730ca8e6de0e23329de07b918e50
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    5 ++
+ .../hadoop/hdfs/server/namenode/Checkpointer.java  |    2 +-
+ .../hadoop/hdfs/server/namenode/ImageServlet.java  |   38 +++++++++---
+ .../hdfs/server/namenode/SecondaryNameNode.java    |    2 +-
+ .../hdfs/server/namenode/TransferFsImage.java      |    5 +-
+ .../hdfs/server/namenode/ha/BootstrapStandby.java  |    2 +-
+ .../src/main/resources/hdfs-default.xml            |   20 ++++++-
+ .../hdfs/server/namenode/TestCheckpoint.java       |    2 +-
+ .../server/namenode/ha/TestBootstrapStandby.java   |   61 ++++++++++++++++++++
+ 9 files changed, 121 insertions(+), 16 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index ada77ae..d877648 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -552,6 +552,11 @@
+                                            "dfs.image.transfer.bandwidthPerSec";
+   public static final long DFS_IMAGE_TRANSFER_RATE_DEFAULT = 0;  //no throttling
+ 
++  public static final String DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY =
++      "dfs.image.transfer-bootstrap-standby.bandwidthPerSec";
++  public static final long DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_DEFAULT =
++      0;  //no throttling
++
+   // Image transfer timeout
+   public static final String DFS_IMAGE_TRANSFER_TIMEOUT_KEY = "dfs.image.transfer.timeout";
+   public static final int DFS_IMAGE_TRANSFER_TIMEOUT_DEFAULT = 60 * 1000;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+index 9327f43..1594002 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+@@ -222,7 +222,7 @@ void doCheckpoint() throws IOException {
+             "image with txid " + sig.mostRecentCheckpointTxId);
+         MD5Hash downloadedHash = TransferFsImage.downloadImageToStorage(
+             backupNode.nnHttpAddress, sig.mostRecentCheckpointTxId, bnStorage,
+-            true);
++            true, false);
+         bnImage.saveDigestAndRenameCheckpointImage(NameNodeFile.IMAGE,
+             sig.mostRecentCheckpointTxId, downloadedHash);
+         lastApplied = sig.mostRecentCheckpointTxId;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+index d10aacc..d635754 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+@@ -80,6 +80,7 @@
+   private static final String STORAGEINFO_PARAM = "storageInfo";
+   private static final String LATEST_FSIMAGE_VALUE = "latest";
+   private static final String IMAGE_FILE_TYPE = "imageFile";
++  private static final String IS_BOOTSTRAP_STANDBY = "bootstrapstandby";
+ 
+   private static final Set<Long> currentlyDownloadingCheckpoints =
+     Collections.synchronizedSet(new HashSet<Long>());
+@@ -155,8 +156,10 @@ private void serveFile(File file) throws IOException {
+               // detected by the client side as an inaccurate length header.
+             }
+             // send file
++            DataTransferThrottler throttler = parsedParams.isBootstrapStandby ?
++                getThrottlerForBootstrapStandby(conf) : getThrottler(conf);
+             TransferFsImage.copyFileToStream(response.getOutputStream(),
+-               file, fis, getThrottler(conf));
++               file, fis, throttler);
+           } finally {
+             IOUtils.closeStream(fis);
+           }
+@@ -213,8 +216,8 @@ public static void setFileNameHeaders(HttpServletResponse response,
+    * @param conf configuration
+    * @return a data transfer throttler
+    */
+-  public final static DataTransferThrottler getThrottler(Configuration conf) {
+-    long transferBandwidth = 
++  public static DataTransferThrottler getThrottler(Configuration conf) {
++    long transferBandwidth =
+       conf.getLong(DFSConfigKeys.DFS_IMAGE_TRANSFER_RATE_KEY,
+                    DFSConfigKeys.DFS_IMAGE_TRANSFER_RATE_DEFAULT);
+     DataTransferThrottler throttler = null;
+@@ -223,7 +226,20 @@ public final static DataTransferThrottler getThrottler(Configuration conf) {
+     }
+     return throttler;
+   }
+-  
++
++  private static DataTransferThrottler getThrottlerForBootstrapStandby(
++      Configuration conf) {
++    long transferBandwidth =
++        conf.getLong(
++            DFSConfigKeys.DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY,
++            DFSConfigKeys.DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_DEFAULT);
++    DataTransferThrottler throttler = null;
++    if (transferBandwidth > 0) {
++      throttler = new DataTransferThrottler(transferBandwidth);
++    }
++    return throttler;
++  }
++
+   @VisibleForTesting
+   static boolean isValidRequestor(ServletContext context, String remoteUser,
+       Configuration conf) throws IOException {
+@@ -297,13 +313,14 @@ static String getParamStringForMostRecentImage() {
+   }
+ 
+   static String getParamStringForImage(NameNodeFile nnf, long txid,
+-      StorageInfo remoteStorageInfo) {
++      StorageInfo remoteStorageInfo, boolean isBootstrapStandby) {
+     final String imageType = nnf == null ? "" : "&" + IMAGE_FILE_TYPE + "="
+         + nnf.name();
+     return "getimage=1&" + TXID_PARAM + "=" + txid
+       + imageType
+-      + "&" + STORAGEINFO_PARAM + "=" +
+-      remoteStorageInfo.toColonSeparatedString();
++      + "&" + STORAGEINFO_PARAM + "="
++      + remoteStorageInfo.toColonSeparatedString() + "&"
++      + IS_BOOTSTRAP_STANDBY + "=" + isBootstrapStandby;
+   }
+ 
+   static String getParamStringForLog(RemoteEditLog log,
+@@ -321,6 +338,7 @@ static String getParamStringForLog(RemoteEditLog log,
+     private long startTxId, endTxId, txId;
+     private String storageInfoString;
+     private boolean fetchLatest;
++    private boolean isBootstrapStandby;
+ 
+     /**
+      * @param request the object from which this servlet reads the url contents
+@@ -332,7 +350,7 @@ public GetImageParams(HttpServletRequest request,
+                            ) throws IOException {
+       @SuppressWarnings("unchecked")
+       Map<String, String[]> pmap = request.getParameterMap();
+-      isGetImage = isGetEdit = fetchLatest = false;
++      isGetImage = isGetEdit = fetchLatest = isBootstrapStandby = false;
+ 
+       for (Map.Entry<String, String[]> entry : pmap.entrySet()) {
+         String key = entry.getKey();
+@@ -344,6 +362,10 @@ public GetImageParams(HttpServletRequest request,
+             String imageType = ServletUtil.getParameter(request, IMAGE_FILE_TYPE);
+             nnf = imageType == null ? NameNodeFile.IMAGE : NameNodeFile
+                 .valueOf(imageType);
++            String bootstrapStandby = ServletUtil.getParameter(request,
++                IS_BOOTSTRAP_STANDBY);
++            isBootstrapStandby = bootstrapStandby != null &&
++                Boolean.parseBoolean(bootstrapStandby);
+           } catch (NumberFormatException nfe) {
+             if (request.getParameter(TXID_PARAM).equals(LATEST_FSIMAGE_VALUE)) {
+               fetchLatest = true;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+index d5d6e40..ee7c6ed 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+@@ -417,7 +417,7 @@ public Boolean run() throws Exception {
+               LOG.info("Image has changed. Downloading updated image from NN.");
+               MD5Hash downloadedHash = TransferFsImage.downloadImageToStorage(
+                   nnHostPort, sig.mostRecentCheckpointTxId,
+-                  dstImage.getStorage(), true);
++                  dstImage.getStorage(), true, false);
+               dstImage.saveDigestAndRenameCheckpointImage(NameNodeFile.IMAGE,
+                   sig.mostRecentCheckpointTxId, downloadedHash);
+             }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+index d7d4a68..15796d0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+@@ -100,9 +100,10 @@ public static void downloadMostRecentImageToDirectory(URL infoServer,
+   }
+ 
+   public static MD5Hash downloadImageToStorage(URL fsName, long imageTxId,
+-      Storage dstStorage, boolean needDigest) throws IOException {
++      Storage dstStorage, boolean needDigest, boolean isBootstrapStandby)
++      throws IOException {
+     String fileid = ImageServlet.getParamStringForImage(null,
+-        imageTxId, dstStorage);
++        imageTxId, dstStorage, isBootstrapStandby);
+     String fileName = NNStorage.getCheckpointImageFileName(imageTxId);
+     
+     List<File> dstFiles = dstStorage.getFiles(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+index 24d3ede..4951ff4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+@@ -316,7 +316,7 @@ private int downloadImage(NNStorage storage, NamenodeProtocol proxy)
+ 
+       // Download that checkpoint into our storage directories.
+       MD5Hash hash = TransferFsImage.downloadImageToStorage(
+-          otherHttpAddr, imageTxId, storage, true);
++          otherHttpAddr, imageTxId, storage, true, true);
+       image.saveDigestAndRenameCheckpointImage(NameNodeFile.IMAGE, imageTxId,
+           hash);
+     } catch (IOException ioe) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index e4ba4d7..8fc45cf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -983,15 +983,31 @@
+   <name>dfs.image.transfer.bandwidthPerSec</name>
+   <value>0</value>
+   <description>
+-        Maximum bandwidth used for image transfer in bytes per second.
++        Maximum bandwidth used for regular image transfers (instead of
++        bootstrapping the standby namenode), in bytes per second.
+         This can help keep normal namenode operations responsive during
+         checkpointing. The maximum bandwidth and timeout in
+         dfs.image.transfer.timeout should be set such that normal image
+         transfers can complete successfully.
+-        A default value of 0 indicates that throttling is disabled. 
++        A default value of 0 indicates that throttling is disabled.
++        The maximum bandwidth used for bootstrapping standby namenode is
++        configured with dfs.image.transfer-bootstrap-standby.bandwidthPerSec.
+   </description>
+ </property>
+ 
++  <property>
++    <name>dfs.image.transfer-bootstrap-standby.bandwidthPerSec</name>
++    <value>0</value>
++    <description>
++      Maximum bandwidth used for transferring image to bootstrap standby
++      namenode, in bytes per second.
++      A default value of 0 indicates that throttling is disabled. This default
++      value should be used in most cases, to ensure timely HA operations.
++      The maximum bandwidth used for regular image transfers is configured
++      with dfs.image.transfer.bandwidthPerSec.
++    </description>
++  </property>
++
+ <property>
+   <name>dfs.image.transfer.chunksize</name>
+   <value>65536</value>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index b78e2f8..c1ce37d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -1984,7 +1984,7 @@ public void testNamespaceVerifiedOnFileTransfer() throws IOException {
+         .when(dstImage).toColonSeparatedString();
+ 
+       try {
+-        TransferFsImage.downloadImageToStorage(fsName, 0, dstImage, false);
++        TransferFsImage.downloadImageToStorage(fsName, 0, dstImage, false, false);
+         fail("Storage info was not verified");
+       } catch (IOException ioe) {
+         String msg = StringUtils.stringifyException(ioe);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+index 7abc502..a849233 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+@@ -24,11 +24,14 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.concurrent.TimeoutException;
+ 
++import com.google.common.base.Supplier;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+ import org.apache.hadoop.hdfs.server.namenode.CheckpointSignature;
+@@ -205,6 +208,64 @@ public void testOtherNodeNotActive() throws Exception {
+     assertEquals(0, rc);
+   }
+ 
++  /**
++   * Test that bootstrapping standby NN is not limited by
++   * {@link DFSConfigKeys#DFS_IMAGE_TRANSFER_RATE_KEY}, but is limited by
++   * {@link DFSConfigKeys#DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY}
++   * created by HDFS-8808.
++   */
++  @Test
++  public void testRateThrottling() throws Exception {
++    cluster.getConfiguration(0).setLong(
++        DFSConfigKeys.DFS_IMAGE_TRANSFER_RATE_KEY, 1);
++    cluster.restartNameNode(0);
++    cluster.waitActive();
++    nn0 = cluster.getNameNode(0);
++    cluster.transitionToActive(0);
++    // Each edit has at least 1 byte. So the lowRate definitely should cause
++    // a timeout, if enforced. If lowRate is not enforced, any reasonable test
++    // machine should at least download an image with 5 edits in 5 seconds.
++    for (int i = 0; i < 5; i++) {
++      nn0.getRpcServer().rollEditLog();
++    }
++    // A very low DFS_IMAGE_TRANSFER_RATE_KEY value won't affect bootstrapping
++    GenericTestUtils.waitFor(new Supplier<Boolean>() {
++      public Boolean get() {
++        try {
++          testSuccessfulBaseCase();
++          return true;
++        } catch (Exception e) {
++          return false;
++        }
++      }
++    }, 500, 5000);
++
++    shutdownCluster();
++    setupCluster();
++    cluster.getConfiguration(0).setLong(
++        DFSConfigKeys.DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY, 1);
++    cluster.restartNameNode(0);
++    cluster.waitActive();
++    nn0 = cluster.getNameNode(0);
++    cluster.transitionToActive(0);
++    // A very low DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY value should
++    // cause timeout
++    try {
++      GenericTestUtils.waitFor(new Supplier<Boolean>() {
++        public Boolean get() {
++          try {
++            testSuccessfulBaseCase();
++            return true;
++          } catch (Exception e) {
++            return false;
++          }
++        }
++      }, 500, 5000);
++      fail("Did not timeout");
++    } catch (TimeoutException e) {
++      LOG.info("Encountered expected timeout.");
++    }
++  }
+   private void removeStandbyNameDirs() {
+     for (URI u : cluster.getNameDirs(1)) {
+       assertTrue(u.getScheme().equals("file"));
+-- 
+1.7.9.5
+

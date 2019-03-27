@@ -1,0 +1,1382 @@
+From 42a5f5fe42beafeefb636adaa1d973763c557b7c Mon Sep 17 00:00:00 2001
+From: Miklos Szegedi <miklos.szegedi@cloudera.com>
+Date: Tue, 4 Oct 2016 16:20:09 -0700
+Subject: [PATCH 1960/2848] YARN-2980. Move health check script related
+ functionality to hadoop-common (Varun Saxena via
+ aw)
+
+(cherry picked from commit d4ac6822e1c5dfac504ced48f10ab57a55b49e93)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+
+(cherry picked from commit 02e650248d3ebb7c779a259f5419f4ad41048f75)
+
+Change-Id: Ie89f23c4816cc944a2dfff65da8b8bb6b5e870ab
+---
+ .../apache/hadoop/util/NodeHealthScriptRunner.java |  345 +++++++++++++++++++
+ .../hadoop/util/TestNodeHealthScriptRunner.java    |  136 ++++++++
+ .../nodemanager/NodeHealthCheckerService.java      |   12 +-
+ .../server/nodemanager/NodeHealthScriptRunner.java |  356 --------------------
+ .../yarn/server/nodemanager/NodeManager.java       |   29 +-
+ .../yarn/server/nodemanager/TestEventFlow.java     |    7 +-
+ .../server/nodemanager/TestNodeHealthService.java  |   86 ++---
+ .../containermanager/BaseContainerManagerTest.java |    7 +-
+ .../nodemanager/webapp/TestContainerLogsPage.java  |   11 +-
+ .../server/nodemanager/webapp/TestNMWebServer.java |   13 +-
+ .../nodemanager/webapp/TestNMWebServices.java      |    7 +-
+ .../nodemanager/webapp/TestNMWebServicesApps.java  |    6 +-
+ .../webapp/TestNMWebServicesContainers.java        |    5 +-
+ 13 files changed, 584 insertions(+), 436 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/NodeHealthScriptRunner.java
+ create mode 100644 hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/util/TestNodeHealthScriptRunner.java
+ delete mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthScriptRunner.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/NodeHealthScriptRunner.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/NodeHealthScriptRunner.java
+new file mode 100644
+index 0000000..568ad5b
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/NodeHealthScriptRunner.java
+@@ -0,0 +1,345 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Timer;
++import java.util.TimerTask;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.service.AbstractService;
++import org.apache.hadoop.util.Shell.ExitCodeException;
++import org.apache.hadoop.util.Shell.ShellCommandExecutor;
++import org.apache.hadoop.util.Shell;
++import org.apache.hadoop.util.StringUtils;
++
++/**
++ * 
++ * The class which provides functionality of checking the health of the node
++ * using the configured node health script and reporting back to the service
++ * for which the health checker has been asked to report.
++ */
++public class NodeHealthScriptRunner extends AbstractService {
++
++  private static Log LOG = LogFactory.getLog(NodeHealthScriptRunner.class);
++
++  /** Absolute path to the health script. */
++  private String nodeHealthScript;
++  /** Delay after which node health script to be executed */
++  private long intervalTime;
++  /** Time after which the script should be timedout */
++  private long scriptTimeout;
++  /** Timer used to schedule node health monitoring script execution */
++  private Timer nodeHealthScriptScheduler;
++
++  /** ShellCommandExecutor used to execute monitoring script */
++  ShellCommandExecutor shexec = null;
++
++  /** Pattern used for searching in the output of the node health script */
++  static private final String ERROR_PATTERN = "ERROR";
++
++  /** Time out error message */
++  public static final String NODE_HEALTH_SCRIPT_TIMED_OUT_MSG = "Node health script timed out";
++
++  private boolean isHealthy;
++
++  private String healthReport;
++
++  private long lastReportedTime;
++
++  private TimerTask timer;
++  
++  private enum HealthCheckerExitStatus {
++    SUCCESS,
++    TIMED_OUT,
++    FAILED_WITH_EXIT_CODE,
++    FAILED_WITH_EXCEPTION,
++    FAILED
++  }
++
++
++  /**
++   * Class which is used by the {@link Timer} class to periodically execute the
++   * node health script.
++   * 
++   */
++  private class NodeHealthMonitorExecutor extends TimerTask {
++
++    String exceptionStackTrace = "";
++
++    public NodeHealthMonitorExecutor(String[] args) {
++      ArrayList<String> execScript = new ArrayList<String>();
++      execScript.add(nodeHealthScript);
++      if (args != null) {
++        execScript.addAll(Arrays.asList(args));
++      }
++      shexec = new ShellCommandExecutor(execScript
++          .toArray(new String[execScript.size()]), null, null, scriptTimeout);
++    }
++
++    @Override
++    public void run() {
++      HealthCheckerExitStatus status = HealthCheckerExitStatus.SUCCESS;
++      try {
++        shexec.execute();
++      } catch (ExitCodeException e) {
++        // ignore the exit code of the script
++        status = HealthCheckerExitStatus.FAILED_WITH_EXIT_CODE;
++        // On Windows, we will not hit the Stream closed IOException
++        // thrown by stdout buffered reader for timeout event.
++        if (Shell.WINDOWS && shexec.isTimedOut()) {
++          status = HealthCheckerExitStatus.TIMED_OUT;
++        }
++      } catch (Exception e) {
++        LOG.warn("Caught exception : " + e.getMessage());
++        if (!shexec.isTimedOut()) {
++          status = HealthCheckerExitStatus.FAILED_WITH_EXCEPTION;
++        } else {
++          status = HealthCheckerExitStatus.TIMED_OUT;
++        }
++        exceptionStackTrace = StringUtils.stringifyException(e);
++      } finally {
++        if (status == HealthCheckerExitStatus.SUCCESS) {
++          if (hasErrors(shexec.getOutput())) {
++            status = HealthCheckerExitStatus.FAILED;
++          }
++        }
++        reportHealthStatus(status);
++      }
++    }
++
++    /**
++     * Method which is used to parse output from the node health monitor and
++     * send to the report address.
++     * 
++     * The timed out script or script which causes IOException output is
++     * ignored.
++     * 
++     * The node is marked unhealthy if
++     * <ol>
++     * <li>The node health script times out</li>
++     * <li>The node health scripts output has a line which begins with ERROR</li>
++     * <li>An exception is thrown while executing the script</li>
++     * </ol>
++     * If the script throws {@link IOException} or {@link ExitCodeException} the
++     * output is ignored and node is left remaining healthy, as script might
++     * have syntax error.
++     * 
++     * @param status
++     */
++    void reportHealthStatus(HealthCheckerExitStatus status) {
++      long now = System.currentTimeMillis();
++      switch (status) {
++      case SUCCESS:
++        setHealthStatus(true, "", now);
++        break;
++      case TIMED_OUT:
++        setHealthStatus(false, NODE_HEALTH_SCRIPT_TIMED_OUT_MSG);
++        break;
++      case FAILED_WITH_EXCEPTION:
++        setHealthStatus(false, exceptionStackTrace);
++        break;
++      case FAILED_WITH_EXIT_CODE:
++        setHealthStatus(true, "", now);
++        break;
++      case FAILED:
++        setHealthStatus(false, shexec.getOutput());
++        break;
++      }
++    }
++
++    /**
++     * Method to check if the output string has line which begins with ERROR.
++     * 
++     * @param output
++     *          string
++     * @return true if output string has error pattern in it.
++     */
++    private boolean hasErrors(String output) {
++      String[] splits = output.split("\n");
++      for (String split : splits) {
++        if (split.startsWith(ERROR_PATTERN)) {
++          return true;
++        }
++      }
++      return false;
++    }
++  }
++
++  public NodeHealthScriptRunner(String scriptName, long chkInterval, long timeout,
++      String[] scriptArgs) {
++    super(NodeHealthScriptRunner.class.getName());
++    this.lastReportedTime = System.currentTimeMillis();
++    this.isHealthy = true;
++    this.healthReport = "";
++    this.nodeHealthScript = scriptName;
++    this.intervalTime = chkInterval;
++    this.scriptTimeout = timeout;
++    this.timer = new NodeHealthMonitorExecutor(scriptArgs);
++  }
++
++  /*
++   * Method which initializes the values for the script path and interval time.
++   */
++  @Override
++  protected void serviceInit(Configuration conf) throws Exception {
++    super.serviceInit(conf);
++  }
++
++  /**
++   * Method used to start the Node health monitoring.
++   * 
++   */
++  @Override
++  protected void serviceStart() throws Exception {
++    // if health script path is not configured don't start the thread.
++    if (!shouldRun(nodeHealthScript)) {
++      LOG.info("Not starting node health monitor");
++      return;
++    }
++    nodeHealthScriptScheduler = new Timer("NodeHealthMonitor-Timer", true);
++    // Start the timer task immediately and
++    // then periodically at interval time.
++    nodeHealthScriptScheduler.scheduleAtFixedRate(timer, 0, intervalTime);
++    super.serviceStart();
++  }
++
++  /**
++   * Method used to terminate the node health monitoring service.
++   * 
++   */
++  @Override
++  protected void serviceStop() {
++    if (!shouldRun(nodeHealthScript)) {
++      return;
++    }
++    if (nodeHealthScriptScheduler != null) {
++      nodeHealthScriptScheduler.cancel();
++    }
++    if (shexec != null) {
++      Process p = shexec.getProcess();
++      if (p != null) {
++        p.destroy();
++      }
++    }
++  }
++
++  /**
++   * Gets the if the node is healthy or not
++   * 
++   * @return true if node is healthy
++   */
++  public boolean isHealthy() {
++    return isHealthy;
++  }
++
++  /**
++   * Sets if the node is healhty or not considering disks' health also.
++   * 
++   * @param isHealthy
++   *          if or not node is healthy
++   */
++  private synchronized void setHealthy(boolean isHealthy) {
++    this.isHealthy = isHealthy;
++  }
++
++  /**
++   * Returns output from health script. if node is healthy then an empty string
++   * is returned.
++   * 
++   * @return output from health script
++   */
++  public String getHealthReport() {
++    return healthReport;
++  }
++
++  /**
++   * Sets the health report from the node health script. Also set the disks'
++   * health info obtained from DiskHealthCheckerService.
++   *
++   * @param healthReport
++   */
++  private synchronized void setHealthReport(String healthReport) {
++    this.healthReport = healthReport;
++  }
++  
++  /**
++   * Returns time stamp when node health script was last run.
++   * 
++   * @return timestamp when node health script was last run
++   */
++  public long getLastReportedTime() {
++    return lastReportedTime;
++  }
++
++  /**
++   * Sets the last run time of the node health script.
++   * 
++   * @param lastReportedTime
++   */
++  private synchronized void setLastReportedTime(long lastReportedTime) {
++    this.lastReportedTime = lastReportedTime;
++  }
++
++  /**
++   * Method used to determine if or not node health monitoring service should be
++   * started or not. Returns true if following conditions are met:
++   * 
++   * <ol>
++   * <li>Path to Node health check script is not empty</li>
++   * <li>Node health check script file exists</li>
++   * </ol>
++   * 
++   * @return true if node health monitoring service can be started.
++   */
++  public static boolean shouldRun(String healthScript) {
++    if (healthScript == null || healthScript.trim().isEmpty()) {
++      return false;
++    }
++    File f = new File(healthScript);
++    return f.exists() && FileUtil.canExecute(f);
++  }
++
++  private synchronized void setHealthStatus(boolean isHealthy, String output) {
++		LOG.info("health status being set as " + output);
++    this.setHealthy(isHealthy);
++    this.setHealthReport(output);
++  }
++  
++  private synchronized void setHealthStatus(boolean isHealthy, String output,
++      long time) {
++	LOG.info("health status being set as " + output);
++    this.setHealthStatus(isHealthy, output);
++    this.setLastReportedTime(time);
++  }
++
++  /**
++   * Used only by tests to access the timer task directly
++   * @return the timer task
++   */
++  public TimerTask getTimerTask() {
++    return timer;
++  }
++}
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/util/TestNodeHealthScriptRunner.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/util/TestNodeHealthScriptRunner.java
+new file mode 100644
+index 0000000..8fc64d1
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/util/TestNodeHealthScriptRunner.java
+@@ -0,0 +1,136 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.TimerTask;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.Path;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++public class TestNodeHealthScriptRunner {
++
++  protected static File testRootDir = new File("target",
++      TestNodeHealthScriptRunner.class.getName() +
++      "-localDir").getAbsoluteFile();
++
++  private File nodeHealthscriptFile = new File(testRootDir,
++      Shell.appendScriptExtension("failingscript"));
++
++  @Before
++  public void setup() {
++    testRootDir.mkdirs();
++  }
++
++  @After
++  public void tearDown() throws Exception {
++    if (testRootDir.exists()) {
++      FileContext.getLocalFSFileContext().delete(
++          new Path(testRootDir.getAbsolutePath()), true);
++    }
++  }
++
++  private void writeNodeHealthScriptFile(String scriptStr, boolean setExecutable)
++          throws IOException {
++    PrintWriter pw = null;
++    try {
++      FileUtil.setWritable(nodeHealthscriptFile, true);
++      FileUtil.setReadable(nodeHealthscriptFile, true);
++      pw = new PrintWriter(new FileOutputStream(nodeHealthscriptFile));
++      pw.println(scriptStr);
++      pw.flush();
++    } finally {
++      pw.close();
++    }
++    FileUtil.setExecutable(nodeHealthscriptFile, setExecutable);
++  }
++
++  @Test
++  public void testNodeHealthScriptShouldRun() throws IOException {
++    Assert.assertFalse("Node health script should start",
++        NodeHealthScriptRunner.shouldRun(
++            nodeHealthscriptFile.getAbsolutePath()));
++    writeNodeHealthScriptFile("", false);
++    // Node health script should not start if the node health script is not
++    // executable.
++    Assert.assertFalse("Node health script should start",
++        NodeHealthScriptRunner.shouldRun(
++            nodeHealthscriptFile.getAbsolutePath()));
++    writeNodeHealthScriptFile("", true);
++    Assert.assertTrue("Node health script should start",
++        NodeHealthScriptRunner.shouldRun(
++            nodeHealthscriptFile.getAbsolutePath()));
++  }
++
++  @Test
++  public void testNodeHealthScript() throws Exception {
++    String errorScript = "echo ERROR\n echo \"Tracker not healthy\"";
++    String normalScript = "echo \"I am all fine\"";
++    String timeOutScript =
++      Shell.WINDOWS ? "@echo off\nping -n 4 127.0.0.1 >nul\necho \"I am fine\""
++      : "sleep 4\necho \"I am fine\"";
++    Configuration conf = new Configuration();
++    writeNodeHealthScriptFile(normalScript, true);
++    NodeHealthScriptRunner nodeHealthScriptRunner = new NodeHealthScriptRunner(
++            nodeHealthscriptFile.getAbsolutePath(),
++            500, 1000, new String[] {});
++    nodeHealthScriptRunner.init(conf);
++    TimerTask timerTask = nodeHealthScriptRunner.getTimerTask();
++
++    timerTask.run();
++    // Normal Script runs successfully
++    Assert.assertTrue("Node health status reported unhealthy",
++        nodeHealthScriptRunner.isHealthy());
++    Assert.assertEquals("", nodeHealthScriptRunner.getHealthReport());
++
++    // Error script.
++    writeNodeHealthScriptFile(errorScript, true);
++    // Run timer
++    timerTask.run();
++    Assert.assertFalse("Node health status reported healthy",
++        nodeHealthScriptRunner.isHealthy());
++    Assert.assertTrue(
++        nodeHealthScriptRunner.getHealthReport().contains("ERROR"));
++    
++    // Healthy script.
++    writeNodeHealthScriptFile(normalScript, true);
++    timerTask.run();
++    Assert.assertTrue("Node health status reported unhealthy",
++        nodeHealthScriptRunner.isHealthy());
++    Assert.assertEquals("", nodeHealthScriptRunner.getHealthReport());
++
++    // Timeout script.
++    writeNodeHealthScriptFile(timeOutScript, true);
++    timerTask.run();
++    Assert.assertFalse("Node health status reported healthy even after timeout",
++    nodeHealthScriptRunner.isHealthy());
++    Assert.assertEquals(
++            NodeHealthScriptRunner.NODE_HEALTH_SCRIPT_TIMED_OUT_MSG,
++            nodeHealthScriptRunner.getHealthReport());
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthCheckerService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthCheckerService.java
+index 6d6001a..02b318a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthCheckerService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthCheckerService.java
+@@ -20,6 +20,8 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.service.CompositeService;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ 
+ /**
+  * The class which provides functionality of checking the health of the node and
+@@ -33,15 +35,17 @@
+ 
+   static final String SEPARATOR = ";";
+ 
+-  public NodeHealthCheckerService() {
++  public NodeHealthCheckerService(NodeHealthScriptRunner scriptRunner,
++      LocalDirsHandlerService dirHandlerService) {
+     super(NodeHealthCheckerService.class.getName());
+-    dirsHandler = new LocalDirsHandlerService();
++    nodeHealthScriptRunner = scriptRunner;
++    dirsHandler = dirHandlerService;
+   }
+ 
+   @Override
+   protected void serviceInit(Configuration conf) throws Exception {
+-    if (NodeHealthScriptRunner.shouldRun(conf)) {
+-      nodeHealthScriptRunner = new NodeHealthScriptRunner();
++    if (NodeHealthScriptRunner.shouldRun(
++        conf.get(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH))) {
+       addService(nodeHealthScriptRunner);
+     }
+     addService(dirsHandler);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthScriptRunner.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthScriptRunner.java
+deleted file mode 100644
+index e3c9862..0000000
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeHealthScriptRunner.java
++++ /dev/null
+@@ -1,356 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.yarn.server.nodemanager;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Timer;
+-import java.util.TimerTask;
+-
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileUtil;
+-import org.apache.hadoop.service.AbstractService;
+-import org.apache.hadoop.util.Shell.ExitCodeException;
+-import org.apache.hadoop.util.Shell.ShellCommandExecutor;
+-import org.apache.hadoop.util.Shell;
+-import org.apache.hadoop.util.StringUtils;
+-import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-
+-/**
+- * 
+- * The class which provides functionality of checking the health of the node
+- * using the configured node health script and reporting back to the service
+- * for which the health checker has been asked to report.
+- */
+-public class NodeHealthScriptRunner extends AbstractService {
+-
+-  private static Log LOG = LogFactory.getLog(NodeHealthScriptRunner.class);
+-
+-  /** Absolute path to the health script. */
+-  private String nodeHealthScript;
+-  /** Delay after which node health script to be executed */
+-  private long intervalTime;
+-  /** Time after which the script should be timedout */
+-  private long scriptTimeout;
+-  /** Timer used to schedule node health monitoring script execution */
+-  private Timer nodeHealthScriptScheduler;
+-
+-  /** ShellCommandExecutor used to execute monitoring script */
+-  ShellCommandExecutor shexec = null;
+-
+-  /** Configuration used by the checker */
+-  private Configuration conf;
+-
+-  /** Pattern used for searching in the output of the node health script */
+-  static private final String ERROR_PATTERN = "ERROR";
+-
+-  /** Time out error message */
+-  static final String NODE_HEALTH_SCRIPT_TIMED_OUT_MSG = "Node health script timed out";
+-
+-  private boolean isHealthy;
+-
+-  private String healthReport;
+-
+-  private long lastReportedTime;
+-
+-  private TimerTask timer;
+-  
+-  private enum HealthCheckerExitStatus {
+-    SUCCESS,
+-    TIMED_OUT,
+-    FAILED_WITH_EXIT_CODE,
+-    FAILED_WITH_EXCEPTION,
+-    FAILED
+-  }
+-
+-
+-  /**
+-   * Class which is used by the {@link Timer} class to periodically execute the
+-   * node health script.
+-   * 
+-   */
+-  private class NodeHealthMonitorExecutor extends TimerTask {
+-
+-    String exceptionStackTrace = "";
+-
+-    public NodeHealthMonitorExecutor(String[] args) {
+-      ArrayList<String> execScript = new ArrayList<String>();
+-      execScript.add(nodeHealthScript);
+-      if (args != null) {
+-        execScript.addAll(Arrays.asList(args));
+-      }
+-      shexec = new ShellCommandExecutor(execScript
+-          .toArray(new String[execScript.size()]), null, null, scriptTimeout);
+-    }
+-
+-    @Override
+-    public void run() {
+-      HealthCheckerExitStatus status = HealthCheckerExitStatus.SUCCESS;
+-      try {
+-        shexec.execute();
+-      } catch (ExitCodeException e) {
+-        // ignore the exit code of the script
+-        status = HealthCheckerExitStatus.FAILED_WITH_EXIT_CODE;
+-        // On Windows, we will not hit the Stream closed IOException
+-        // thrown by stdout buffered reader for timeout event.
+-        if (Shell.WINDOWS && shexec.isTimedOut()) {
+-          status = HealthCheckerExitStatus.TIMED_OUT;
+-        }
+-      } catch (Exception e) {
+-        LOG.warn("Caught exception : " + e.getMessage());
+-        if (!shexec.isTimedOut()) {
+-          status = HealthCheckerExitStatus.FAILED_WITH_EXCEPTION;
+-        } else {
+-          status = HealthCheckerExitStatus.TIMED_OUT;
+-        }
+-        exceptionStackTrace = StringUtils.stringifyException(e);
+-      } finally {
+-        if (status == HealthCheckerExitStatus.SUCCESS) {
+-          if (hasErrors(shexec.getOutput())) {
+-            status = HealthCheckerExitStatus.FAILED;
+-          }
+-        }
+-        reportHealthStatus(status);
+-      }
+-    }
+-
+-    /**
+-     * Method which is used to parse output from the node health monitor and
+-     * send to the report address.
+-     * 
+-     * The timed out script or script which causes IOException output is
+-     * ignored.
+-     * 
+-     * The node is marked unhealthy if
+-     * <ol>
+-     * <li>The node health script times out</li>
+-     * <li>The node health scripts output has a line which begins with ERROR</li>
+-     * <li>An exception is thrown while executing the script</li>
+-     * </ol>
+-     * If the script throws {@link IOException} or {@link ExitCodeException} the
+-     * output is ignored and node is left remaining healthy, as script might
+-     * have syntax error.
+-     * 
+-     * @param status
+-     */
+-    void reportHealthStatus(HealthCheckerExitStatus status) {
+-      long now = System.currentTimeMillis();
+-      switch (status) {
+-      case SUCCESS:
+-        setHealthStatus(true, "", now);
+-        break;
+-      case TIMED_OUT:
+-        setHealthStatus(false, NODE_HEALTH_SCRIPT_TIMED_OUT_MSG);
+-        break;
+-      case FAILED_WITH_EXCEPTION:
+-        setHealthStatus(false, exceptionStackTrace);
+-        break;
+-      case FAILED_WITH_EXIT_CODE:
+-        setHealthStatus(true, "", now);
+-        break;
+-      case FAILED:
+-        setHealthStatus(false, shexec.getOutput());
+-        break;
+-      }
+-    }
+-
+-    /**
+-     * Method to check if the output string has line which begins with ERROR.
+-     * 
+-     * @param output
+-     *          string
+-     * @return true if output string has error pattern in it.
+-     */
+-    private boolean hasErrors(String output) {
+-      String[] splits = output.split("\n");
+-      for (String split : splits) {
+-        if (split.startsWith(ERROR_PATTERN)) {
+-          return true;
+-        }
+-      }
+-      return false;
+-    }
+-  }
+-
+-  public NodeHealthScriptRunner() {
+-    super(NodeHealthScriptRunner.class.getName());
+-    this.lastReportedTime = System.currentTimeMillis();
+-    this.isHealthy = true;
+-    this.healthReport = "";    
+-  }
+-
+-  /*
+-   * Method which initializes the values for the script path and interval time.
+-   */
+-  @Override
+-  protected void serviceInit(Configuration conf) throws Exception {
+-    this.conf = conf;
+-    this.nodeHealthScript = 
+-        conf.get(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH);
+-    this.intervalTime = conf.getLong(YarnConfiguration.NM_HEALTH_CHECK_INTERVAL_MS,
+-        YarnConfiguration.DEFAULT_NM_HEALTH_CHECK_INTERVAL_MS);
+-    this.scriptTimeout = conf.getLong(
+-        YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS,
+-        YarnConfiguration.DEFAULT_NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS);
+-    String[] args = conf.getStrings(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_OPTS,
+-        new String[] {});
+-    timer = new NodeHealthMonitorExecutor(args);
+-    super.serviceInit(conf);
+-  }
+-
+-  /**
+-   * Method used to start the Node health monitoring.
+-   * 
+-   */
+-  @Override
+-  protected void serviceStart() throws Exception {
+-    // if health script path is not configured don't start the thread.
+-    if (!shouldRun(conf)) {
+-      LOG.info("Not starting node health monitor");
+-      return;
+-    }
+-    nodeHealthScriptScheduler = new Timer("NodeHealthMonitor-Timer", true);
+-    // Start the timer task immediately and
+-    // then periodically at interval time.
+-    nodeHealthScriptScheduler.scheduleAtFixedRate(timer, 0, intervalTime);
+-    super.serviceStart();
+-  }
+-
+-  /**
+-   * Method used to terminate the node health monitoring service.
+-   * 
+-   */
+-  @Override
+-  protected void serviceStop() {
+-    if (!shouldRun(conf)) {
+-      return;
+-    }
+-    if (nodeHealthScriptScheduler != null) {
+-      nodeHealthScriptScheduler.cancel();
+-    }
+-    if (shexec != null) {
+-      Process p = shexec.getProcess();
+-      if (p != null) {
+-        p.destroy();
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Gets the if the node is healthy or not
+-   * 
+-   * @return true if node is healthy
+-   */
+-  public boolean isHealthy() {
+-    return isHealthy;
+-  }
+-
+-  /**
+-   * Sets if the node is healhty or not considering disks' health also.
+-   * 
+-   * @param isHealthy
+-   *          if or not node is healthy
+-   */
+-  private synchronized void setHealthy(boolean isHealthy) {
+-    this.isHealthy = isHealthy;
+-  }
+-
+-  /**
+-   * Returns output from health script. if node is healthy then an empty string
+-   * is returned.
+-   * 
+-   * @return output from health script
+-   */
+-  public String getHealthReport() {
+-    return healthReport;
+-  }
+-
+-  /**
+-   * Sets the health report from the node health script. Also set the disks'
+-   * health info obtained from DiskHealthCheckerService.
+-   *
+-   * @param healthReport
+-   */
+-  private synchronized void setHealthReport(String healthReport) {
+-    this.healthReport = healthReport;
+-  }
+-  
+-  /**
+-   * Returns time stamp when node health script was last run.
+-   * 
+-   * @return timestamp when node health script was last run
+-   */
+-  public long getLastReportedTime() {
+-    return lastReportedTime;
+-  }
+-
+-  /**
+-   * Sets the last run time of the node health script.
+-   * 
+-   * @param lastReportedTime
+-   */
+-  private synchronized void setLastReportedTime(long lastReportedTime) {
+-    this.lastReportedTime = lastReportedTime;
+-  }
+-
+-  /**
+-   * Method used to determine if or not node health monitoring service should be
+-   * started or not. Returns true if following conditions are met:
+-   * 
+-   * <ol>
+-   * <li>Path to Node health check script is not empty</li>
+-   * <li>Node health check script file exists</li>
+-   * </ol>
+-   * 
+-   * @param conf
+-   * @return true if node health monitoring service can be started.
+-   */
+-  public static boolean shouldRun(Configuration conf) {
+-    String nodeHealthScript = 
+-      conf.get(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH);
+-    if (nodeHealthScript == null || nodeHealthScript.trim().isEmpty()) {
+-      return false;
+-    }
+-    File f = new File(nodeHealthScript);
+-    return f.exists() && FileUtil.canExecute(f);
+-  }
+-
+-  private synchronized void setHealthStatus(boolean isHealthy, String output) {
+-    this.setHealthy(isHealthy);
+-    this.setHealthReport(output);
+-  }
+-  
+-  private synchronized void setHealthStatus(boolean isHealthy, String output,
+-      long time) {
+-    this.setHealthStatus(isHealthy, output);
+-    this.setLastReportedTime(time);
+-  }
+-
+-  /**
+-   * Used only by tests to access the timer task directly
+-   * @return the timer task
+-   */
+-  TimerTask getTimerTask() {
+-    return timer;
+-  }
+-}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+index e2e53f3..6d54abf 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+@@ -40,6 +40,8 @@
+ import org.apache.hadoop.service.CompositeService;
+ import org.apache.hadoop.util.ExitUtil;
+ import org.apache.hadoop.util.JvmPauseMonitor;
++import org.apache.hadoop.util.GenericOptionsParser;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.ShutdownHookManager;
+ import org.apache.hadoop.util.StringUtils;
+@@ -191,6 +193,25 @@ private void recoverTokens(NMTokenSecretManagerInNM nmTokenSecretManager,
+     }
+   }
+ 
++  public static NodeHealthScriptRunner getNodeHealthScriptRunner(Configuration conf) {
++    String nodeHealthScript =
++        conf.get(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH);
++    if(!NodeHealthScriptRunner.shouldRun(nodeHealthScript)) {
++      LOG.info("Abey khali");
++      return null;
++    }
++    long nmCheckintervalTime = conf.getLong(
++        YarnConfiguration.NM_HEALTH_CHECK_INTERVAL_MS,
++        YarnConfiguration.DEFAULT_NM_HEALTH_CHECK_INTERVAL_MS);
++    long scriptTimeout = conf.getLong(
++        YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS,
++        YarnConfiguration.DEFAULT_NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS);
++    String[] scriptArgs = conf.getStrings(
++        YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_OPTS, new String[] {});
++    return new NodeHealthScriptRunner(nodeHealthScript,
++        nmCheckintervalTime, scriptTimeout, scriptArgs);
++  }
++
+   @Override
+   protected void serviceInit(Configuration conf) throws Exception {
+ 
+@@ -233,15 +254,15 @@ protected void serviceInit(Configuration conf) throws Exception {
+     // NodeManager level dispatcher
+     this.dispatcher = new AsyncDispatcher();
+ 
+-    nodeHealthChecker = new NodeHealthCheckerService();
+     dirsHandler = new LocalDirsHandlerService(metrics);
+-
++    nodeHealthChecker =
++        new NodeHealthCheckerService(
++            getNodeHealthScriptRunner(conf), dirsHandler);
+     addService(nodeHealthChecker);
+-    dirsHandler = nodeHealthChecker.getDiskHandler();
+ 
+     this.context = createNMContext(containerTokenSecretManager,
+         nmTokenSecretManager, nmStore);
+-    
++
+     nodeStatusUpdater =
+         createNodeStatusUpdater(context, dispatcher, nodeHealthChecker);
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+index 6962d59..c5784da 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+@@ -63,7 +63,7 @@
+   private static File remoteLogDir = new File("target",
+       TestEventFlow.class.getName() + "-remoteLogDir").getAbsoluteFile();
+   private static final long SIMULATED_RM_IDENTIFIER = 1234;
+-  
++
+   @Test
+   public void testSuccessfulContainerLaunch() throws InterruptedException,
+       IOException, YarnException {
+@@ -98,9 +98,10 @@ public int getHttpPort() {
+ 
+     DeletionService del = new DeletionService(exec);
+     Dispatcher dispatcher = new AsyncDispatcher();
+-    NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++    LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++    NodeHealthCheckerService healthChecker = new NodeHealthCheckerService(
++        NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
+     healthChecker.init(conf);
+-    LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+     NodeManagerMetrics metrics = NodeManagerMetrics.create();
+     NodeStatusUpdater nodeStatusUpdater =
+         new NodeStatusUpdaterImpl(context, dispatcher, healthChecker, metrics) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeHealthService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeHealthService.java
+index 3542196..2e41dea 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeHealthService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeHealthService.java
+@@ -22,7 +22,6 @@
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+-import java.util.TimerTask;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -30,6 +29,7 @@
+ import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+@@ -40,6 +40,9 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ 
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.spy;
++
+ public class TestNodeHealthService {
+ 
+   private static volatile Log LOG = LogFactory
+@@ -66,17 +69,7 @@ public void tearDown() throws Exception {
+           new Path(testRootDir.getAbsolutePath()), true);
+     }
+   }
+-
+-  private Configuration getConfForNodeHealthScript() {
+-    Configuration conf = new Configuration();
+-    conf.set(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH,
+-        nodeHealthscriptFile.getAbsolutePath());
+-    conf.setLong(YarnConfiguration.NM_HEALTH_CHECK_INTERVAL_MS, 500);
+-    conf.setLong(
+-        YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS, 1000);
+-    return conf;
+-  }
+-
++  
+   private void writeNodeHealthScriptFile(String scriptStr, boolean setExecutable)
+           throws IOException {
+     PrintWriter pw = null;
+@@ -92,28 +85,14 @@ private void writeNodeHealthScriptFile(String scriptStr, boolean setExecutable)
+     FileUtil.setExecutable(nodeHealthscriptFile, setExecutable);
+   }
+ 
+-  @Test
+-  public void testNodeHealthScriptShouldRun() throws IOException {
+-    // Node health script should not start if there is no property called
+-    // node health script path.
+-    Assert.assertFalse("By default Health script should not have started",
+-        NodeHealthScriptRunner.shouldRun(new Configuration()));
+-    Configuration conf = getConfForNodeHealthScript();
+-    // Node health script should not start if the node health script does not
+-    // exists
+-    Assert.assertFalse("Node health script should start",
+-        NodeHealthScriptRunner.shouldRun(conf));
+-    // Create script path.
+-    conf.writeXml(new FileOutputStream(nodeHealthConfigFile));
+-    conf.addResource(nodeHealthConfigFile.getName());
+-    writeNodeHealthScriptFile("", false);
+-    // Node health script should not start if the node health script is not
+-    // executable.
+-    Assert.assertFalse("Node health script should start",
+-        NodeHealthScriptRunner.shouldRun(conf));
+-    writeNodeHealthScriptFile("", true);
+-    Assert.assertTrue("Node health script should start",
+-        NodeHealthScriptRunner.shouldRun(conf));
++  private Configuration getConfForNodeHealthScript() {
++    Configuration conf = new Configuration();
++    conf.set(YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_PATH,
++        nodeHealthscriptFile.getAbsolutePath());
++    conf.setLong(YarnConfiguration.NM_HEALTH_CHECK_INTERVAL_MS, 500);
++    conf.setLong(
++        YarnConfiguration.NM_HEALTH_CHECK_SCRIPT_TIMEOUT_MS, 1000);
++    return conf;
+   }
+ 
+   private void setHealthStatus(NodeHealthStatus healthStatus, boolean isHealthy,
+@@ -124,27 +103,24 @@ private void setHealthStatus(NodeHealthStatus healthStatus, boolean isHealthy,
+   }
+ 
+   @Test
+-  public void testNodeHealthScript() throws Exception {
++  public void testNodeHealthService() throws Exception {
+     RecordFactory factory = RecordFactoryProvider.getRecordFactory(null);
+     NodeHealthStatus healthStatus =
+         factory.newRecordInstance(NodeHealthStatus.class);
+-    String errorScript = "echo ERROR\n echo \"Tracker not healthy\"";
+-    String normalScript = "echo \"I am all fine\"";
+-    String timeOutScript = Shell.WINDOWS ? "@echo off\nping -n 4 127.0.0.1 >nul\necho \"I am fine\""
+-        : "sleep 4\necho \"I am fine\"";
+     Configuration conf = getConfForNodeHealthScript();
+     conf.writeXml(new FileOutputStream(nodeHealthConfigFile));
+     conf.addResource(nodeHealthConfigFile.getName());
++    writeNodeHealthScriptFile("", true);
+ 
+-    writeNodeHealthScriptFile(normalScript, true);
+-    NodeHealthCheckerService nodeHealthChecker = new NodeHealthCheckerService();
+-    nodeHealthChecker.init(conf);
++    LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
+     NodeHealthScriptRunner nodeHealthScriptRunner =
+-        nodeHealthChecker.getNodeHealthScriptRunner();
+-    TimerTask timerTask = nodeHealthScriptRunner.getTimerTask();
+-
+-    timerTask.run();
++        spy(NodeManager.getNodeHealthScriptRunner(conf));
++    NodeHealthCheckerService nodeHealthChecker = new NodeHealthCheckerService(
++    		nodeHealthScriptRunner, dirsHandler);
++    nodeHealthChecker.init(conf);
+ 
++    doReturn(true).when(nodeHealthScriptRunner).isHealthy();
++    doReturn("").when(nodeHealthScriptRunner).getHealthReport();
+     setHealthStatus(healthStatus, nodeHealthChecker.isHealthy(),
+         nodeHealthChecker.getHealthReport(),
+         nodeHealthChecker.getLastHealthReportTime());
+@@ -155,11 +131,7 @@ public void testNodeHealthScript() throws Exception {
+     Assert.assertTrue("Node health status reported unhealthy", healthStatus
+         .getHealthReport().equals(nodeHealthChecker.getHealthReport()));
+ 
+-    // write out error file.
+-    // Healthy to unhealthy transition
+-    writeNodeHealthScriptFile(errorScript, true);
+-    // Run timer
+-    timerTask.run();
++    doReturn(false).when(nodeHealthScriptRunner).isHealthy();   
+     // update health status
+     setHealthStatus(healthStatus, nodeHealthChecker.isHealthy(),
+         nodeHealthChecker.getHealthReport(),
+@@ -169,10 +141,8 @@ public void testNodeHealthScript() throws Exception {
+         .getIsNodeHealthy());
+     Assert.assertTrue("Node health status reported healthy", healthStatus
+         .getHealthReport().equals(nodeHealthChecker.getHealthReport()));
+-    
+-    // Check unhealthy to healthy transitions.
+-    writeNodeHealthScriptFile(normalScript, true);
+-    timerTask.run();
++
++    doReturn(true).when(nodeHealthScriptRunner).isHealthy();
+     setHealthStatus(healthStatus, nodeHealthChecker.isHealthy(),
+         nodeHealthChecker.getHealthReport(),
+         nodeHealthChecker.getLastHealthReportTime());
+@@ -184,8 +154,9 @@ public void testNodeHealthScript() throws Exception {
+         .getHealthReport().equals(nodeHealthChecker.getHealthReport()));
+ 
+     // Healthy to timeout transition.
+-    writeNodeHealthScriptFile(timeOutScript, true);
+-    timerTask.run();
++    doReturn(false).when(nodeHealthScriptRunner).isHealthy();
++    doReturn(NodeHealthScriptRunner.NODE_HEALTH_SCRIPT_TIMED_OUT_MSG)
++        .when(nodeHealthScriptRunner).getHealthReport();
+     setHealthStatus(healthStatus, nodeHealthChecker.isHealthy(),
+         nodeHealthChecker.getHealthReport(),
+         nodeHealthChecker.getLastHealthReportTime());
+@@ -198,5 +169,4 @@ public void testNodeHealthScript() throws Exception {
+             + NodeHealthCheckerService.SEPARATOR
+             + nodeHealthChecker.getDiskHandler().getDisksHealthReport(false)));
+   }
+-
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+index 2541acc..6474e5a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+@@ -37,6 +37,7 @@
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.ContainerManagementProtocol;
+ import org.apache.hadoop.yarn.api.protocolrecords.GetContainerStatusesRequest;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+@@ -58,6 +59,7 @@
+ import org.apache.hadoop.yarn.server.nodemanager.LocalDirsHandlerService;
+ import org.apache.hadoop.yarn.server.nodemanager.LocalRMInterface;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeHealthCheckerService;
++import org.apache.hadoop.yarn.server.nodemanager.NodeManager;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeManager.NMContext;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdater;
+ import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdaterImpl;
+@@ -175,9 +177,10 @@ public void setup() throws IOException {
+     delSrvc.init(conf);
+ 
+     exec = createContainerExecutor();
+-    nodeHealthChecker = new NodeHealthCheckerService();
++    dirsHandler = new LocalDirsHandlerService();
++    nodeHealthChecker = new NodeHealthCheckerService(
++        NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
+     nodeHealthChecker.init(conf);
+-    dirsHandler = nodeHealthChecker.getDiskHandler();
+     containerManager = createContainerManager(delSrvc);
+     ((NMContext)context).setContainerManager(containerManager);
+     nodeStatusUpdater.init(conf);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+index 979e745..84e42fc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+@@ -43,6 +43,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.nativeio.NativeIO;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+@@ -78,6 +79,12 @@
+ 
+ public class TestContainerLogsPage {
+ 
++  private NodeHealthCheckerService createNodeHealthCheckerService(Configuration conf) {
++    NodeHealthScriptRunner scriptRunner = NodeManager.getNodeHealthScriptRunner(conf);
++    LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++    return new NodeHealthCheckerService(scriptRunner, dirsHandler);
++  }
++
+   @Test(timeout=30000)
+   public void testContainerLogDirs() throws IOException, YarnException {
+     File absLogDir = new File("target",
+@@ -85,7 +92,7 @@ public void testContainerLogDirs() throws IOException, YarnException {
+     String logdirwithFile = absLogDir.toURI().toString();
+     Configuration conf = new Configuration();
+     conf.set(YarnConfiguration.NM_LOG_DIRS, logdirwithFile);
+-    NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++    NodeHealthCheckerService healthChecker = createNodeHealthCheckerService(conf);
+     healthChecker.init(conf);
+     LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+     NMContext nmContext = new NodeManager.NMContext(null, null, dirsHandler,
+@@ -205,7 +212,7 @@ public void testContainerLogPageAccess() throws IOException {
+         "kerberos");
+       UserGroupInformation.setConfiguration(conf);
+ 
+-      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++      NodeHealthCheckerService healthChecker = createNodeHealthCheckerService(conf);
+       healthChecker.init(conf);
+       LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+       // Add an application and the corresponding containers
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
+index 372e899..f0c7cbc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServer.java
+@@ -28,6 +28,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+@@ -77,7 +78,13 @@ public void tearDown() {
+     FileUtil.fullyDelete(testRootDir);
+     FileUtil.fullyDelete(testLogDir);
+   }
+-  
++
++  private NodeHealthCheckerService createNodeHealthCheckerService(Configuration conf) {
++    NodeHealthScriptRunner scriptRunner = NodeManager.getNodeHealthScriptRunner(conf);
++    LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++    return new NodeHealthCheckerService(scriptRunner, dirsHandler);
++  }
++
+   private int startNMWebAppServer(String webAddr) {
+     Context nmContext = new NodeManager.NMContext(null, null, null, null,
+         null);
+@@ -106,7 +113,7 @@ public boolean isPmemCheckEnabled() {
+     Configuration conf = new Configuration();
+     conf.set(YarnConfiguration.NM_LOCAL_DIRS, testRootDir.getAbsolutePath());
+     conf.set(YarnConfiguration.NM_LOG_DIRS, testLogDir.getAbsolutePath());
+-    NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++    NodeHealthCheckerService healthChecker = createNodeHealthCheckerService(conf);
+     healthChecker.init(conf);
+     LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+     conf.set(YarnConfiguration.NM_WEBAPP_ADDRESS, webAddr);
+@@ -169,7 +176,7 @@ public boolean isPmemCheckEnabled() {
+     Configuration conf = new Configuration();
+     conf.set(YarnConfiguration.NM_LOCAL_DIRS, testRootDir.getAbsolutePath());
+     conf.set(YarnConfiguration.NM_LOG_DIRS, testLogDir.getAbsolutePath());
+-    NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++    NodeHealthCheckerService healthChecker = createNodeHealthCheckerService(conf);
+     healthChecker.init(conf);
+     LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServices.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServices.java
+index 61bdf10..3199c0f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServices.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServices.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+@@ -98,14 +99,16 @@
+       TestNMWebServices.class.getSimpleName() + "LogDir");
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
++
+     @Override
+     protected void configureServlets() {
+       Configuration conf = new Configuration();
+       conf.set(YarnConfiguration.NM_LOCAL_DIRS, testRootDir.getAbsolutePath());
+       conf.set(YarnConfiguration.NM_LOG_DIRS, testLogDir.getAbsolutePath());
+-      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++      dirsHandler = new LocalDirsHandlerService();
++      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService(
++          NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
+       healthChecker.init(conf);
+-      dirsHandler = healthChecker.getDiskHandler();
+       aclsManager = new ApplicationACLsManager(conf);
+       nmContext = new NodeManager.NMContext(null, null, dirsHandler,
+           aclsManager, null);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesApps.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesApps.java
+index 87aa852..e875513 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesApps.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesApps.java
+@@ -33,6 +33,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+@@ -91,11 +92,14 @@
+       TestNMWebServicesApps.class.getSimpleName() + "LogDir");
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
++
+     @Override
+     protected void configureServlets() {
+       conf.set(YarnConfiguration.NM_LOCAL_DIRS, testRootDir.getAbsolutePath());
+       conf.set(YarnConfiguration.NM_LOG_DIRS, testLogDir.getAbsolutePath());
+-      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++      LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService(
++          NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
+       healthChecker.init(conf);
+       dirsHandler = healthChecker.getDiskHandler();
+       aclsManager = new ApplicationACLsManager(conf);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesContainers.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesContainers.java
+index 62d9cb7..c11246f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesContainers.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestNMWebServicesContainers.java
+@@ -34,6 +34,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.util.NodeHealthScriptRunner;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+@@ -123,7 +124,9 @@ public boolean isPmemCheckEnabled() {
+       };
+       conf.set(YarnConfiguration.NM_LOCAL_DIRS, testRootDir.getAbsolutePath());
+       conf.set(YarnConfiguration.NM_LOG_DIRS, testLogDir.getAbsolutePath());
+-      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
++      LocalDirsHandlerService dirsHandler = new LocalDirsHandlerService();
++      NodeHealthCheckerService healthChecker = new NodeHealthCheckerService(
++          NodeManager.getNodeHealthScriptRunner(conf), dirsHandler);
+       healthChecker.init(conf);
+       dirsHandler = healthChecker.getDiskHandler();
+       aclsManager = new ApplicationACLsManager(conf);
+-- 
+1.7.9.5
+

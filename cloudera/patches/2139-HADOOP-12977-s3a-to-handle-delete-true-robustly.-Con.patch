@@ -1,0 +1,444 @@
+From ae4c5fdbf3ce6c9f92ef34b6d4707bbaa351d996 Mon Sep 17 00:00:00 2001
+From: Steve Loughran <stevel@apache.org>
+Date: Fri, 7 Oct 2016 12:51:40 +0100
+Subject: [PATCH 2139/2848] HADOOP-12977 s3a to handle delete("/", true)
+ robustly. Contributed by Steve Loughran.
+
+(cherry picked from commit ebd4f39a393e5fa9a810c6a36b749549229a53df)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRootDirectoryTest.java
+
+Change-Id: Ie5cdc8d4dba189c393a8e3d4cf8cf06a1acd5d36
+---
+ .../src/site/markdown/filesystem/filesystem.md     |   77 +++++++++++++++-----
+ .../org/apache/hadoop/fs/FileContextURIBase.java   |    4 +-
+ .../AbstractContractRootDirectoryTest.java         |   34 ++++++++-
+ .../hadoop/fs/contract/ContractTestUtils.java      |   39 ++++++++++
+ .../org/apache/hadoop/fs/s3a/S3AFileSystem.java    |   77 ++++++++++++++++----
+ 5 files changed, 197 insertions(+), 34 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+index e59fa1b..61799df 100644
+--- a/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
++++ b/hadoop-common-project/hadoop-common/src/site/markdown/filesystem/filesystem.md
+@@ -513,19 +513,40 @@ exists in the metadata, but no copies of any its blocks can be located;
+ 
+ ### `FileSystem.delete(Path P, boolean recursive)`
+ 
++Delete a path, be it a file, symbolic link or directory. The
++`recursive` flag indicates whether a recursive delete should take place —if
++unset then a non-empty directory cannot be deleted.
++
++Except in the special case of the root directory, if this API call
++completed successfully then there is nothing at the end of the path.
++That is: the outcome is desired. The return flag simply tells the caller
++whether or not any change was made to the state of the filesystem.
++
++*Note*: many uses of this method surround it with checks for the return value being
++false, raising exception if so. For example
++
++```java
++if (!fs.delete(path, true)) throw new IOException("Could not delete " + path);
++```
++
++This pattern is not needed. Code SHOULD just call `delete(path, recursive)` and
++assume the destination is no longer present —except in the special case of root
++directories, which will always remain (see below for special coverage of root directories).
++
+ #### Preconditions
+ 
+-A directory with children and recursive == false cannot be deleted
++A directory with children and `recursive == False` cannot be deleted
+ 
+     if isDir(FS, p) and not recursive and (children(FS, p) != {}) : raise IOException
+ 
++(HDFS raises `PathIsNotEmptyDirectoryException` here.)
+ 
+ #### Postconditions
+ 
+ 
+ ##### Nonexistent path
+ 
+-If the file does not exist the FS state does not change
++If the file does not exist the filesystem state does not change
+ 
+     if not exists(FS, p):
+         FS' = FS
+@@ -544,7 +565,7 @@ A path referring to a file is removed, return value: `True`
+         result = True
+ 
+ 
+-##### Empty root directory
++##### Empty root directory, `recursive == False`
+ 
+ Deleting an empty root does not change the filesystem state
+ and may return true or false.
+@@ -555,7 +576,10 @@ and may return true or false.
+ 
+ There is no consistent return code from an attempt to delete the root directory.
+ 
+-##### Empty (non-root) directory
++Implementations SHOULD return true; this avoids code which checks for a false
++return value from overreacting.
++
++##### Empty (non-root) directory `recursive == False`
+ 
+ Deleting an empty directory that is not root will remove the path from the FS and
+ return true.
+@@ -565,26 +589,41 @@ return true.
+         result = True
+ 
+ 
+-##### Recursive delete of root directory
++##### Recursive delete of non-empty root directory
+ 
+ Deleting a root path with children and `recursive==True`
+  can do one of two things.
+ 
+-The POSIX model assumes that if the user has
++1. The POSIX model assumes that if the user has
+ the correct permissions to delete everything,
+ they are free to do so (resulting in an empty filesystem).
+ 
+-    if isDir(FS, p) and isRoot(p) and recursive :
+-        FS' = ({["/"]}, {}, {}, {})
+-        result = True
++        if isDir(FS, p) and isRoot(p) and recursive :
++            FS' = ({["/"]}, {}, {}, {})
++            result = True
+ 
+-In contrast, HDFS never permits the deletion of the root of a filesystem; the
+-filesystem can be taken offline and reformatted if an empty
++1. HDFS never permits the deletion of the root of a filesystem; the
++filesystem must be taken offline and reformatted if an empty
+ filesystem is desired.
+ 
+-    if isDir(FS, p) and isRoot(p) and recursive :
+-        FS' = FS
+-        result = False
++        if isDir(FS, p) and isRoot(p) and recursive :
++            FS' = FS
++            result = False
++
++HDFS has the notion of *Protected Directories*, which are declared in
++the option `fs.protected.directories`. Any attempt to delete such a directory
++or a parent thereof raises an `AccessControlException`. Accordingly, any
++attempt to delete the root directory SHALL, if there is a protected directory,
++result in such an exception being raised.
++
++This specification does not recommend any specific action. Do note, however,
++that the POSIX model assumes that there is a permissions model such that normal
++users do not have the permission to delete that root directory; it is an action
++which only system administrators should be able to perform.
++
++Any filesystem client which interacts with a remote filesystem which lacks
++such a security model, MAY reject calls to `delete("/", true)` on the basis
++that it makes it too easy to lose data.
+ 
+ ##### Recursive delete of non-root directory
+ 
+@@ -610,16 +649,16 @@ removes the path and all descendants
+ 
+ #### Implementation Notes
+ 
+-* S3N, Swift, FTP and potentially other non-traditional FileSystems
+-implement `delete()` as recursive listing and file delete operation.
+-This can break the expectations of client applications -and means that
+-they cannot be used as drop-in replacements for HDFS.
++* Object Stores and other non-traditional filesystems onto which a directory
++ tree is emulated, tend to implement `delete()` as recursive listing and
++entry-by-entry delete operation.
++This can break the expectations of client applications for O(1) atomic directory
++deletion, preventing the stores' use as drop-in replacements for HDFS.
+ 
+ <!--  ============================================================= -->
+ <!--  METHOD: rename() -->
+ <!--  ============================================================= -->
+ 
+-
+ ### `FileSystem.rename(Path src, Path d)`
+ 
+ In terms of its specification, `rename()` is one of the most complex operations within a filesystem .
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextURIBase.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextURIBase.java
+index 4082737..9b621be 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextURIBase.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextURIBase.java
+@@ -75,7 +75,9 @@ public void setUp() throws Exception { }
+   public void tearDown() throws Exception {
+     // Clean up after test completion
+     // No need to clean fc1 as fc1 and fc2 points same location
+-    fc2.delete(BASE, true);
++    if (fc2 != null) {
++      fc2.delete(BASE, true);
++    }
+   }
+ 
+   @Test
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRootDirectoryTest.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRootDirectoryTest.java
+index 7273945..c88f160 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRootDirectoryTest.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractContractRootDirectoryTest.java
+@@ -29,6 +29,8 @@
+ 
+ import static org.apache.hadoop.fs.contract.ContractTestUtils.createFile;
+ import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
++import static org.apache.hadoop.fs.contract.ContractTestUtils.deleteChildren;
++import static org.apache.hadoop.fs.contract.ContractTestUtils.listChildren;
+ 
+ /**
+  * This class does things to the root directory.
+@@ -57,12 +59,40 @@ public void testMkDirDepth1() throws Throwable {
+   }
+ 
+   @Test
+-  public void testRmEmptyRootDirNonRecursive() throws Throwable {
++  public void testRmEmptyRootDirRecursive() throws Throwable {
+     //extra sanity checks here to avoid support calls about complete loss of data
+     skipIfUnsupported(TEST_ROOT_TESTS_ENABLED);
+     Path root = new Path("/");
+     assertIsDirectory(root);
+     boolean deleted = getFileSystem().delete(root, true);
++    LOG.info("rm -r / of empty dir result is {}", deleted);
++    assertIsDirectory(root);
++  }
++
++  @Test
++  public void testRmEmptyRootDirNonRecursive() throws Throwable {
++    // extra sanity checks here to avoid support calls about complete loss
++    // of data
++    skipIfUnsupported(TEST_ROOT_TESTS_ENABLED);
++    Path root = new Path("/");
++    assertIsDirectory(root);
++    // make sure it is clean
++    FileSystem fs = getFileSystem();
++    deleteChildren(fs, root, true);
++    FileStatus[] children = listChildren(fs, root);
++    if (children.length > 0) {
++      StringBuilder error = new StringBuilder();
++      error.append("Deletion of child entries failed, still have")
++          .append(children.length)
++          .append(System.lineSeparator());
++      for (FileStatus child : children) {
++        error.append("  ").append(child.getPath())
++            .append(System.lineSeparator());
++      }
++      fail(error.toString());
++    }
++    // then try to delete the empty one
++    boolean deleted = fs.delete(root, false);
+     LOG.info("rm / of empty dir result is {}", deleted);
+     assertIsDirectory(root);
+   }
+@@ -83,6 +113,8 @@ public void testRmNonEmptyRootDirNonRecursive() throws Throwable {
+     } catch (IOException e) {
+       //expected
+       handleExpectedException(e);
++      // and the file must still be present
++      assertIsFile(file);
+     } finally {
+       getFileSystem().delete(file, false);
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/ContractTestUtils.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/ContractTestUtils.java
+index 20ba075..9dd1688 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/ContractTestUtils.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/ContractTestUtils.java
+@@ -394,6 +394,45 @@ public static void rejectRootOperation(Path path) throws IOException {
+     rejectRootOperation(path, false);
+   }
+ 
++  /**
++   * List then delete the children of a path, but not the path itself.
++   * This can be used to delete the entries under a root path when that
++   * FS does not support {@code delete("/")}.
++   * @param fileSystem filesystem
++   * @param path path to delete
++   * @param recursive flag to indicate child entry deletion should be recursive
++   * @return the number of child entries found and deleted (not including
++   * any recursive children of those entries)
++   * @throws IOException problem in the deletion process.
++   */
++  public static int deleteChildren(FileSystem fileSystem,
++      Path path,
++      boolean recursive) throws IOException {
++    FileStatus[] children = listChildren(fileSystem, path);
++    for (FileStatus entry : children) {
++      fileSystem.delete(entry.getPath(), recursive);
++    }
++    return children.length;
++  }
++
++  /**
++   * List all children of a path, but not the path itself in the case
++   * that the path refers to a file or empty directory.
++   * @param fileSystem FS
++   * @param path path
++   * @return a list of children, and never the path itself.
++   * @throws IOException problem in the list process
++   */
++  public static FileStatus[] listChildren(FileSystem fileSystem,
++      Path path) throws IOException {
++    FileStatus[] entries = fileSystem.listStatus(path);
++    if (entries.length == 1 && path.equals(entries[0].getPath())) {
++      // this is the path: ignore
++      return new FileStatus[]{};
++    } else {
++      return entries;
++    }
++  }
+ 
+   public static void noteAction(String action) {
+     if (LOG.isDebugEnabled()) {
+diff --git a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+index 2070106..996fa28 100644
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+@@ -67,10 +67,13 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.GlobalStorageStatistics;
++import org.apache.hadoop.fs.InvalidRequestException;
+ import org.apache.hadoop.fs.LocalFileSystem;
+ import org.apache.hadoop.fs.LocatedFileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
++import org.apache.hadoop.fs.PathIOException;
++import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
+ import org.apache.hadoop.fs.RemoteIterator;
+ import org.apache.hadoop.fs.StorageStatistics;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -815,13 +818,27 @@ public void incrementWriteOperations() {
+    * operation statistics.
+    * @param key key to blob to delete.
+    */
+-  private void deleteObject(String key) {
++  private void deleteObject(String key) throws InvalidRequestException {
++    blockRootDelete(key);
+     incrementWriteOperations();
+     incrementStatistic(OBJECT_DELETE_REQUESTS);
+     s3.deleteObject(bucket, key);
+   }
+ 
+   /**
++   * Reject any request to delete an object where the key is root.
++   * @param key key to validate
++   * @throws InvalidRequestException if the request was rejected due to
++   * a mistaken attempt to delete the root directory.
++   */
++  private void blockRootDelete(String key) throws InvalidRequestException {
++    if (key.isEmpty() || "/".equals(key)) {
++      throw new InvalidRequestException("Bucket "+ bucket
++          +" cannot be deleted");
++    }
++  }
++
++  /**
+    * Perform a bulk object delete operation.
+    * Increments the {@code OBJECT_DELETE_REQUESTS} and write
+    * operation statistics.
+@@ -960,17 +977,24 @@ public void incrementPutProgressStatistics(String key, long bytes) {
+   /**
+    * A helper method to delete a list of keys on a s3-backend.
+    *
+-   * @param keysToDelete collection of keys to delete on the s3-backend
++   * @param keysToDelete collection of keys to delete on the s3-backend.
++   *        if empty, no request is made of the object store.
+    * @param clearKeys clears the keysToDelete-list after processing the list
+    *            when set to true
+    * @param deleteFakeDir indicates whether this is for deleting fake dirs
++   * @throws InvalidRequestException if the request was rejected due to
++   * a mistaken attempt to delete the root directory.
+    */
+   private void removeKeys(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+-      boolean clearKeys, boolean deleteFakeDir) throws AmazonClientException {
++      boolean clearKeys, boolean deleteFakeDir)
++      throws AmazonClientException, InvalidRequestException {
+     if (keysToDelete.isEmpty()) {
+-      // no keys
++      // exit fast if there are no keys to delete
+       return;
+     }
++    for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
++      blockRootDelete(keyVersion.getKey());
++    }
+     if (enableMultiObjectsDelete) {
+       deleteObjects(new DeleteObjectsRequest(bucket).withKeys(keysToDelete));
+     } else {
+@@ -1032,18 +1056,16 @@ private boolean innerDelete(S3AFileStatus status, boolean recursive)
+     if (status.isDirectory()) {
+       LOG.debug("delete: Path is a directory: {}", f);
+ 
+-      if (!recursive && !status.isEmptyDirectory()) {
+-        throw new IOException("Path is a folder: " + f +
+-                              " and it is not an empty directory");
+-      }
+-
+       if (!key.endsWith("/")) {
+         key = key + "/";
+       }
+ 
+       if (key.equals("/")) {
+-        LOG.info("s3a cannot delete the root directory");
+-        return false;
++        return rejectRootDirectoryDelete(status, recursive);
++      }
++
++      if (!recursive && !status.isEmptyDirectory()) {
++        throw new PathIsNotEmptyDirectoryException(f.toString());
+       }
+ 
+       if (status.isEmptyDirectory()) {
+@@ -1084,10 +1106,39 @@ private boolean innerDelete(S3AFileStatus status, boolean recursive)
+       deleteObject(key);
+     }
+ 
+-    createFakeDirectoryIfNecessary(f.getParent());
++    Path parent = f.getParent();
++    if (parent != null) {
++      createFakeDirectoryIfNecessary(parent);
++    }
+     return true;
+   }
+ 
++  /**
++   * Implements the specific logic to reject root directory deletion.
++   * The caller must return the result of this call, rather than
++   * attempt to continue with the delete operation: deleting root
++   * directories is never allowed. This method simply implements
++   * the policy of when to return an exit code versus raise an exception.
++   * @param status filesystem status
++   * @param recursive recursive flag from command
++   * @return a return code for the operation
++   * @throws PathIOException if the operation was explicitly rejected.
++   */
++  private boolean rejectRootDirectoryDelete(S3AFileStatus status,
++      boolean recursive) throws IOException {
++    LOG.info("s3a delete the {} root directory of {}", bucket, recursive);
++    boolean emptyRoot = status.isEmptyDirectory();
++    if (emptyRoot) {
++      return true;
++    }
++    if (recursive) {
++      return false;
++    } else {
++      // reject
++      throw new PathIOException(bucket, "Cannot delete root path");
++    }
++  }
++
+   private void createFakeDirectoryIfNecessary(Path f)
+       throws IOException, AmazonClientException {
+     String key = pathToKey(f);
+@@ -1563,7 +1614,7 @@ private void deleteUnnecessaryFakeDirectories(Path path) {
+     }
+     try {
+       removeKeys(keysToRemove, false, true);
+-    } catch(AmazonClientException e) {
++    } catch(AmazonClientException | InvalidRequestException e) {
+       instrumentation.errorIgnored();
+       if (LOG.isDebugEnabled()) {
+         StringBuilder sb = new StringBuilder();
+-- 
+1.7.9.5
+

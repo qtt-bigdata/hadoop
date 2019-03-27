@@ -1,0 +1,263 @@
+From f50e554157f5c8ccb509e886bf01042523f02746 Mon Sep 17 00:00:00 2001
+From: Lei Xu <lei@apache.org>
+Date: Mon, 8 Aug 2016 16:32:01 -0700
+Subject: [PATCH 1695/2848] HDFS-4176. EditLogTailer should call rollEdits
+ with a timeout. (lei)
+
+(cherry picked from commit e7c701586d8cfac73101b3358707c5ad22937879)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+
+Change-Id: I2f997abf5dc55cfe5c4ec781c7a9ad54058d5110
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    3 +
+ .../hdfs/server/namenode/ha/EditLogTailer.java     |   78 ++++++++++++++++++--
+ .../src/main/resources/hdfs-default.xml            |    7 ++
+ .../hdfs/server/namenode/ha/TestEditLogTailer.java |   45 +++++++++++
+ 4 files changed, 126 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 092e2e4..ff20f77 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -691,6 +691,9 @@
+   public static final int DFS_HA_LOGROLL_PERIOD_DEFAULT = 2 * 60; // 2m
+   public static final String DFS_HA_TAILEDITS_PERIOD_KEY = "dfs.ha.tail-edits.period";
+   public static final int DFS_HA_TAILEDITS_PERIOD_DEFAULT = 60; // 1m
++  public static final String DFS_HA_TAILEDITS_ROLLEDITS_TIMEOUT_KEY =
++      "dfs.ha.tail-edits.rolledits.timeout";
++  public static final int DFS_HA_TAILEDITS_ROLLEDITS_TIMEOUT_DEFAULT = 60; // 1m
+   public static final String DFS_HA_LOGROLL_RPC_TIMEOUT_KEY = "dfs.ha.log-roll.rpc.timeout";
+   public static final int DFS_HA_LOGROLL_RPC_TIMEOUT_DEFAULT = 20000; // 20s
+   public static final String DFS_HA_FENCE_METHODS_KEY = "dfs.ha.fencing.methods";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+index 3d72645..806e124 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+@@ -24,6 +24,15 @@
+ import java.security.PrivilegedExceptionAction;
+ import java.util.Collection;
+ 
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+@@ -42,6 +51,8 @@
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.ipc.RPC;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.ipc.StandbyException;
+ import org.apache.hadoop.security.SecurityUtil;
+ 
+ import static org.apache.hadoop.util.Time.now;
+@@ -94,6 +105,17 @@
+   private final long logRollPeriodMs;
+ 
+   /**
++   * The timeout in milliseconds of calling rollEdits RPC to Active NN.
++   * @see HDFS-4176.
++   */
++  private final long rollEditsTimeoutMs;
++
++  /**
++   * The executor to run roll edit RPC call in a daemon thread.
++   */
++  private final ExecutorService rollEditsRpcExecutor;
++
++  /**
+    * How often the Standby should check if there are new finalized segment(s)
+    * available to be read from.
+    */
+@@ -123,7 +145,14 @@ public EditLogTailer(FSNamesystem namesystem, Configuration conf) {
+     
+     sleepTimeMs = conf.getInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,
+         DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_DEFAULT) * 1000;
+-    
++
++    rollEditsTimeoutMs = conf.getInt(
++        DFSConfigKeys.DFS_HA_TAILEDITS_ROLLEDITS_TIMEOUT_KEY,
++        DFSConfigKeys.DFS_HA_TAILEDITS_ROLLEDITS_TIMEOUT_DEFAULT) * 1000;
++
++    rollEditsRpcExecutor = Executors.newSingleThreadExecutor(
++        new ThreadFactoryBuilder().setDaemon(true).build());
++
+     LOG.debug("logRollPeriodMs=" + logRollPeriodMs +
+         " sleepTime=" + sleepTimeMs);
+   }
+@@ -152,6 +181,7 @@ public void start() {
+   }
+   
+   public void stop() throws IOException {
++    rollEditsRpcExecutor.shutdown();
+     tailerThread.setShouldRun(false);
+     tailerThread.interrupt();
+     try {
+@@ -171,7 +201,7 @@ FSEditLog getEditLog() {
+   public void setEditLog(FSEditLog editLog) {
+     this.editLog = editLog;
+   }
+-  
++
+   public void catchupDuringFailover() throws IOException {
+     Preconditions.checkState(tailerThread == null ||
+         !tailerThread.isAlive(),
+@@ -265,15 +295,49 @@ private boolean tooLongSinceLastLoad() {
+   }
+ 
+   /**
++   * @return a Callable to roll logs on remote NameNode.
++   */
++  @VisibleForTesting
++  Callable<Void> getRollEditsTask() {
++    return new Callable<Void>() {
++      @Override
++      public Void call() throws IOException {
++        getActiveNodeProxy().rollEditLog();
++        return null;
++      }
++    };
++  }
++
++  /**
+    * Trigger the active node to roll its logs.
+    */
+-  private void triggerActiveLogRoll() {
+-    LOG.info("Triggering log roll on remote NameNode " + activeAddr);
++  @VisibleForTesting
++  void triggerActiveLogRoll() {
++    LOG.info("Triggering log roll on remote NameNode");
++    Future<Void> future = null;
+     try {
+-      getActiveNodeProxy().rollEditLog();
++      future = rollEditsRpcExecutor.submit(getRollEditsTask());
++      future.get(rollEditsTimeoutMs, TimeUnit.MILLISECONDS);
+       lastRollTriggerTxId = lastLoadedTxnId;
+-    } catch (IOException ioe) {
+-      LOG.warn("Unable to trigger a roll of the active NN", ioe);
++    } catch (ExecutionException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof RemoteException) {
++        IOException ioe = ((RemoteException) cause).unwrapRemoteException();
++        if (ioe instanceof StandbyException) {
++          LOG.info("Skipping log roll. Remote node is not in Active state: " +
++              ioe.getMessage().split("\n")[0]);
++          return;
++        }
++      }
++      LOG.warn("Unable to trigger a roll of the active NN", e);
++    } catch (TimeoutException e) {
++      if (future != null) {
++        future.cancel(true);
++      }
++      LOG.warn(String.format(
++          "Unable to finish rolling edits in %d ms", rollEditsTimeoutMs));
++    } catch (InterruptedException e) {
++      LOG.warn("Unable to trigger a roll of the active NN", e);
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 7df891f..cd6d60e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -1302,6 +1302,13 @@
+ </property>
+ 
+ <property>
++  <name>dfs.ha.tail-edits.rolledits.timeout</name>
++  <value>60</value>
++  <description>The timeout in seconds of calling rollEdits RPC on Active NN.
++  </description>
++</property>
++
++<property>
+   <name>dfs.ha.automatic-failover.enabled</name>
+   <value>false</value>
+   <description>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+index 8c61c92..b1fd313 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+@@ -17,11 +17,15 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode.ha;
+ 
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.when;
+ 
+ import java.io.File;
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
+@@ -42,6 +46,7 @@
+ import org.junit.Test;
+ 
+ import com.google.common.base.Supplier;
++import org.mockito.Mockito;
+ 
+ public class TestEditLogTailer {
+   
+@@ -157,4 +162,44 @@ public Boolean get() {
+       }
+     }, 100, 10000);
+   }
++
++  @Test(timeout=20000)
++  public void testRollEditTimeoutForActiveNN() throws IOException {
++    Configuration conf = new Configuration();
++    conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_ROLLEDITS_TIMEOUT_KEY, 5); // 5s
++    conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY, 1);
++
++    HAUtil.setAllowStandbyReads(conf, true);
++
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .nnTopology(MiniDFSNNTopology.simpleHATopology())
++        .numDataNodes(0)
++        .build();
++    cluster.waitActive();
++
++    cluster.transitionToActive(0);
++
++    try {
++      EditLogTailer tailer = Mockito.spy(
++          cluster.getNamesystem(1).getEditLogTailer());
++      final AtomicInteger flag = new AtomicInteger(0);
++
++      // Return a slow roll edit process.
++      when(tailer.getRollEditsTask()).thenReturn(
++          new Callable<Void>() {
++            @Override
++            public Void call() throws Exception {
++              Thread.sleep(30000);  // sleep for 30 seconds.
++              assertTrue(Thread.currentThread().isInterrupted());
++              flag.addAndGet(1);
++              return null;
++            }
++          }
++      );
++      tailer.triggerActiveLogRoll();
++      assertEquals(0, flag.get());
++    } finally {
++      cluster.shutdown();
++    }
++  }
+ }
+-- 
+1.7.9.5
+

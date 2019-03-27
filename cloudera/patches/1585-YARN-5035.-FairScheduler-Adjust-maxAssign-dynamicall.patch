@@ -1,0 +1,496 @@
+From 40dadc463f9250e215ca921ca2fe3fb713cd1ef8 Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Thu, 26 May 2016 14:41:07 -0700
+Subject: [PATCH 1585/2848] YARN-5035. FairScheduler: Adjust maxAssign
+ dynamically when assignMultiple is turned on.
+ (kasha)
+
+(cherry picked from commit 04ded558b03ee0fbf68a611cf1f25508b4447e44)
+(cherry picked from commit 59335b4d7a969378cb765b000ba1e13dabc44a3a)
+
+Conflicts:
+	hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/FairScheduler.md
+
+Change-Id: I5aedbd0e45b40daa90b78e22daacd5a480a6768b
+---
+ .../scheduler/fair/FairScheduler.java              |   33 +++++-
+ .../scheduler/fair/FairSchedulerConfiguration.java |   12 ++
+ .../scheduler/fair/TestFairScheduler.java          |   55 ++++++++-
+ .../src/site/apt/FairScheduler.apt.vm              |  119 +++++++++++---------
+ 4 files changed, 157 insertions(+), 62 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 5a56e82..50edc15 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -189,6 +189,8 @@
+   private FairSchedulerEventLog eventLog; // Machine-readable event log
+   protected boolean assignMultiple; // Allocate multiple containers per
+                                     // heartbeat
++  @VisibleForTesting
++  boolean maxAssignDynamic;
+   protected int maxAssign; // Max containers to assign per heartbeat
+ 
+   @VisibleForTesting
+@@ -1109,6 +1111,22 @@ public int compare(NodeId n1, NodeId n2) {
+     }
+   }
+ 
++  private boolean shouldContinueAssigning(int containers,
++      Resource maxResourcesToAssign, Resource assignedResource) {
++    if (!assignMultiple) {
++      return false; // assignMultiple is not enabled. Allocate one at a time.
++    }
++
++    if (maxAssignDynamic) {
++      // Using fitsIn to check if the resources assigned so far are less than
++      // or equal to max resources to assign (half of remaining resources).
++      // The "equal to" part can lead to allocating one extra container.
++      return Resources.fitsIn(assignedResource, maxResourcesToAssign);
++    } else {
++      return maxAssign <= 0 || containers < maxAssign;
++    }
++  }
++
+   @VisibleForTesting
+   synchronized void attemptScheduling(FSSchedulerNode node) {
+     if (rmContext.isWorkPreservingRecoveryEnabled()
+@@ -1137,16 +1155,22 @@ synchronized void attemptScheduling(FSSchedulerNode node) {
+     if (!validReservation) {
+       // No reservation, schedule at queue which is farthest below fair share
+       int assignedContainers = 0;
++      Resource assignedResource = Resources.clone(Resources.none());
++      Resource maxResourcesToAssign =
++          Resources.multiply(node.getAvailableResource(), 0.5f);
+       while (node.getReservedContainer() == null) {
+         boolean assignedContainer = false;
+-        if (!queueMgr.getRootQueue().assignContainer(node).equals(
+-            Resources.none())) {
++        Resource assignment = queueMgr.getRootQueue().assignContainer(node);
++        if (!assignment.equals(Resources.none())) {
+           assignedContainers++;
+           assignedContainer = true;
++          Resources.addTo(assignedResource, assignment);
+         }
+         if (!assignedContainer) { break; }
+-        if (!assignMultiple) { break; }
+-        if ((assignedContainers >= maxAssign) && (maxAssign > 0)) { break; }
++        if (!shouldContinueAssigning(assignedContainers,
++            maxResourcesToAssign, assignedResource)) {
++          break;
++        }
+       }
+     }
+     updateRootQueueMetrics();
+@@ -1320,6 +1344,7 @@ private void initScheduler(Configuration conf) throws IOException {
+       preemptionUtilizationThreshold =
+           this.conf.getPreemptionUtilizationThreshold();
+       assignMultiple = this.conf.getAssignMultiple();
++      maxAssignDynamic = this.conf.isMaxAssignDynamic();
+       maxAssign = this.conf.getMaxAssign();
+       sizeBasedWeight = this.conf.getSizeBasedWeight();
+       preemptionInterval = this.conf.getPreemptionInterval();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerConfiguration.java
+index c679aa4..afabb14 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairSchedulerConfiguration.java
+@@ -128,6 +128,14 @@
+   protected static final boolean DEFAULT_SIZE_BASED_WEIGHT = false;
+ 
+   /** Maximum number of containers to assign on each check-in. */
++  public static final String DYNAMIC_MAX_ASSIGN =
++      CONF_PREFIX + "dynamic.max.assign";
++  private static final boolean DEFAULT_DYNAMIC_MAX_ASSIGN = true;
++
++  /**
++   * Specify exact number of containers to assign on each heartbeat, if dynamic
++   * max assign is turned off.
++   */
+   protected static final String MAX_ASSIGN = CONF_PREFIX + "max.assign";
+   protected static final int DEFAULT_MAX_ASSIGN = -1;
+ 
+@@ -221,6 +229,10 @@ public boolean getAssignMultiple() {
+     return getBoolean(ASSIGN_MULTIPLE, DEFAULT_ASSIGN_MULTIPLE);
+   }
+ 
++  public boolean isMaxAssignDynamic() {
++    return getBoolean(DYNAMIC_MAX_ASSIGN, DEFAULT_DYNAMIC_MAX_ASSIGN);
++  }
++
+   public int getMaxAssign() {
+     return getInt(MAX_ASSIGN, DEFAULT_MAX_ASSIGN);
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 970cd33..ad1667c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -988,6 +988,7 @@ public void testReservationThresholdWithAssignMultiple() throws Exception {
+     // set reservable-nodes to 0 which make reservation exceed
+     conf.setFloat(FairSchedulerConfiguration.RESERVABLE_NODES, 0f);
+     conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE, true);
++    conf.setBoolean(FairSchedulerConfiguration.DYNAMIC_MAX_ASSIGN, false);
+     scheduler.init(conf);
+     scheduler.start();
+     scheduler.reinitialize(conf, resourceManager.getRMContext());
+@@ -3603,8 +3604,9 @@ public void testFifoWithinQueue() throws Exception {
+   }
+ 
+   @Test(timeout = 3000)
+-  public void testMaxAssign() throws Exception {
++  public void testFixedMaxAssign() throws Exception {
+     conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE, true);
++    conf.setBoolean(FairSchedulerConfiguration.DYNAMIC_MAX_ASSIGN, false);
+     scheduler.init(conf);
+     scheduler.start();
+     scheduler.reinitialize(conf, resourceManager.getRMContext());
+@@ -3634,10 +3636,59 @@ public void testMaxAssign() throws Exception {
+     assertEquals("Incorrect number of containers allocated", 8, app
+         .getLiveContainers().size());
+   }
+-  
++
++
++  /**
++   * Test to verify the behavior of dynamic-max-assign.
++   * 1. Verify the value of maxassign doesn't affect number of containers
++   * affected.
++   * 2. Verify the node is fully allocated.
++   */
++  @Test(timeout = 3000)
++  public void testDynamicMaxAssign() throws Exception {
++    conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE, true);
++    scheduler.init(conf);
++    scheduler.start();
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++
++    RMNode node =
++        MockNodes.newNodeInfo(1, Resources.createResource(8192, 8), 0,
++            "127.0.0.1");
++    NodeAddedSchedulerEvent nodeEvent = new NodeAddedSchedulerEvent(node);
++    NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node);
++    scheduler.handle(nodeEvent);
++
++    ApplicationAttemptId attId =
++        createSchedulingRequest(1024, 1, "root.default", "user", 12);
++    FSAppAttempt app = scheduler.getSchedulerApp(attId);
++
++    // Set maxassign to a value smaller than half the remaining resources
++    scheduler.maxAssign = 2;
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    // New container allocations should be floor(8/2) + 1 = 5
++    assertEquals("Incorrect number of containers allocated", 5,
++        app.getLiveContainers().size());
++
++    // Set maxassign to a value larger than half the remaining resources
++    scheduler.maxAssign = 4;
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    // New container allocations should be floor(3/2) + 1 = 2
++    assertEquals("Incorrect number of containers allocated", 7,
++        app.getLiveContainers().size());
++
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    // New container allocations should be 1
++    assertEquals("Incorrect number of containers allocated", 8,
++        app.getLiveContainers().size());
++  }
++
+   @Test(timeout = 3000)
+   public void testMaxAssignWithZeroMemoryContainers() throws Exception {
+     conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE, true);
++    conf.setBoolean(FairSchedulerConfiguration.DYNAMIC_MAX_ASSIGN, false);
+     conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 0);
+     
+     scheduler.init(conf);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/apt/FairScheduler.apt.vm b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/apt/FairScheduler.apt.vm
+index 2e4c13a..e25fcbe 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/apt/FairScheduler.apt.vm
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/apt/FairScheduler.apt.vm
+@@ -20,14 +20,14 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+ 
+ %{toc|section=1|fromDepth=0}
+ 
+-* {Purpose} 
++* {Purpose}
+ 
+-  This document describes the <<<FairScheduler>>>, a pluggable scheduler for Hadoop 
++  This document describes the <<<FairScheduler>>>, a pluggable scheduler for Hadoop
+   that allows YARN applications to share resources in large clusters fairly.
+ 
+ * {Introduction}
+ 
+-  Fair scheduling is a method of assigning resources to applications such that 
++  Fair scheduling is a method of assigning resources to applications such that
+   all apps get, on average, an equal share of resources over time.
+   Hadoop NextGen is capable of scheduling multiple resource types. By default,
+   the Fair Scheduler bases scheduling fairness decisions only on memory. It
+@@ -39,7 +39,7 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+   Hadoop scheduler, which forms a queue of apps, this lets short apps finish in
+   reasonable time while not starving long-lived apps. It is also a reasonable way
+   to share a cluster between a number of users. Finally, fair sharing can also
+-  work with app priorities - the priorities are used as weights to determine the 
++  work with app priorities - the priorities are used as weights to determine the
+   fraction of total resources that each app should get.
+ 
+   The scheduler organizes apps further into "queues", and shares resources
+@@ -53,23 +53,23 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+   configured. Queues can be arranged in a hierarchy to divide resources and
+   configured with weights to share the cluster in specific proportions.
+ 
+-  In addition to providing fair sharing, the Fair Scheduler allows assigning 
+-  guaranteed minimum shares to queues, which is useful for ensuring that 
+-  certain users, groups or production applications always get sufficient 
+-  resources. When a queue contains apps, it gets at least its minimum share, 
+-  but when the queue does not need its full guaranteed share, the excess is 
+-  split between other running apps. This lets the scheduler guarantee capacity 
++  In addition to providing fair sharing, the Fair Scheduler allows assigning
++  guaranteed minimum shares to queues, which is useful for ensuring that
++  certain users, groups or production applications always get sufficient
++  resources. When a queue contains apps, it gets at least its minimum share,
++  but when the queue does not need its full guaranteed share, the excess is
++  split between other running apps. This lets the scheduler guarantee capacity
+   for queues while utilizing resources efficiently when these queues don't
+   contain applications.
+ 
+-  The Fair Scheduler lets all apps run by default, but it is also possible to 
+-  limit the number of running apps per user and per queue through the config 
+-  file. This can be useful when a user must submit hundreds of apps at once, 
+-  or in general to improve performance if running too many apps at once would 
++  The Fair Scheduler lets all apps run by default, but it is also possible to
++  limit the number of running apps per user and per queue through the config
++  file. This can be useful when a user must submit hundreds of apps at once,
++  or in general to improve performance if running too many apps at once would
+   cause too much intermediate data to be created or too much context-switching.
+-  Limiting the apps does not cause any subsequently submitted apps to fail, 
+-  only to wait in the scheduler's queue until some of the user's earlier apps 
+-  finish. 
++  Limiting the apps does not cause any subsequently submitted apps to fail,
++  only to wait in the scheduler's queue until some of the user's earlier apps
++  finish.
+ 
+ * {Hierarchical queues with pluggable policies}
+ 
+@@ -78,9 +78,9 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+   of the root queue in the typical fair scheduling fashion. Then, the children
+   distribute the resources assigned to them to their children in the same
+   fashion.  Applications may only be scheduled on leaf queues. Queues can be
+-  specified as children of other queues by placing them as sub-elements of 
++  specified as children of other queues by placing them as sub-elements of
+   their parents in the fair scheduler allocation file.
+-  
++
+   A queue's name starts with the names of its parents, with periods as
+   separators. So a queue named "queue1" under the root queue, would be referred
+   to as "root.queue1", and a queue named "queue2" under a queue named "parent1"
+@@ -95,9 +95,9 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+   FifoPolicy, FairSharePolicy (default), and DominantResourceFairnessPolicy are
+   built-in and can be readily used.
+ 
+-  Certain add-ons are not yet supported which existed in the original (MR1) 
+-  Fair Scheduler. Among them, is the use of a custom policies governing 
+-  priority "boosting" over  certain apps. 
++  Certain add-ons are not yet supported which existed in the original (MR1)
++  Fair Scheduler. Among them, is the use of a custom policies governing
++  priority "boosting" over  certain apps.
+ 
+ * {Automatically placing applications in queues}
+ 
+@@ -111,7 +111,7 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+ 
+ * {Installation}
+ 
+-  To use the Fair Scheduler first assign the appropriate scheduler class in 
++  To use the Fair Scheduler first assign the appropriate scheduler class in
+   yarn-site.xml:
+ 
+ ------
+@@ -123,10 +123,10 @@ Hadoop MapReduce Next Generation - Fair Scheduler
+ 
+ * {Configuration}
+ 
+-  Customizing the Fair Scheduler typically involves altering two files. First, 
+-  scheduler-wide options can be set by adding configuration properties in the 
+-  yarn-site.xml file in your existing configuration directory. Second, in 
+-  most cases users will want to create an allocation file listing which queues 
++  Customizing the Fair Scheduler typically involves altering two files. First,
++  scheduler-wide options can be set by adding configuration properties in the
++  yarn-site.xml file in your existing configuration directory. Second, in
++  most cases users will want to create an allocation file listing which queues
+   exist and their respective weights and capacities. The allocation file
+   is reloaded every 10 seconds, allowing changes to be made on the fly.
+ 
+@@ -143,8 +143,8 @@ Properties that can be placed in yarn-site.xml
+ 
+  * <<<yarn.scheduler.fair.user-as-default-queue>>>
+ 
+-    * Whether to use the username associated with the allocation as the default 
+-      queue name, in the event that a queue name is not specified. If this is set 
++    * Whether to use the username associated with the allocation as the default
++      queue name, in the event that a queue name is not specified. If this is set
+       to "false" or unset, all jobs have a shared default queue, named "default".
+       Defaults to true.  If a queue placement policy is given in the allocations
+       file, this property is ignored.
+@@ -160,7 +160,7 @@ Properties that can be placed in yarn-site.xml
+       all resources. Defaults to 0.8f.
+ 
+  * <<<yarn.scheduler.fair.sizebasedweight>>>
+-  
++
+     * Whether to assign shares to individual apps based on their size, rather than
+       providing an equal share to all apps regardless of size. When set to true,
+       apps are weighted by the natural logarithm of one plus the app's total
+@@ -171,10 +171,18 @@ Properties that can be placed in yarn-site.xml
+     * Whether to allow multiple container assignments in one heartbeat. Defaults
+       to false.
+ 
++ * <<<yarn.scheduler.fair.dynamic.max.assign>>>
++
++    * If assignmultiple is true, whether to dynamically determine the amount of
++      resources that can be assigned in one heartbeat. When turned on, about
++      half of the un-allocated resources on the node are allocated to containers
++      in a single heartbeat. Defaults to true.
++
+  * <<<yarn.scheduler.fair.max.assign>>>
+ 
+-    * If assignmultiple is true, the maximum amount of containers that can be
+-      assigned in one heartbeat. Defaults to -1, which sets no limit.
++    * If assignmultiple is true and dynamic-max-assign is false, the maximum
++      amount of containers that can be assigned in one heartbeat. Defaults to
++      -1, which sets no limit.
+ 
+  * <<<yarn.scheduler.fair.locality.threshold.node>>>
+ 
+@@ -205,10 +213,10 @@ Properties that can be placed in yarn-site.xml
+       allocations file, this property is ignored.
+ 
+  * <<<yarn.scheduler.fair.update-interval-ms>>>
+- 
++
+     * The interval at which to lock the scheduler and recalculate fair shares,
+       recalculate demand, and check whether anything is due for preemption.
+-      Defaults to 500 ms. 
++      Defaults to 500 ms.
+ 
+ Allocation file format
+ 
+@@ -253,7 +261,7 @@ Allocation file format
+ 
+    * schedulingPolicy: to set the scheduling policy of any queue. The allowed
+      values are "fifo"/"fair"/"drf" or any class that extends
+-     <<<org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.SchedulingPolicy>>>. 
++     <<<org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.SchedulingPolicy>>>.
+      Defaults to "fair". If "fifo", apps with earlier submit times are given preference
+      for containers, but apps submitted later may run concurrently if there is
+      leftover space on the cluster after satisfying the earlier app's requests.
+@@ -281,11 +289,11 @@ Allocation file format
+      containers to take resources from other queues. If not set, the queue will
+      inherit the value from its parent queue.
+ 
+- * <<User elements>>, which represent settings governing the behavior of individual 
+-     users. They can contain a single property: maxRunningApps, a limit on the 
++ * <<User elements>>, which represent settings governing the behavior of individual
++     users. They can contain a single property: maxRunningApps, a limit on the
+      number of running apps for a particular user.
+ 
+- * <<A userMaxAppsDefault element>>, which sets the default running app limit 
++ * <<A userMaxAppsDefault element>>, which sets the default running app limit
+    for any users whose limit is not otherwise specified.
+ 
+  * <<A defaultFairSharePreemptionTimeout element>>, which sets the fair share
+@@ -342,14 +350,14 @@ Allocation file format
+ 
+      * nestedUserQueue : the app is placed into a queue with the name of the user
+        under the queue suggested by the nested rule. This is similar to ‘user’
+-       rule,the difference being in 'nestedUserQueue' rule,user queues can be created 
++       rule,the difference being in 'nestedUserQueue' rule,user queues can be created
+        under any parent queue, while 'user' rule creates user queues only under root queue.
+-       Note that nestedUserQueue rule would be applied only if the nested rule returns a 
++       Note that nestedUserQueue rule would be applied only if the nested rule returns a
+        parent queue.One can configure a parent queue either by setting 'type' attribute of queue
+        to 'parent' or by configuring at least one leaf under that queue which makes it a parent.
+-       See example allocation for a sample use case. 
++       See example allocation for a sample use case.
+ 
+-     * default: the app is placed into the queue specified in the 'queue' attribute of the 
++     * default: the app is placed into the queue specified in the 'queue' attribute of the
+        default rule. If 'queue' attribute is not specified, the app is placed into 'root.default' queue.
+ 
+      * reject: the app is rejected.
+@@ -379,12 +387,12 @@ Allocation file format
+   <queue name="secondary_group_queue" type="parent">
+   <weight>3.0</weight>
+   </queue>
+-  
++
+   <user name="sample_user">
+     <maxRunningApps>30</maxRunningApps>
+   </user>
+   <userMaxAppsDefault>5</userMaxAppsDefault>
+-  
++
+   <queuePlacementPolicy>
+     <rule name="specified" />
+     <rule name="primaryGroup" create="false" />
+@@ -412,15 +420,15 @@ Queue Access Control Lists (ACLs)
+   is inside queue1, and user1 is in queue1's ACL, and user2 is in queue2's
+   ACL, then both users may submit to queue2.
+ 
+-  <<Note:>> The delimiter is a space character. To specify only ACL groups, begin the 
+-  value with a space character. 
+-  
++  <<Note:>> The delimiter is a space character. To specify only ACL groups, begin the
++  value with a space character.
++
+   The root queue's ACLs are "*" by default which, because ACLs are passed down,
+   means that everybody may submit to and kill applications from every queue.
+   To start restricting access, change the root queue's ACLs to something other
+-  than "*". 
++  than "*".
++
+ 
+-  
+ * {Administration}
+ 
+   The fair scheduler provides support for administration at runtime through a few mechanisms:
+@@ -439,19 +447,19 @@ Monitoring through web UI
+   http://<ResourceManager URL>/cluster/scheduler.
+ 
+   The following fields can be seen for each queue on the web interface:
+-  
+- * Used Resources - The sum of resources allocated to containers within the queue. 
++
++ * Used Resources - The sum of resources allocated to containers within the queue.
+ 
+  * Num Active Applications - The number of applications in the queue that have
+    received at least one container.
+- 
++
+  * Num Pending Applications - The number of applications in the queue that have
+    not yet received any containers.
+ 
+  * Min Resources - The configured minimum resources that are guaranteed to the queue.
+-  	
++
+  * Max Resources - The configured maximum resources that are allowed to the queue.
+- 
++
+  * Instantaneous Fair Share - The queue's instantaneous fair share of resources.
+    These shares consider only actives queues (those with running applications),
+    and are used for scheduling decisions. Queues may be allocated resources
+@@ -473,10 +481,9 @@ Moving applications between queues
+   queue, or for moving an unimportant application to a lower priority queue.
+   Apps can be moved by running "yarn application -movetoqueue appID -queue
+   targetQueueName".
+-  
++
+   When an application is moved to a queue, its existing allocations become
+   counted with the new queue's allocations instead of the old for purposes
+   of determining fairness. An attempt to move an application to a queue will
+   fail if the addition of the app's resources to that queue would violate the
+   its maxRunningApps or maxResources constraints.
+-
+-- 
+1.7.9.5
+

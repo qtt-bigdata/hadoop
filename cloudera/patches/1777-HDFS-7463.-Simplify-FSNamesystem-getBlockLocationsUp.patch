@@ -1,0 +1,374 @@
+From 48462d6a65a54f43d365d45066431493ad63d1b9 Mon Sep 17 00:00:00 2001
+From: Haohui Mai <wheat9@apache.org>
+Date: Wed, 10 Dec 2014 23:01:17 -0800
+Subject: [PATCH 1777/2848] HDFS-7463. Simplify
+ FSNamesystem#getBlockLocationsUpdateTimes.
+ Contributed by Haohui Mai.
+
+(cherry picked from commit 9e1c05981506dade56654dbf18f9d63cb6629532)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+
+Change-Id: I0d469f7e5ab6d40f703c1171c9fb0006466bb8a8
+---
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |  224 +++++++++-----------
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |    9 +-
+ .../java/org/apache/hadoop/hdfs/TestGetBlocks.java |    4 +-
+ .../hdfs/server/namenode/NameNodeAdapter.java      |    4 +-
+ .../hadoop/hdfs/server/namenode/TestFsck.java      |    6 +-
+ 5 files changed, 118 insertions(+), 129 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 280cd43..655ab8f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1846,27 +1846,76 @@ private void setOwnerInt(final String srcArg, String username, String group)
+     logAuditEvent(true, "setOwner", srcArg, null, resultingStat);
+   }
+ 
++  static class GetBlockLocationsResult {
++    final INodesInPath iip;
++    final LocatedBlocks blocks;
++    boolean updateAccessTime() {
++      return iip != null;
++    }
++    private GetBlockLocationsResult(INodesInPath iip, LocatedBlocks blocks) {
++      this.iip = iip;
++      this.blocks = blocks;
++    }
++  }
++
+   /**
+    * Get block locations within the specified range.
+    * @see ClientProtocol#getBlockLocations(String, long, long)
+    */
+   LocatedBlocks getBlockLocations(String clientMachine, String src,
+-      long offset, long length) throws AccessControlException,
+-      FileNotFoundException, UnresolvedLinkException, IOException {
+-    LocatedBlocks blocks = getBlockLocations(src, offset, length, true, true,
+-        true);
++      long offset, long length) throws IOException {
++    checkOperation(OperationCategory.READ);
++    GetBlockLocationsResult res = null;
++    readLock();
++    try {
++      checkOperation(OperationCategory.READ);
++      res = getBlockLocations(src, offset, length, true, true);
++    } catch (AccessControlException e) {
++      logAuditEvent(false, "open", src);
++      throw e;
++    } finally {
++      readUnlock();
++    }
++
++    logAuditEvent(true, "open", src);
++
++    if (res == null) {
++      return null;
++    }
++
++    if (res.updateAccessTime()) {
++      writeLock();
++      final long now = now();
++      try {
++        checkOperation(OperationCategory.WRITE);
++        INode inode = res.iip.getLastINode();
++        boolean updateAccessTime = now > inode.getAccessTime() +
++            getAccessTimePrecision();
++        if (!isInSafeMode() && updateAccessTime) {
++          boolean changed = dir.setTimes(
++              inode, -1, now, false, res.iip.getLatestSnapshotId());
++          if (changed) {
++            getEditLog().logTimes(src, -1, now);
++          }
++        }
++      } catch (Throwable e) {
++        LOG.warn("Failed to update the access time of " + src, e);
++      } finally {
++        writeUnlock();
++      }
++    }
++
++    LocatedBlocks blocks = res.blocks;
+     if (blocks != null) {
+-      blockManager.getDatanodeManager().sortLocatedBlocks(clientMachine,
+-          blocks.getLocatedBlocks());
++      blockManager.getDatanodeManager().sortLocatedBlocks(
++          clientMachine, blocks.getLocatedBlocks());
+ 
+       // lastBlock is not part of getLocatedBlocks(), might need to sort it too
+       LocatedBlock lastBlock = blocks.getLastLocatedBlock();
+       if (lastBlock != null) {
+-        ArrayList<LocatedBlock> lastBlockList =
+-            Lists.newArrayListWithCapacity(1);
+-        lastBlockList.add(lastBlock);
+-        blockManager.getDatanodeManager().sortLocatedBlocks(clientMachine,
+-            lastBlockList);
++        ArrayList<LocatedBlock> lastBlockList = Lists.newArrayList(lastBlock);
++        blockManager.getDatanodeManager().sortLocatedBlocks(
++            clientMachine, lastBlockList);
+       }
+     }
+     return blocks;
+@@ -1875,24 +1924,11 @@ LocatedBlocks getBlockLocations(String clientMachine, String src,
+   /**
+    * Get block locations within the specified range.
+    * @see ClientProtocol#getBlockLocations(String, long, long)
+-   * @throws FileNotFoundException, UnresolvedLinkException, IOException
++   * @throws IOException
+    */
+-  LocatedBlocks getBlockLocations(String src, long offset, long length,
+-      boolean doAccessTime, boolean needBlockToken, boolean checkSafeMode)
+-      throws FileNotFoundException, UnresolvedLinkException, IOException {
+-    try {
+-      return getBlockLocationsInt(src, offset, length, doAccessTime,
+-                                  needBlockToken, checkSafeMode);
+-    } catch (AccessControlException e) {
+-      logAuditEvent(false, "open", src);
+-      throw e;
+-    }
+-  }
+-
+-  private LocatedBlocks getBlockLocationsInt(String src, long offset,
+-      long length, boolean doAccessTime, boolean needBlockToken,
+-      boolean checkSafeMode)
+-      throws FileNotFoundException, UnresolvedLinkException, IOException {
++  GetBlockLocationsResult getBlockLocations(
++      String src, long offset, long length, boolean needBlockToken,
++      boolean checkSafeMode) throws IOException {
+     if (offset < 0) {
+       throw new HadoopIllegalArgumentException(
+           "Negative offset is not supported. File: " + src);
+@@ -1901,16 +1937,16 @@ private LocatedBlocks getBlockLocationsInt(String src, long offset,
+       throw new HadoopIllegalArgumentException(
+           "Negative length is not supported. File: " + src);
+     }
+-    final LocatedBlocks ret = getBlockLocationsUpdateTimes(src,
+-        offset, length, doAccessTime, needBlockToken);  
+-    logAuditEvent(true, "open", src);
++    final GetBlockLocationsResult ret = getBlockLocationsInt(
++        src, offset, length, needBlockToken);
++
+     if (checkSafeMode && isInSafeMode()) {
+-      for (LocatedBlock b : ret.getLocatedBlocks()) {
++      for (LocatedBlock b : ret.blocks.getLocatedBlocks()) {
+         // if safemode & no block locations yet then throw safemodeException
+         if ((b.getLocations() == null) || (b.getLocations().length == 0)) {
+           SafeModeException se = new SafeModeException(
+               "Zero blocklocations for " + src, safeMode);
+-          if (haEnabled && haContext != null && 
++          if (haEnabled && haContext != null &&
+               haContext.getState().getServiceState() == HAServiceState.ACTIVE) {
+             throw new RetriableException(se);
+           } else {
+@@ -1922,98 +1958,50 @@ private LocatedBlocks getBlockLocationsInt(String src, long offset,
+     return ret;
+   }
+ 
+-  /*
+-   * Get block locations within the specified range, updating the
+-   * access times if necessary. 
+-   */
+-  private LocatedBlocks getBlockLocationsUpdateTimes(final String srcArg,
+-      long offset, long length, boolean doAccessTime, boolean needBlockToken)
+-      throws FileNotFoundException,
+-      UnresolvedLinkException, IOException {
++  private GetBlockLocationsResult getBlockLocationsInt(
++      final String srcArg, long offset, long length, boolean needBlockToken)
++      throws IOException {
+     String src = srcArg;
+     FSPermissionChecker pc = getPermissionChecker();
+     byte[][] pathComponents = FSDirectory.getPathComponentsForReservedPath(src);
+-    for (int attempt = 0; attempt < 2; attempt++) {
+-      boolean isReadOp = (attempt == 0);
+-      if (isReadOp) { // first attempt is with readlock
+-        checkOperation(OperationCategory.READ);
+-        readLock();
+-      }  else { // second attempt is with  write lock
+-        checkOperation(OperationCategory.WRITE);
+-        writeLock(); // writelock is needed to set accesstime
+-      }
+-      try {
+-        src = resolvePath(src, pathComponents);
+-        if (isReadOp) {
+-          checkOperation(OperationCategory.READ);
+-        } else {
+-          checkOperation(OperationCategory.WRITE);
+-        }
+-        if (isPermissionEnabled) {
+-          checkPathAccess(pc, src, FsAction.READ);
+-        }
++    src = resolvePath(src, pathComponents);
++    final INodesInPath iip = dir.getINodesInPath(src, true);
++    final INode[] inodes = iip.getINodes();
++    final INodeFile inode = INodeFile.valueOf(inodes[inodes.length - 1], src);
++    if (isPermissionEnabled) {
++      checkPathAccess(pc, src, FsAction.READ);
++      checkUnreadableBySuperuser(pc, inode, iip.getPathSnapshotId());
++    }
+ 
+-        // if the namenode is in safemode, then do not update access time
+-        if (isInSafeMode()) {
+-          doAccessTime = false;
+-        }
++    final long fileSize = iip.isSnapshot()
++        ? inode.computeFileSize(iip.getPathSnapshotId())
++        : inode.computeFileSizeNotIncludingLastUcBlock();
++    boolean isUc = inode.isUnderConstruction();
++    if (iip.isSnapshot()) {
++      // if src indicates a snapshot file, we need to make sure the returned
++      // blocks do not exceed the size of the snapshot file.
++      length = Math.min(length, fileSize - offset);
++      isUc = false;
++    }
+ 
+-        final INodesInPath iip = dir.getINodesInPath(src, true);
+-        final INode[] inodes = iip.getINodes();
+-        final INodeFile inode = INodeFile.valueOf(
+-            inodes[inodes.length - 1], src);
+-        if (isPermissionEnabled) {
+-          checkUnreadableBySuperuser(pc, inode, iip.getPathSnapshotId());
+-        }
+-        if (!iip.isSnapshot() //snapshots are readonly, so don't update atime.
+-            && doAccessTime && isAccessTimeSupported()) {
+-          final long now = now();
+-          if (now > inode.getAccessTime() + getAccessTimePrecision()) {
+-            // if we have to set access time but we only have the readlock, then
+-            // restart this entire operation with the writeLock.
+-            if (isReadOp) {
+-              continue;
+-            }
+-            boolean changed = dir.setTimes(inode, -1, now, false,
+-                    iip.getLatestSnapshotId());
+-            if (changed) {
+-              getEditLog().logTimes(src, -1, now);
+-            }
+-          }
+-        }
+-        final long fileSize = iip.isSnapshot() ?
+-            inode.computeFileSize(iip.getPathSnapshotId())
+-            : inode.computeFileSizeNotIncludingLastUcBlock();
+-        boolean isUc = inode.isUnderConstruction();
+-        if (iip.isSnapshot()) {
+-          // if src indicates a snapshot file, we need to make sure the returned
+-          // blocks do not exceed the size of the snapshot file.
+-          length = Math.min(length, fileSize - offset);
+-          isUc = false;
+-        }
++    final FileEncryptionInfo feInfo =
++        FSDirectory.isReservedRawName(srcArg) ? null
++            : dir.getFileEncryptionInfo(inode, iip.getPathSnapshotId(), iip);
+ 
+-        final FileEncryptionInfo feInfo =
+-          FSDirectory.isReservedRawName(srcArg) ?
+-          null : dir.getFileEncryptionInfo(inode, iip.getPathSnapshotId(),
+-              iip);
+-
+-        final LocatedBlocks blocks =
+-          blockManager.createLocatedBlocks(inode.getBlocks(), fileSize,
+-            isUc, offset, length, needBlockToken, iip.isSnapshot(), feInfo);
+-        // Set caching information for the located blocks.
+-        for (LocatedBlock lb: blocks.getLocatedBlocks()) {
+-          cacheManager.setCachedLocations(lb);
+-        }
+-        return blocks;
+-      } finally {
+-        if (isReadOp) {
+-          readUnlock();
+-        } else {
+-          writeUnlock();
+-        }
+-      }
++    final LocatedBlocks blocks = blockManager.createLocatedBlocks(
++        inode.getBlocks(), fileSize, isUc, offset, length, needBlockToken,
++        iip.isSnapshot(), feInfo);
++
++    // Set caching information for the located blocks.
++    for (LocatedBlock lb : blocks.getLocatedBlocks()) {
++      cacheManager.setCachedLocations(lb);
+     }
+-    return null; // can never reach here
++
++    final long now = now();
++    boolean updateAccessTime = isAccessTimeSupported() && !isInSafeMode()
++        && !iip.isSnapshot()
++        && now > inode.getAccessTime() + getAccessTimePrecision();
++    return new GetBlockLocationsResult(updateAccessTime ? iip : null, blocks);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 3c9cd74..0bdac52 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -450,12 +450,15 @@ void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+     long fileLen = file.getLen();
+     // Get block locations without updating the file access time
+     // and without block access tokens
+-    LocatedBlocks blocks;
++    LocatedBlocks blocks = null;
++    FSNamesystem fsn = namenode.getNamesystem();
++    fsn.readLock();
+     try {
+-      blocks = namenode.getNamesystem().getBlockLocations(path, 0,
+-          fileLen, false, false, false);
++      blocks = fsn.getBlockLocations(path, 0, fileLen, false, false).blocks;
+     } catch (FileNotFoundException fnfe) {
+       blocks = null;
++    } finally {
++      fsn.readUnlock();
+     }
+     if (blocks == null) { // the file is deleted
+       return;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
+index d64c50c..d331de9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
+@@ -169,9 +169,7 @@ public void testReadSelectNonStaleDatanode() throws Exception {
+       if (stm != null) {
+         stm.close();
+       }
+-      if (client != null) {
+-        client.close();
+-      }
++      client.close();
+       cluster.shutdown();
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
+index 790a64e..d589e55 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NameNodeAdapter.java
+@@ -63,8 +63,8 @@ public static FSNamesystem getNamesystem(NameNode namenode) {
+    */
+   public static LocatedBlocks getBlockLocations(NameNode namenode,
+       String src, long offset, long length) throws IOException {
+-    return namenode.getNamesystem().getBlockLocations(
+-        src, offset, length, false, true, true);
++    return namenode.getNamesystem().getBlockLocations("foo",
++        src, offset, length);
+   }
+   
+   public static HdfsFileStatus getFileInfo(NameNode namenode, String src,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index f9a6edc..6b866ff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -1024,9 +1024,9 @@ public void testFsckFileNotFound() throws Exception {
+     DatanodeManager dnManager = mock(DatanodeManager.class);
+     
+     when(namenode.getNamesystem()).thenReturn(fsName);
+-    when(fsName.getBlockLocations(anyString(), anyLong(), anyLong(),
+-        anyBoolean(), anyBoolean(), anyBoolean())).
+-        thenThrow(new FileNotFoundException()) ;
++    when(fsName.getBlockLocations(
++        anyString(), anyLong(), anyLong(), anyBoolean(), anyBoolean()))
++        .thenThrow(new FileNotFoundException());
+     when(fsName.getBlockManager()).thenReturn(blockManager);
+     when(blockManager.getDatanodeManager()).thenReturn(dnManager);
+ 
+-- 
+1.7.9.5
+

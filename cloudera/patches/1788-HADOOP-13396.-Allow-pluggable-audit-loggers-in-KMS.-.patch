@@ -1,0 +1,750 @@
+From 789a1214ab70da577ba05353521c33946814815e Mon Sep 17 00:00:00 2001
+From: Xiao Chen <xiao@apache.org>
+Date: Wed, 24 Aug 2016 10:14:46 -0700
+Subject: [PATCH 1788/2848] HADOOP-13396. Allow pluggable audit loggers in
+ KMS. Contributed by Xiao Chen
+
+(cherry picked from commit 3476156807733505746951f0c9346592742bbbb2)
+
+Conflicts:
+	hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+
+Change-Id: Ic75e1fc0b72f0065f525db5cb4ddc7d4afad9afc
+---
+ .../hadoop-kms/src/main/conf/kms-site.xml          |   10 +
+ .../hadoop/crypto/key/kms/server/KMSAudit.java     |  200 +++++++++++---------
+ .../crypto/key/kms/server/KMSAuditLogger.java      |  154 +++++++++++++++
+ .../crypto/key/kms/server/KMSConfiguration.java    |    4 +
+ .../hadoop/crypto/key/kms/server/KMSWebApp.java    |    5 +-
+ .../key/kms/server/SimpleKMSAuditLogger.java       |   96 ++++++++++
+ .../hadoop/crypto/key/kms/server/TestKMSAudit.java |   41 +++-
+ .../src/test/resources/log4j-kmsaudit.properties   |    5 +-
+ 8 files changed, 414 insertions(+), 101 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAuditLogger.java
+ create mode 100644 hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/SimpleKMSAuditLogger.java
+
+diff --git a/hadoop-common-project/hadoop-kms/src/main/conf/kms-site.xml b/hadoop-common-project/hadoop-kms/src/main/conf/kms-site.xml
+index a810ca4..51b4438 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/conf/kms-site.xml
++++ b/hadoop-common-project/hadoop-kms/src/main/conf/kms-site.xml
+@@ -170,4 +170,14 @@
+     </description>
+   </property>
+ 
++  <property>
++    <name>hadoop.kms.audit.logger</name>
++    <value>org.apache.hadoop.crypto.key.kms.server.SimpleKMSAuditLogger</value>
++    <description>
++      The audit logger for KMS. It is a comma-separated list of KMSAuditLogger
++      class names. Default is the text-format SimpleKMSAuditLogger only.
++      If this is not configured, default will be used.
++    </description>
++  </property>
++
+ </configuration>
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+index 6a401e0..eef0bce 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAudit.java
+@@ -17,12 +17,18 @@
+  */
+ package org.apache.hadoop.crypto.key.kms.server;
+ 
++import static org.apache.hadoop.crypto.key.kms.server.KMSAuditLogger.AuditEvent;
++import static org.apache.hadoop.crypto.key.kms.server.KMSAuditLogger.OpStatus;
++
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.ReflectionUtils;
++import org.apache.hadoop.util.Time;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import com.google.common.base.Joiner;
+ import com.google.common.base.Strings;
+ import com.google.common.cache.Cache;
+ import com.google.common.cache.CacheBuilder;
+@@ -31,67 +37,24 @@
+ import com.google.common.collect.Sets;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Set;
++import java.util.HashSet;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicLong;
++import java.util.Collection;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Set;
+ 
+ /**
+- * Provides convenience methods for audit logging consistently the different
++ * Provides convenience methods for audit logging consisting different
+  * types of events.
+  */
+ public class KMSAudit {
+-
+-  private static class AuditEvent {
+-    private final AtomicLong accessCount = new AtomicLong(-1);
+-    private final String keyName;
+-    private final String user;
+-    private final KMS.KMSOp op;
+-    private final String extraMsg;
+-    private final long startTime = System.currentTimeMillis();
+-
+-    private AuditEvent(String keyName, String user, KMS.KMSOp op, String msg) {
+-      this.keyName = keyName;
+-      this.user = user;
+-      this.op = op;
+-      this.extraMsg = msg;
+-    }
+-
+-    public String getExtraMsg() {
+-      return extraMsg;
+-    }
+-
+-    public AtomicLong getAccessCount() {
+-      return accessCount;
+-    }
+-
+-    public String getKeyName() {
+-      return keyName;
+-    }
+-
+-    public String getUser() {
+-      return user;
+-    }
+-
+-    public KMS.KMSOp getOp() {
+-      return op;
+-    }
+-
+-    public long getStartTime() {
+-      return startTime;
+-    }
+-  }
+-
+-  public static enum OpStatus {
+-    OK, UNAUTHORIZED, UNAUTHENTICATED, ERROR;
+-  }
+-
+-  private static Set<KMS.KMSOp> AGGREGATE_OPS_WHITELIST = Sets.newHashSet(
++  @VisibleForTesting
++  static final Set<KMS.KMSOp> AGGREGATE_OPS_WHITELIST = Sets.newHashSet(
+     KMS.KMSOp.GET_KEY_VERSION, KMS.KMSOp.GET_CURRENT_KEY,
+     KMS.KMSOp.DECRYPT_EEK, KMS.KMSOp.GENERATE_EEK
+   );
+@@ -102,17 +65,21 @@ public long getStartTime() {
+ 
+   public static final String KMS_LOGGER_NAME = "kms-audit";
+ 
+-  private static Logger AUDIT_LOG = LoggerFactory.getLogger(KMS_LOGGER_NAME);
++  private final static Logger LOG = LoggerFactory.getLogger(KMSAudit.class);
++  private final List<KMSAuditLogger> auditLoggers = new LinkedList<>();
+ 
+   /**
+    * Create a new KMSAudit.
+    *
+-   * @param windowMs Duplicate events within the aggregation window are quashed
+-   *                 to reduce log traffic. A single message for aggregated
+-   *                 events is printed at the end of the window, along with a
+-   *                 count of the number of aggregated events.
++   * @param conf The configuration object.
+    */
+-  KMSAudit(long windowMs) {
++  KMSAudit(Configuration conf) {
++    // Duplicate events within the aggregation window are quashed
++    // to reduce log traffic. A single message for aggregated
++    // events is printed at the end of the window, along with a
++    // count of the number of aggregated events.
++    long windowMs = conf.getLong(KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW,
++        KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW_DEFAULT);
+     cache = CacheBuilder.newBuilder()
+         .expireAfterWrite(windowMs, TimeUnit.MILLISECONDS)
+         .removalListener(
+@@ -122,7 +89,7 @@ public void onRemoval(
+                   RemovalNotification<String, AuditEvent> entry) {
+                 AuditEvent event = entry.getValue();
+                 if (event.getAccessCount().get() > 0) {
+-                  KMSAudit.this.logEvent(event);
++                  KMSAudit.this.logEvent(OpStatus.OK, event);
+                   event.getAccessCount().set(0);
+                   KMSAudit.this.cache.put(entry.getKey(), event);
+                 }
+@@ -136,87 +103,127 @@ public void run() {
+         cache.cleanUp();
+       }
+     }, windowMs / 10, windowMs / 10, TimeUnit.MILLISECONDS);
++    initializeAuditLoggers(conf);
+   }
+ 
+-  private void logEvent(AuditEvent event) {
+-    AUDIT_LOG.info(
+-        "OK[op={}, key={}, user={}, accessCount={}, interval={}ms] {}",
+-        event.getOp(), event.getKeyName(), event.getUser(),
+-        event.getAccessCount().get(),
+-        (System.currentTimeMillis() - event.getStartTime()),
+-        event.getExtraMsg());
++  /**
++   * Read the KMSAuditLogger classes from configuration. If any loggers fail to
++   * load, a RumTimeException will be thrown.
++   *
++   * @param conf The configuration.
++   * @return Collection of KMSAudigLogger classes.
++   */
++  private Set<Class<? extends KMSAuditLogger>> getAuditLoggerClasses(
++      final Configuration conf) {
++    Set<Class<? extends KMSAuditLogger>> result = new HashSet<>();
++    // getTrimmedStringCollection will remove duplicates.
++    Collection<String> classes =
++        conf.getTrimmedStringCollection(KMSConfiguration.KMS_AUDIT_LOGGER_KEY);
++    if (classes.isEmpty()) {
++      LOG.info("No audit logger configured, using default.");
++      result.add(SimpleKMSAuditLogger.class);
++      return result;
++    }
++
++    for (String c : classes) {
++      try {
++        Class<?> cls = conf.getClassByName(c);
++        result.add(cls.asSubclass(KMSAuditLogger.class));
++      } catch (ClassNotFoundException cnfe) {
++        throw new RuntimeException("Failed to load " + c + ", please check "
++            + "configuration " + KMSConfiguration.KMS_AUDIT_LOGGER_KEY, cnfe);
++      }
++    }
++    return result;
+   }
+ 
+-  private void op(OpStatus opStatus, final KMS.KMSOp op, final String user,
+-      final String key, final String extraMsg) {
++  /**
++   * Create a collection of KMSAuditLoggers from configuration, and initialize
++   * them. If any logger failed to be created or initialized, a RunTimeException
++   * is thrown.
++   */
++  private void initializeAuditLoggers(Configuration conf) {
++    Set<Class<? extends KMSAuditLogger>> classes = getAuditLoggerClasses(conf);
++    Preconditions
++        .checkState(!classes.isEmpty(), "Should have at least 1 audit logger.");
++    for (Class<? extends KMSAuditLogger> c : classes) {
++      final KMSAuditLogger logger = ReflectionUtils.newInstance(c, conf);
++      auditLoggers.add(logger);
++    }
++    for (KMSAuditLogger logger: auditLoggers) {
++      try {
++        LOG.info("Initializing audit logger {}", logger.getClass());
++        logger.initialize(conf);
++      } catch (Exception ex) {
++        throw new RuntimeException(
++            "Failed to initialize " + logger.getClass().getName(), ex);
++      }
++    }
++  }
++
++  private void logEvent(final OpStatus status, AuditEvent event) {
++    event.setEndTime(Time.now());
++    for (KMSAuditLogger logger: auditLoggers) {
++      logger.logAuditEvent(status, event);
++    }
++  }
++
++  private void op(final OpStatus opStatus, final KMS.KMSOp op,
++      final UserGroupInformation ugi, final String key, final String remoteHost,
++      final String extraMsg) {
++    final String user = ugi == null ? null: ugi.getShortUserName();
+     if (!Strings.isNullOrEmpty(user) && !Strings.isNullOrEmpty(key)
+         && (op != null)
+         && AGGREGATE_OPS_WHITELIST.contains(op)) {
+       String cacheKey = createCacheKey(user, key, op);
+       if (opStatus == OpStatus.UNAUTHORIZED) {
+         cache.invalidate(cacheKey);
+-        AUDIT_LOG.info("UNAUTHORIZED[op={}, key={}, user={}] {}", op, key, user,
+-            extraMsg);
++        logEvent(opStatus, new AuditEvent(op, ugi, key, remoteHost, extraMsg));
+       } else {
+         try {
+           AuditEvent event = cache.get(cacheKey, new Callable<AuditEvent>() {
+             @Override
+             public AuditEvent call() throws Exception {
+-              return new AuditEvent(key, user, op, extraMsg);
++              return new AuditEvent(op, ugi, key, remoteHost, extraMsg);
+             }
+           });
+           // Log first access (initialized as -1 so
+           // incrementAndGet() == 0 implies first access)
+           if (event.getAccessCount().incrementAndGet() == 0) {
+             event.getAccessCount().incrementAndGet();
+-            logEvent(event);
++            logEvent(opStatus, event);
+           }
+         } catch (ExecutionException ex) {
+           throw new RuntimeException(ex);
+         }
+       }
+     } else {
+-      List<String> kvs = new LinkedList<String>();
+-      if (op != null) {
+-        kvs.add("op=" + op);
+-      }
+-      if (!Strings.isNullOrEmpty(key)) {
+-        kvs.add("key=" + key);
+-      }
+-      if (!Strings.isNullOrEmpty(user)) {
+-        kvs.add("user=" + user);
+-      }
+-      if (kvs.size() == 0) {
+-        AUDIT_LOG.info("{} {}", opStatus.toString(), extraMsg);
+-      } else {
+-        String join = Joiner.on(", ").join(kvs);
+-        AUDIT_LOG.info("{}[{}] {}", opStatus.toString(), join, extraMsg);
+-      }
++      logEvent(opStatus, new AuditEvent(op, ugi, key, remoteHost, extraMsg));
+     }
+   }
+ 
+   public void ok(UserGroupInformation user, KMS.KMSOp op, String key,
+       String extraMsg) {
+-    op(OpStatus.OK, op, user.getShortUserName(), key, extraMsg);
++    op(OpStatus.OK, op, user, key, "Unknown", extraMsg);
+   }
+ 
+   public void ok(UserGroupInformation user, KMS.KMSOp op, String extraMsg) {
+-    op(OpStatus.OK, op, user.getShortUserName(), null, extraMsg);
++    op(OpStatus.OK, op, user, null, "Unknown", extraMsg);
+   }
+ 
+   public void unauthorized(UserGroupInformation user, KMS.KMSOp op, String key) {
+-    op(OpStatus.UNAUTHORIZED, op, user.getShortUserName(), key, "");
++    op(OpStatus.UNAUTHORIZED, op, user, key, "Unknown", "");
+   }
+ 
+   public void error(UserGroupInformation user, String method, String url,
+       String extraMsg) {
+-    op(OpStatus.ERROR, null, user.getShortUserName(), null, "Method:'" + method
++    op(OpStatus.ERROR, null, user, null, "Unknown", "Method:'" + method
+         + "' Exception:'" + extraMsg + "'");
+   }
+ 
+   public void unauthenticated(String remoteHost, String method,
+       String url, String extraMsg) {
+-    op(OpStatus.UNAUTHENTICATED, null, null, null, "RemoteHost:"
++    op(OpStatus.UNAUTHENTICATED, null, null, null, remoteHost, "RemoteHost:"
+         + remoteHost + " Method:" + method
+         + " URL:" + url + " ErrorMsg:'" + extraMsg + "'");
+   }
+@@ -227,6 +234,13 @@ private static String createCacheKey(String user, String key, KMS.KMSOp op) {
+ 
+   public void shutdown() {
+     executor.shutdownNow();
++    for (KMSAuditLogger logger : auditLoggers) {
++      try {
++        logger.cleanup();
++      } catch (Exception ex) {
++        LOG.error("Failed to cleanup logger {}", logger.getClass(), ex);
++      }
++    }
+   }
+ 
+   @VisibleForTesting
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAuditLogger.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAuditLogger.java
+new file mode 100644
+index 0000000..a539724
+--- /dev/null
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSAuditLogger.java
+@@ -0,0 +1,154 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.crypto.key.kms.server;
++
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.security.UserGroupInformation;
++
++/**
++ * Interface defining a KMS audit logger.
++ * <p>
++ * IMPORTANT WARNING: Audit logs should be strictly backwards-compatible,
++ * because there are usually parsing tools highly dependent on the audit log
++ * formatting. Different tools have different ways of parsing the audit log, so
++ * changing the audit log output in any way is considered incompatible,
++ * and will haunt the consumer tools / developers. Don't do it.
++ */
++@InterfaceAudience.Private
++@InterfaceStability.Evolving
++interface KMSAuditLogger {
++  enum OpStatus {
++    OK, UNAUTHORIZED, UNAUTHENTICATED, ERROR;
++  }
++
++  /**
++   * Class defining an audit event.
++   */
++  class AuditEvent {
++    private final AtomicLong accessCount = new AtomicLong(-1);
++    private final KMS.KMSOp op;
++    private final String keyName;
++    private final String user;
++    private final String impersonator;
++    private final String remoteHost;
++    private final String extraMsg;
++    private final long startTime = System.currentTimeMillis();
++    private long endTime = startTime;
++
++    AuditEvent(KMS.KMSOp op, UserGroupInformation ugi, String keyName,
++        String remoteHost, String msg) {
++      this.keyName = keyName;
++      if (ugi == null) {
++        this.user = null;
++        this.impersonator = null;
++      } else {
++        this.user = ugi.getShortUserName();
++        if (ugi.getAuthenticationMethod()
++            == UserGroupInformation.AuthenticationMethod.PROXY) {
++          this.impersonator = ugi.getRealUser().getUserName();
++        } else {
++          this.impersonator = null;
++        }
++      }
++      this.remoteHost = remoteHost;
++      this.op = op;
++      this.extraMsg = msg;
++    }
++
++    public AtomicLong getAccessCount() {
++      return accessCount;
++    }
++
++    public KMS.KMSOp getOp() {
++      return op;
++    }
++
++    public String getKeyName() {
++      return keyName;
++    }
++
++    public String getUser() {
++      return user;
++    }
++
++    public String getImpersonator() {
++      return impersonator;
++    }
++
++    public String getRemoteHost() {
++      return remoteHost;
++    }
++
++    public String getExtraMsg() {
++      return extraMsg;
++    }
++
++    public long getStartTime() {
++      return startTime;
++    }
++
++    public long getEndTime() {
++      return endTime;
++    }
++
++    /**
++     * Set the time this audit event is finished.
++     */
++    void setEndTime(long endTime) {
++      this.endTime = endTime;
++    }
++
++    @Override
++    public String toString() {
++      StringBuilder sb = new StringBuilder();
++      sb.append("op=" + op).append(", keyName=" + keyName)
++          .append(", user=" + user).append(", impersonator=" + impersonator)
++          .append(", remoteHost=" + remoteHost)
++          .append(", extraMsg=" + extraMsg);
++      return sb.toString();
++    }
++  }
++
++  /**
++   * Clean up the audit logger.
++   *
++   * @throws IOException
++   */
++  void cleanup() throws IOException;
++
++  /**
++   * Initialize the audit logger.
++   *
++   * @param conf The configuration object.
++   * @throws IOException
++   */
++  void initialize(Configuration conf) throws IOException;
++
++  /**
++   * Log an audit event.
++   *
++   * @param status The status of the event.
++   * @param event  The audit event.
++   */
++  void logAuditEvent(final OpStatus status, final AuditEvent event);
++}
+\ No newline at end of file
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
+index 23c983f..600f1e9 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSConfiguration.java
+@@ -58,6 +58,10 @@
+   // Delay for Audit logs that need aggregation
+   public static final String KMS_AUDIT_AGGREGATION_WINDOW = CONFIG_PREFIX +
+       "audit.aggregation.window.ms";
++
++  // KMS Audit logger classes to use
++  public static final String KMS_AUDIT_LOGGER_KEY = CONFIG_PREFIX +
++      "audit.logger";
+   
+   public static final boolean KEY_CACHE_ENABLE_DEFAULT = true;
+   // 10 mins
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
+index 1474463..e972509 100644
+--- a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/KMSWebApp.java
+@@ -147,10 +147,7 @@ public void contextInitialized(ServletContextEvent sce) {
+       unauthenticatedCallsMeter = metricRegistry.register(
+           UNAUTHENTICATED_CALLS_METER, new Meter());
+ 
+-      kmsAudit =
+-          new KMSAudit(kmsConf.getLong(
+-              KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW,
+-              KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW_DEFAULT));
++      kmsAudit = new KMSAudit(kmsConf);
+ 
+       // this is required for the the JMXJsonServlet to work properly.
+       // the JMXJsonServlet is behind the authentication filter,
+diff --git a/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/SimpleKMSAuditLogger.java b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/SimpleKMSAuditLogger.java
+new file mode 100644
+index 0000000..4dcbe2c
+--- /dev/null
++++ b/hadoop-common-project/hadoop-kms/src/main/java/org/apache/hadoop/crypto/key/kms/server/SimpleKMSAuditLogger.java
+@@ -0,0 +1,96 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.crypto.key.kms.server;
++
++import static org.apache.hadoop.crypto.key.kms.server.KMSAudit.KMS_LOGGER_NAME;
++
++import java.io.IOException;
++import java.util.LinkedList;
++import java.util.List;
++
++import com.google.common.base.Joiner;
++import com.google.common.base.Strings;
++import org.apache.hadoop.conf.Configuration;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * A simple text format audit logger. This is the default.
++ * <p>
++ * IMPORTANT WARNING: Audit logs should be strictly backwards-compatible,
++ * because there are usually parsing tools highly dependent on the audit log
++ * formatting. Different tools have different ways of parsing the audit log, so
++ * changing the audit log output in any way is considered incompatible,
++ * and will haunt the consumer tools / developers. Don't do it.
++ */
++class SimpleKMSAuditLogger implements KMSAuditLogger {
++  final private Logger auditLog = LoggerFactory.getLogger(KMS_LOGGER_NAME);
++
++  @Override
++  public void cleanup() throws IOException {
++  }
++
++  @Override
++  public void initialize(Configuration conf) throws IOException {
++  }
++
++  @Override
++  public void logAuditEvent(final OpStatus status, final AuditEvent event) {
++    if (!Strings.isNullOrEmpty(event.getUser()) && !Strings
++        .isNullOrEmpty(event.getKeyName()) && (event.getOp() != null)
++        && KMSAudit.AGGREGATE_OPS_WHITELIST.contains(event.getOp())) {
++      switch (status) {
++      case OK:
++        auditLog.info(
++            "{}[op={}, key={}, user={}, accessCount={}, interval={}ms] {}",
++            status, event.getOp(), event.getKeyName(), event.getUser(),
++            event.getAccessCount().get(),
++            (event.getEndTime() - event.getStartTime()), event.getExtraMsg());
++        break;
++      case UNAUTHORIZED:
++        logAuditSimpleFormat(status, event);
++        break;
++      default:
++        logAuditSimpleFormat(status, event);
++        break;
++      }
++    } else {
++      logAuditSimpleFormat(status, event);
++    }
++  }
++
++  private void logAuditSimpleFormat(final OpStatus status,
++      final AuditEvent event) {
++    final List<String> kvs = new LinkedList<>();
++    if (event.getOp() != null) {
++      kvs.add("op=" + event.getOp());
++    }
++    if (!Strings.isNullOrEmpty(event.getKeyName())) {
++      kvs.add("key=" + event.getKeyName());
++    }
++    if (!Strings.isNullOrEmpty(event.getUser())) {
++      kvs.add("user=" + event.getUser());
++    }
++    if (kvs.isEmpty()) {
++      auditLog.info("{} {}", status, event.getExtraMsg());
++    } else {
++      final String join = Joiner.on(", ").join(kvs);
++      auditLog.info("{}[{}] {}", status, join, event.getExtraMsg());
++    }
++  }
++}
+diff --git a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+index 41b31a3..40cbb53 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
++++ b/hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMSAudit.java
+@@ -23,10 +23,13 @@
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.io.PrintStream;
++import java.util.List;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.crypto.key.kms.server.KMS.KMSOp;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.ThreadUtil;
+ import org.apache.log4j.LogManager;
+ import org.apache.log4j.PropertyConfigurator;
+@@ -37,6 +40,7 @@
+ import org.junit.Test;
+ import org.junit.rules.Timeout;
+ import org.mockito.Mockito;
++import org.mockito.internal.util.reflection.Whitebox;
+ 
+ public class TestKMSAudit {
+ 
+@@ -71,9 +75,8 @@ public void setUp() throws IOException {
+         ThreadUtil.getResourceAsStream("log4j-kmsaudit.properties");
+     PropertyConfigurator.configure(is);
+     IOUtils.closeStream(is);
+-
+-    this.kmsAudit =
+-        new KMSAudit(KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW_DEFAULT);
++    Configuration conf = new Configuration();
++    this.kmsAudit = new KMSAudit(conf);
+   }
+ 
+   @After
+@@ -175,4 +178,36 @@ public void testAuditLogFormat() throws Exception {
+             + "ERROR\\[user=luser\\] Method:'method' Exception:'testmsg'"
+             + "UNAUTHENTICATED RemoteHost:remotehost Method:method URL:url ErrorMsg:'testmsg'"));
+   }
++
++  @SuppressWarnings("unchecked")
++  @Test
++  public void testInitAuditLoggers() throws Exception {
++    // Default should be the simple logger
++    List<KMSAuditLogger> loggers = (List<KMSAuditLogger>) Whitebox
++        .getInternalState(kmsAudit, "auditLoggers");
++    Assert.assertEquals(1, loggers.size());
++    Assert.assertEquals(SimpleKMSAuditLogger.class, loggers.get(0).getClass());
++
++    // Explicitly configure the simple logger. Duplicates are ignored.
++    final Configuration conf = new Configuration();
++    conf.set(KMSConfiguration.KMS_AUDIT_LOGGER_KEY,
++        SimpleKMSAuditLogger.class.getName() + ", "
++            + SimpleKMSAuditLogger.class.getName());
++    final KMSAudit audit = new KMSAudit(conf);
++    loggers =
++        (List<KMSAuditLogger>) Whitebox.getInternalState(audit, "auditLoggers");
++    Assert.assertEquals(1, loggers.size());
++    Assert.assertEquals(SimpleKMSAuditLogger.class, loggers.get(0).getClass());
++
++    // If any loggers unable to load, init should fail.
++    conf.set(KMSConfiguration.KMS_AUDIT_LOGGER_KEY,
++        SimpleKMSAuditLogger.class.getName() + ",unknown");
++    try {
++      new KMSAudit(conf);
++      Assert.fail("loggers configured but invalid, init should fail.");
++    } catch (Exception ex) {
++      GenericTestUtils
++          .assertExceptionContains(KMSConfiguration.KMS_AUDIT_LOGGER_KEY, ex);
++    }
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-kms/src/test/resources/log4j-kmsaudit.properties b/hadoop-common-project/hadoop-kms/src/test/resources/log4j-kmsaudit.properties
+index cca6941..b8a4013 100644
+--- a/hadoop-common-project/hadoop-kms/src/test/resources/log4j-kmsaudit.properties
++++ b/hadoop-common-project/hadoop-kms/src/test/resources/log4j-kmsaudit.properties
+@@ -16,10 +16,13 @@
+ # limitations under the License.
+ #
+ 
++log4j.rootLogger=INFO, kms-audit
++
+ # LOG Appender
+ log4j.appender.kms-audit=org.apache.log4j.ConsoleAppender
+ log4j.appender.kms-audit.Target=System.err
+ log4j.appender.kms-audit.layout=org.apache.log4j.PatternLayout
+ log4j.appender.kms-audit.layout.ConversionPattern=%m
+ 
+-log4j.rootLogger=INFO, kms-audit
+\ No newline at end of file
++# disable default logging in KMSAudit class
++log4j.logger.org.apache.hadoop.crypto.key.kms.server.KMSAudit=OFF
+\ No newline at end of file
+-- 
+1.7.9.5
+

@@ -1,0 +1,399 @@
+From da92e607a2f5940baf8181181a9e0dd450ef4c89 Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Thu, 10 Sep 2015 09:18:10 -0500
+Subject: [PATCH 2648/2848] HDFS-6763. Initialize file system-wide quota once
+ on transitioning to active. Contributed by Kihwal
+ Lee (cherry picked from commit
+ a40342b0dab1f9137ae4b3679a5aca7f2a57d23d)
+
+(cherry picked from commit 633344aa578c5cc3362edf3721cdf9f37fb51f67)
+
+ Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDiskspaceQuotaUpdate.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
+
+Change-Id: I703d2cc8bedbf394336cc6ef8aeb4065ec2816e1
+---
+ .../hadoop/hdfs/server/namenode/BackupImage.java   |    6 +-
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |  106 ++++++++++++++++++++
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   98 ------------------
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    2 +
+ .../server/namenode/TestDiskspaceQuotaUpdate.java  |    6 +-
+ .../server/namenode/TestFSImageWithSnapshot.java   |    3 +-
+ 6 files changed, 113 insertions(+), 108 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+index 793087b..4f6f7b1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+@@ -25,7 +25,6 @@
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.common.InconsistentFSStateException;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+@@ -95,9 +94,6 @@
+     super(conf);
+     storage.setDisablePreUpgradableLayoutCheck(true);
+     bnState = BNState.DROP_UNTIL_NEXT_ROLL;
+-    quotaInitThreads = conf.getInt(
+-        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_DEFAULT);
+   }
+   
+   void setNamesystem(FSNamesystem fsn) {
+@@ -236,7 +232,7 @@ private synchronized void applyEdits(long firstTxId, int numTxns, byte[] data)
+       }
+       lastAppliedTxId = logLoader.getLastAppliedTxId();
+ 
+-      FSImage.updateCountForQuota(namesystem.dir.rootDir, quotaInitThreads);
++      namesystem.dir.updateCountForQuota();
+     } finally {
+       backupInputStream.clear();
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 7d8aa06..6781097 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -33,7 +33,9 @@
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.ListIterator;
++import java.util.concurrent.ForkJoinPool;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.concurrent.RecursiveAction;
+ 
+ import com.google.protobuf.InvalidProtocolBufferException;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+@@ -110,6 +112,8 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import static org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot.CURRENT_STATE_ID;
++
+ /**
+  * Both FSDirectory and FSNamesystem manage the state of the namespace.
+  * FSDirectory is a pure in-memory data structure, all of whose operations
+@@ -162,6 +166,8 @@ private static INodeDirectory createRoot(FSNamesystem namesystem) {
+   private final long contentSleepMicroSec;
+   private final INodeMap inodeMap; // Synchronized by dirLock
+   private long yieldCount = 0; // keep track of lock yield count.
++  private int quotaInitThreads;
++
+   private final int inodeXAttrsLimit; //inode xattrs max limit
+ 
+   // lock to protect the directory and BlockMap
+@@ -279,6 +285,10 @@ public int getWriteHoldCount() {
+     namesystem = ns;
+ 
+     ezManager = new EncryptionZoneManager(this, conf);
++
++    this.quotaInitThreads = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_KEY,
++        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_DEFAULT);
+   }
+     
+   FSNamesystem getFSNamesystem() {
+@@ -1817,6 +1827,102 @@ boolean isDirMutable(String src) throws UnresolvedLinkException,
+     }
+   }
+ 
++  /**
++   * Update the count of each directory with quota in the namespace.
++   * A directory's count is defined as the total number inodes in the tree
++   * rooted at the directory.
++   *
++   * This is an update of existing state of the filesystem and does not
++   * throw QuotaExceededException.
++   */
++  void updateCountForQuota(int initThreads) {
++    writeLock();
++    try {
++      int threads = (initThreads < 1) ? 1 : initThreads;
++      LOG.info("Initializing quota with " + threads + " thread(s)");
++      long start = Time.now();
++      Quota.Counts counts = Quota.Counts.newInstance();
++      ForkJoinPool p = new ForkJoinPool(threads);
++      RecursiveAction task = new InitQuotaTask(rootDir, counts);
++      p.execute(task);
++      task.join();
++      p.shutdown();
++      LOG.info("Quota initialization completed in " + (Time.now() - start) +
++          " milliseconds\n" + counts);
++    } finally {
++      writeUnlock();
++    }
++  }
++
++  void updateCountForQuota() {
++    updateCountForQuota(quotaInitThreads);
++  }
++
++  /**
++   * parallel initialization using fork-join.
++   */
++  private static class InitQuotaTask extends RecursiveAction {
++    private final INodeDirectory dir;
++    private final Quota.Counts counts;
++
++    public InitQuotaTask(INodeDirectory dir, Quota.Counts counts) {
++      this.dir = dir;
++      this.counts = counts;
++    }
++
++    public void compute() {
++      Quota.Counts myCounts = Quota.Counts.newInstance();
++      dir.computeQuotaUsage4CurrentDirectory(myCounts);
++
++      ReadOnlyList<INode> children = dir.getChildrenList(CURRENT_STATE_ID);
++
++      if (children.size() > 0) {
++        List<InitQuotaTask> subtasks = new ArrayList<>();
++        for (INode child : children) {
++          if (child.isDirectory()) {
++            subtasks.add(new InitQuotaTask(child.asDirectory(), myCounts));
++          } else {
++            // file or symlink. count using the local counts variable
++            child.computeQuotaUsage(myCounts, false, CURRENT_STATE_ID);
++          }
++        }
++        // invoke and wait for completion
++        invokeAll(subtasks);
++      }
++
++      if (dir.isQuotaSet()) {
++        // check if quota is violated. It indicates a software bug.
++        final Quota.Counts q = dir.getQuotaCounts();
++
++        final long nsConsumed = myCounts.get(Quota.NAMESPACE);
++        final long nsQuota = q.get(Quota.NAMESPACE);
++        if (Quota.isViolated(nsQuota, nsConsumed)) {
++          LOG.warn("Namespace quota violation in image for "
++              + dir.getFullPathName()
++              + " quota = " + nsQuota + " < consumed = " + nsConsumed);
++        }
++
++        final long ssConsumed = myCounts.get(Quota.DISKSPACE);
++        final long ssQuota = q.get(Quota.DISKSPACE);
++        if (Quota.isViolated(ssQuota, ssConsumed)) {
++          LOG.warn("Storagespace quota violation in image for "
++              + dir.getFullPathName()
++              + " quota = " + ssQuota + " < consumed = " + ssConsumed);
++        }
++
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Setting quota for " + dir + "\n" + myCounts);
++        }
++        dir.getDirectoryWithQuotaFeature()
++            .setSpaceConsumed(nsConsumed, ssConsumed);
++      }
++
++      synchronized(counts) {
++        counts.add(myCounts);
++      }
++    }
++  }
++
+   /** Updates namespace and diskspace consumed for all
+    * directories until the parent directory of file represented by path.
+    * 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 9d3103e..563303e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -27,8 +27,6 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.concurrent.ForkJoinPool;
+-import java.util.concurrent.RecursiveAction;
+ import java.util.EnumSet;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -59,7 +57,6 @@
+ import org.apache.hadoop.hdfs.server.namenode.FSImageStorageInspector.FSImageFile;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeFile;
+-import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
+ import org.apache.hadoop.hdfs.server.namenode.startupprogress.Phase;
+ import org.apache.hadoop.hdfs.server.namenode.startupprogress.StartupProgress;
+ import org.apache.hadoop.hdfs.server.protocol.CheckpointCommand;
+@@ -69,7 +66,6 @@
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.util.Canceler;
+ import org.apache.hadoop.hdfs.util.MD5FileUtils;
+-import org.apache.hadoop.hdfs.util.ReadOnlyList;
+ import org.apache.hadoop.io.MD5Hash;
+ import org.apache.hadoop.util.Time;
+ 
+@@ -155,10 +151,6 @@ protected FSImage(Configuration conf,
+       storage.setRestoreFailedStorage(true);
+     }
+ 
+-    this.quotaInitThreads = conf.getInt(
+-        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_DEFAULT);
+-
+     this.editLog = FSEditLog.newInstance(conf, storage, editsDirs);
+     archivalManager = new NNStorageRetentionManager(conf, storage, editLog);
+   }
+@@ -915,102 +907,12 @@ private long loadEdits(Iterable<EditLogInputStream> editStreams,
+       }
+     } finally {
+       FSEditLog.closeAllStreams(editStreams);
+-      // update the counts
+-      updateCountForQuota(target.dir.rootDir, quotaInitThreads);
+     }
+     prog.endPhase(Phase.LOADING_EDITS);
+     return lastAppliedTxId - prevLastAppliedTxId;
+   }
+ 
+   /**
+-   * Update the count of each directory with quota in the namespace.
+-   * A directory's count is defined as the total number inodes in the tree
+-   * rooted at the directory.
+-   * 
+-   * This is an update of existing state of the filesystem and does not
+-   * throw QuotaExceededException.
+-   */
+-  static void updateCountForQuota(INodeDirectory root, int threads) {
+-    threads = (threads < 1) ? 1 : threads;
+-    LOG.info("Initializing quota with " + threads + " thread(s)");
+-    long start = Time.now();
+-    Quota.Counts counts = Quota.Counts.newInstance();
+-    ForkJoinPool p = new ForkJoinPool(threads);
+-    RecursiveAction task = new InitQuotaTask(root, counts);
+-    p.execute(task);
+-    task.join();
+-    p.shutdown();
+-    LOG.info("Quota initialization completed in " + (Time.now() - start) +
+-        " milliseconds\n" + counts);
+-  }
+-
+-  /**
+-   * parallel initialization using fork-join.
+-   */
+-  private static class InitQuotaTask extends RecursiveAction {
+-    private final INodeDirectory dir;
+-    private final Quota.Counts counts;
+-
+-    public InitQuotaTask(INodeDirectory dir, Quota.Counts counts) {
+-      this.dir = dir;
+-      this.counts = counts;
+-    }
+-
+-    public void compute() {
+-      Quota.Counts myCounts = Quota.Counts.newInstance();
+-      dir.computeQuotaUsage4CurrentDirectory(myCounts);
+-
+-      ReadOnlyList<INode> children =
+-          dir.getChildrenList(Snapshot.CURRENT_STATE_ID);
+-
+-      if (children.size() > 0) {
+-        List<InitQuotaTask> subtasks = new ArrayList<InitQuotaTask>();
+-        for (INode child : children) {
+-          if (child.isDirectory()) {
+-            subtasks.add(new InitQuotaTask(child.asDirectory(), myCounts));
+-          } else {
+-            // file or symlink. count using the local counts variable
+-            child.computeQuotaUsage(myCounts, false, Snapshot.CURRENT_STATE_ID);
+-          }
+-        }
+-        // invoke and wait for completion
+-        invokeAll(subtasks);
+-      }
+-
+-      if (dir.isQuotaSet()) {
+-        // check if quota is violated. It indicates a software bug.
+-        final Quota.Counts q = dir.getQuotaCounts();
+-
+-        final long nsConsumed = myCounts.get(Quota.NAMESPACE);
+-        final long nsQuota = q.get(Quota.NAMESPACE);
+-        if (Quota.isViolated(nsQuota, nsConsumed)) {
+-          LOG.warn("Namespace quota violation in image for "
+-              + dir.getFullPathName()
+-              + " quota = " + nsQuota + " < consumed = " + nsConsumed);
+-        }
+-
+-        final long ssConsumed = myCounts.get(Quota.DISKSPACE);
+-        final long ssQuota = q.get(Quota.DISKSPACE);
+-        if (Quota.isViolated(ssQuota, ssConsumed)) {
+-          LOG.warn("Storagespace quota violation in image for "
+-              + dir.getFullPathName()
+-              + " quota = " + ssQuota + " < consumed = " + ssConsumed);
+-        }
+-
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Setting quota for " + dir + "\n" + myCounts);
+-        }
+-        dir.getDirectoryWithQuotaFeature()
+-            .setSpaceConsumed(nsConsumed, ssConsumed);
+-      }
+-
+-      synchronized(counts) {
+-        counts.add(myCounts);
+-      }
+-    }
+-  }
+-
+-  /**
+    * Load the image namespace from the given image file, verifying
+    * it against the MD5 sum stored in its associated .md5 file.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index b3713a0..357507a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1314,6 +1314,8 @@ void startActiveServices() throws IOException {
+         getFSImage().editLog.openForWrite();
+       }
+ 
++      // Initialize the quota.
++      dir.updateCountForQuota();
+       // Enable quota checks.
+       dir.enableQuotaChecks();
+       dir.ezManager.startReencryptThreads();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDiskspaceQuotaUpdate.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDiskspaceQuotaUpdate.java
+index 213de38..22aa113 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDiskspaceQuotaUpdate.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDiskspaceQuotaUpdate.java
+@@ -256,13 +256,13 @@ public void testQuotaInitialization() throws Exception {
+     HashMap<String, Long> dsMap = new HashMap<String, Long>();
+     scanDirsWithQuota(root, nsMap, dsMap, false);
+ 
+-    FSImage.updateCountForQuota(root, 1);
++    fsdir.updateCountForQuota(1);
+     scanDirsWithQuota(root, nsMap, dsMap, true);
+ 
+-    FSImage.updateCountForQuota(root, 2);
++    fsdir.updateCountForQuota(2);
+     scanDirsWithQuota(root, nsMap, dsMap, true);
+ 
+-    FSImage.updateCountForQuota(root, 4);
++    fsdir.updateCountForQuota(4);
+     scanDirsWithQuota(root, nsMap, dsMap, true);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
+index 8d1a241..1ff18a0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImageWithSnapshot.java
+@@ -158,8 +158,7 @@ private void loadFSImageFromTempFile(File imageFile) throws IOException {
+     fsn.getFSDirectory().writeLock();
+     try {
+       loader.load(imageFile, false);
+-      FSImage.updateCountForQuota(
+-          INodeDirectory.valueOf(fsn.getFSDirectory().getINode("/"), "/"), 4);
++      fsn.getFSDirectory().updateCountForQuota();
+     } finally {
+       fsn.getFSDirectory().writeUnlock();
+       fsn.writeUnlock();
+-- 
+1.7.9.5
+

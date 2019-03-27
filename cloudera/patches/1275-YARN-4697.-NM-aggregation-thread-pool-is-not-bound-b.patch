@@ -1,0 +1,288 @@
+From 1a16ec2abf2d9c8c45aa2c0baafac74f1ab8642c Mon Sep 17 00:00:00 2001
+From: Robert Kanter <rkanter@apache.org>
+Date: Wed, 24 Feb 2016 15:00:24 -0800
+Subject: [PATCH 1275/2848] YARN-4697. NM aggregation thread pool is not bound
+ by limits (haibochen via rkanter)
+
+(cherry picked from commit 954dd57043d2de4f962876c1b89753bfc7e4ce55)
+
+Change-Id: I22cf5cad307d0bfa3ed6b35fcb6d8edb0897850f
+---
+ .../apache/hadoop/yarn/conf/YarnConfiguration.java |    5 +
+ .../src/main/resources/yarn-default.xml            |    8 ++
+ .../logaggregation/LogAggregationService.java      |   36 ++++-
+ .../logaggregation/TestLogAggregationService.java  |  143 ++++++++++++++++++++
+ 4 files changed, 186 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index bff657e..1584fc4 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -680,6 +680,11 @@ private static void addDeprecatedKeys() {
+   public static final String NM_LOG_DIRS = NM_PREFIX + "log-dirs";
+   public static final String DEFAULT_NM_LOG_DIRS = "/tmp/logs";
+ 
++  /** The number of threads to handle log aggregation in node manager. */
++  public static final String NM_LOG_AGGREGATION_THREAD_POOL_SIZE =
++      NM_PREFIX + "logaggregation.threadpool-size-max";
++  public static final int DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE = 100;
++
+   public static final String NM_RESOURCEMANAGER_MINIMUM_VERSION =
+       NM_PREFIX + "resourcemanager.minimum.version";
+   public static final String DEFAULT_NM_RESOURCEMANAGER_MINIMUM_VERSION = "NONE";
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index 6abbd4f..579ff43 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -898,6 +898,14 @@
+   </property>
+ 
+   <property>
++    <description>
++    Thread pool size for LogAggregationService in Node Manager.
++    </description>
++    <name>yarn.nodemanager.logaggregation.threadpool-size-max</name>
++    <value>100</value>
++  </property>
++
++  <property>
+     <description>Percentage of CPU that can be allocated
+     for containers. This setting allows users to limit the amount of
+     CPU that YARN containers use. Currently functional only
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
+index bd3e847..042c552 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.service.AbstractService;
++import org.apache.hadoop.util.concurrent.HadoopExecutors;
+ import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+@@ -100,7 +101,8 @@
+ 
+   private final ConcurrentMap<ApplicationId, AppLogAggregator> appLogAggregators;
+ 
+-  private final ExecutorService threadPool;
++  @VisibleForTesting
++  ExecutorService threadPool;
+   
+   public LogAggregationService(Dispatcher dispatcher, Context context,
+       DeletionService deletionService, LocalDirsHandlerService dirsHandler) {
+@@ -111,10 +113,6 @@ public LogAggregationService(Dispatcher dispatcher, Context context,
+     this.dirsHandler = dirsHandler;
+     this.appLogAggregators =
+         new ConcurrentHashMap<ApplicationId, AppLogAggregator>();
+-    this.threadPool = Executors.newCachedThreadPool(
+-        new ThreadFactoryBuilder()
+-          .setNameFormat("LogAggregationService #%d")
+-          .build());
+   }
+ 
+   protected void serviceInit(Configuration conf) throws Exception {
+@@ -124,7 +122,11 @@ protected void serviceInit(Configuration conf) throws Exception {
+     this.remoteRootLogDirSuffix =
+         conf.get(YarnConfiguration.NM_REMOTE_APP_LOG_DIR_SUFFIX,
+             YarnConfiguration.DEFAULT_NM_REMOTE_APP_LOG_DIR_SUFFIX);
+-
++    int threadPoolSize = getAggregatorThreadPoolSize(conf);
++    this.threadPool = HadoopExecutors.newFixedThreadPool(threadPoolSize,
++        new ThreadFactoryBuilder()
++            .setNameFormat("LogAggregationService #%d")
++            .build());
+     super.serviceInit(conf);
+   }
+ 
+@@ -472,4 +474,26 @@ public void handle(LogHandlerEvent event) {
+   public NodeId getNodeId() {
+     return this.nodeId;
+   }
++
++
++  private int getAggregatorThreadPoolSize(Configuration conf) {
++    int threadPoolSize;
++    try {
++      threadPoolSize = conf.getInt(YarnConfiguration
++          .NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++          YarnConfiguration.DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE);
++    } catch (NumberFormatException ex) {
++      LOG.warn("Invalid thread pool size. Setting it to the default value " +
++          "in YarnConfiguration");
++      threadPoolSize = YarnConfiguration.
++          DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE;
++    }
++    if(threadPoolSize <= 0) {
++      LOG.warn("Invalid thread pool size. Setting it to the default value " +
++          "in YarnConfiguration");
++      threadPoolSize = YarnConfiguration.
++          DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE;
++    }
++    return threadPoolSize;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
+index f519bc0..074b7fd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
+@@ -55,6 +55,12 @@
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.LogFactory;
+@@ -974,6 +980,143 @@ private DrainDispatcher createDispatcher() {
+     return appAcls;
+   }
+ 
++  @Test (timeout = 30000)
++  public void testFixedSizeThreadPool() throws Exception {
++    // store configured thread pool size temporarily for restoration
++    int initThreadPoolSize = conf.getInt(YarnConfiguration
++        .NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++        YarnConfiguration.DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE);
++
++    int threadPoolSize = 3;
++    conf.setInt(YarnConfiguration.NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++        threadPoolSize);
++
++    DeletionService delSrvc = mock(DeletionService.class);
++
++    LocalDirsHandlerService dirSvc = mock(LocalDirsHandlerService.class);
++    when(dirSvc.getLogDirs()).thenThrow(new RuntimeException());
++
++    LogAggregationService logAggregationService =
++      new LogAggregationService(dispatcher, this.context, delSrvc, dirSvc);
++
++    logAggregationService.init(this.conf);
++    logAggregationService.start();
++
++    ExecutorService executorService = logAggregationService.threadPool;
++
++    // used to block threads in the thread pool because main thread always
++    // acquires the write lock first.
++    final ReadWriteLock rwLock = new ReentrantReadWriteLock();
++    final Lock rLock = rwLock.readLock();
++    final Lock wLock = rwLock.writeLock();
++
++    try {
++      wLock.lock();
++      Runnable runnable = new Runnable() {
++        @Override
++        public void run() {
++          try {
++            // threads in the thread pool running this will be blocked
++            rLock.tryLock(35000, TimeUnit.MILLISECONDS);
++          } catch (InterruptedException e) {
++            e.printStackTrace();
++          } finally {
++            rLock.unlock();
++          }
++        }
++      };
++
++      // submit $(threadPoolSize + 1) runnables to the thread pool. If the thread
++      // pool size is set properly, only $(threadPoolSize) threads will be
++      // created in the thread pool, each of which is blocked on the read lock.
++      for(int i = 0; i < threadPoolSize + 1; i++)  {
++        executorService.submit(runnable);
++      }
++
++      // count the number of current running LogAggregationService threads
++      int runningThread = ((ThreadPoolExecutor) executorService).getActiveCount();
++      assertEquals(threadPoolSize, runningThread);
++    }
++    finally {
++      wLock.unlock();
++    }
++
++    logAggregationService.stop();
++    logAggregationService.close();
++
++    // restore the original configurations to avoid side effects
++    conf.setInt(YarnConfiguration.NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++        initThreadPoolSize);
++  }
++
++  @Test
++  public void testInvalidThreadPoolSizeNaN() throws IOException {
++      testInvalidThreadPoolSizeValue("NaN");
++  }
++
++  @Test
++  public void testInvalidThreadPoolSizeNegative() throws IOException {
++      testInvalidThreadPoolSizeValue("-100");
++  }
++
++  @Test
++  public void testInvalidThreadPoolSizeXLarge() throws  IOException {
++      testInvalidThreadPoolSizeValue("11111111111");
++  }
++
++  private void testInvalidThreadPoolSizeValue(final String threadPoolSize)
++      throws IOException {
++    Supplier<Boolean> isInputInvalid = new Supplier<Boolean>() {
++        @Override
++        public Boolean get() {
++          try {
++            int value = Integer.parseInt(threadPoolSize);
++            return value <= 0;
++          } catch (NumberFormatException ex) {
++            return true;
++          }
++        }
++    };
++
++    assertTrue("The thread pool size must be invalid to use with this " +
++        "method", isInputInvalid.get());
++
++
++    // store configured thread pool size temporarily for restoration
++    int initThreadPoolSize = conf.getInt(YarnConfiguration
++        .NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++        YarnConfiguration.DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE);
++
++    conf.set(YarnConfiguration.NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++         threadPoolSize);
++
++    DeletionService delSrvc = mock(DeletionService.class);
++
++    LocalDirsHandlerService dirSvc = mock(LocalDirsHandlerService.class);
++    when(dirSvc.getLogDirs()).thenThrow(new RuntimeException());
++
++    LogAggregationService logAggregationService =
++         new LogAggregationService(dispatcher, this.context, delSrvc, dirSvc);
++
++    logAggregationService.init(this.conf);
++    logAggregationService.start();
++
++    ThreadPoolExecutor executorService = (ThreadPoolExecutor)
++        logAggregationService.threadPool;
++    assertEquals("The thread pool size should be set to the value of YARN" +
++        ".DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE because the configured "
++         + " thread pool size is " + "invalid.",
++        YarnConfiguration.DEFAULT_NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++        executorService.getMaximumPoolSize());
++
++    logAggregationService.stop();
++    logAggregationService.close();
++
++     // retore original configuration to aviod side effects
++     conf.setInt(YarnConfiguration.NM_LOG_AGGREGATION_THREAD_POOL_SIZE,
++         initThreadPoolSize);
++  }
++
+   @Test(timeout=20000)
+   public void testStopAfterError() throws Exception {
+     DeletionService delSrvc = mock(DeletionService.class);
+-- 
+1.7.9.5
+

@@ -1,0 +1,3208 @@
+From 7d9d5161888d08bbe49c7bef376216cb66e51436 Mon Sep 17 00:00:00 2001
+From: Ming Ma <mingma@twitter.com>
+Date: Mon, 17 Oct 2016 17:46:29 -0700
+Subject: [PATCH 2120/2848] HDFS-9390. Block management for maintenance
+ states.
+
+(cherry picked from commit d55a7f893584acee0c3bfd89e89f8002310dcc3f)
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDecommissioningStatus.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+
+Change-Id: I0f0be422a2719c3aabe7afd3f76aaa78348ede02
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    4 +
+ .../main/java/org/apache/hadoop/hdfs/DFSUtil.java  |   55 +-
+ .../hadoop/hdfs/server/balancer/Dispatcher.java    |   11 +-
+ .../hdfs/server/blockmanagement/BlockManager.java  |  328 ++++++---
+ .../BlockPlacementPolicyDefault.java               |    4 +-
+ .../blockmanagement/CacheReplicationMonitor.java   |    2 +-
+ .../server/blockmanagement/DatanodeDescriptor.java |   35 +-
+ .../server/blockmanagement/DatanodeManager.java    |   67 +-
+ .../blockmanagement/DecommissionManager.java       |  160 ++--
+ .../server/blockmanagement/HeartbeatManager.java   |   24 +-
+ .../server/blockmanagement/NumberReplicas.java     |   39 +-
+ .../server/blockmanagement/StorageTypeStats.java   |    8 +-
+ .../hadoop/hdfs/server/common/JspHelper.java       |    2 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   13 +-
+ .../hdfs/server/namenode/NamenodeJspHelper.java    |    8 +-
+ .../src/main/resources/hdfs-default.xml            |    7 +
+ .../apache/hadoop/hdfs/AdminStatesBaseTest.java    |   19 +-
+ .../apache/hadoop/hdfs/TestMaintenanceState.java   |  775 +++++++++++++++++---
+ .../server/blockmanagement/TestBlockManager.java   |   87 ++-
+ .../server/namenode/TestDecommissioningStatus.java |   52 +-
+ .../namenode/TestNamenodeCapacityReport.java       |  137 ++--
+ .../apache/hadoop/hdfs/util/HostsFileWriter.java   |    1 +
+ 22 files changed, 1404 insertions(+), 434 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 1867df1..ef7ea4e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -238,6 +238,10 @@
+   public static final String  DFS_NAMENODE_REPLICATION_PENDING_TIMEOUT_SEC_KEY = "dfs.namenode.replication.pending.timeout-sec";
+   public static final int     DFS_NAMENODE_REPLICATION_PENDING_TIMEOUT_SEC_DEFAULT = -1;
+   public static final String  DFS_NAMENODE_REPLICATION_MAX_STREAMS_KEY = "dfs.namenode.replication.max-streams";
++  public static final String  DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY =
++      "dfs.namenode.maintenance.replication.min";
++  public static final int     DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_DEFAULT
++      = 1;
+   public static final int     DFS_NAMENODE_REPLICATION_MAX_STREAMS_DEFAULT = 2;
+   public static final String  DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_KEY = "dfs.namenode.replication.max-streams-hard-limit";
+   public static final int     DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_DEFAULT = 4;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index 80040c8..d073fa0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -171,48 +171,57 @@ public static SecureRandom getSecureRandom() {
+   }
+ 
+   /**
+-   * Compartor for sorting DataNodeInfo[] based on decommissioned states.
+-   * Decommissioned nodes are moved to the end of the array on sorting with
+-   * this compartor.
+-   */
+-  public static final Comparator<DatanodeInfo> DECOM_COMPARATOR = 
+-    new Comparator<DatanodeInfo>() {
+-      @Override
+-      public int compare(DatanodeInfo a, DatanodeInfo b) {
+-        return a.isDecommissioned() == b.isDecommissioned() ? 0 : 
+-          a.isDecommissioned() ? 1 : -1;
++   * Comparator for sorting DataNodeInfo[] based on
++   * decommissioned and entering_maintenance states.
++   */
++  public static class ServiceComparator implements Comparator<DatanodeInfo> {
++    @Override
++    public int compare(DatanodeInfo a, DatanodeInfo b) {
++      // Decommissioned nodes will still be moved to the end of the list
++      if (a.isDecommissioned()) {
++        return b.isDecommissioned() ? 0 : 1;
++      } else if (b.isDecommissioned()) {
++        return -1;
+       }
+-    };
+ 
++      // ENTERING_MAINTENANCE nodes should be after live nodes.
++      if (a.isEnteringMaintenance()) {
++        return b.isEnteringMaintenance() ? 0 : 1;
++      } else if (b.isEnteringMaintenance()) {
++        return -1;
++      } else {
++        return 0;
++      }
++    }
++  }
+ 
+   /**
+-   * Comparator for sorting DataNodeInfo[] based on decommissioned/stale states.
+-   * Decommissioned/stale nodes are moved to the end of the array on sorting
+-   * with this comparator.
+-   */ 
++   * Comparator for sorting DataNodeInfo[] based on
++   * stale, decommissioned and entering_maintenance states.
++   * Order: live -> stale -> entering_maintenance -> decommissioned
++   */
+   @InterfaceAudience.Private 
+-  public static class DecomStaleComparator implements Comparator<DatanodeInfo> {
++  public static class ServiceAndStaleComparator extends ServiceComparator {
+     private final long staleInterval;
+ 
+     /**
+-     * Constructor of DecomStaleComparator
++     * Constructor of ServiceAndStaleComparator
+      * 
+      * @param interval
+      *          The time interval for marking datanodes as stale is passed from
+      *          outside, since the interval may be changed dynamically
+      */
+-    public DecomStaleComparator(long interval) {
++    public ServiceAndStaleComparator(long interval) {
+       this.staleInterval = interval;
+     }
+ 
+     @Override
+     public int compare(DatanodeInfo a, DatanodeInfo b) {
+-      // Decommissioned nodes will still be moved to the end of the list
+-      if (a.isDecommissioned()) {
+-        return b.isDecommissioned() ? 0 : 1;
+-      } else if (b.isDecommissioned()) {
+-        return -1;
++      int ret = super.compare(a, b);
++      if (ret != 0) {
++        return ret;
+       }
++
+       // Stale nodes will be moved behind the normal nodes
+       boolean aStale = a.isStale(staleInterval);
+       boolean bStale = b.isStale(staleInterval);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+index c55263c..82516a6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/balancer/Dispatcher.java
+@@ -899,20 +899,17 @@ void add(Source source, StorageGroup target) {
+   }
+ 
+   private boolean shouldIgnore(DatanodeInfo dn) {
+-    // ignore decommissioned nodes
+-    final boolean decommissioned = dn.isDecommissioned();
+-    // ignore decommissioning nodes
+-    final boolean decommissioning = dn.isDecommissionInProgress();
++    // ignore out-of-service nodes
++    final boolean outOfService = !dn.isInService();
+     // ignore nodes in exclude list
+     final boolean excluded = Util.isExcluded(excludedNodes, dn);
+     // ignore nodes not in the include list (if include list is not empty)
+     final boolean notIncluded = !Util.isIncluded(includedNodes, dn);
+ 
+-    if (decommissioned || decommissioning || excluded || notIncluded) {
++    if (outOfService || excluded || notIncluded) {
+       if (LOG.isTraceEnabled()) {
+         LOG.trace("Excluding datanode " + dn
+-            + ": decommissioned=" + decommissioned
+-            + ", decommissioning=" + decommissioning
++            + ": outOfService=" + outOfService
+             + ", excluded=" + excluded
+             + ", notIncluded=" + notIncluded);
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 4bb94c1..62c7c28 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -22,6 +22,7 @@
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.EnumSet;
+@@ -108,6 +109,29 @@
+ 
+ /**
+  * Keeps information related to the blocks stored in the Hadoop cluster.
++ * For block state management, it tries to maintain the  safety
++ * property of "# of live replicas == # of expected redundancy" under
++ * any events such as decommission, namenode failover, datanode failure.
++ *
++ * The motivation of maintenance mode is to allow admins quickly repair nodes
++ * without paying the cost of decommission. Thus with maintenance mode,
++ * # of live replicas doesn't have to be equal to # of expected redundancy.
++ * If any of the replica is in maintenance mode, the safety property
++ * is extended as follows. These property still apply for the case of zero
++ * maintenance replicas, thus we can use these safe property for all scenarios.
++ * a. # of live replicas >= # of min replication for maintenance.
++ * b. # of live replicas <= # of expected redundancy.
++ * c. # of live replicas and maintenance replicas >= # of expected redundancy.
++ *
++ * For regular replication, # of min live replicas for maintenance is determined
++ * by DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY. This number has to <=
++ * DFS_NAMENODE_REPLICATION_MIN_KEY.
++ * For erasure encoding, # of min live replicas for maintenance is
++ * BlockInfoStriped#getRealDataBlockNum.
++ *
++ * Another safety property is to satisfy the block placement policy. While the
++ * policy is configurable, the replicas the policy is applied to are the live
++ * replicas + maintenance replicas.
+  */
+ @InterfaceAudience.Private
+ public class BlockManager implements BlockStatsMXBean {
+@@ -293,6 +317,11 @@ public int getPendingDataNodeMessageCount() {
+   /** Check whether name system is running before terminating */
+   private boolean checkNSRunning = true;
+ 
++  /** Minimum live replicas needed for the datanode to be transitioned
++   * from ENTERING_MAINTENANCE to IN_MAINTENANCE.
++   */
++  private final short minReplicationToBeInMaintenance;
++
+   public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+       final Configuration conf) throws IOException {
+     this.namesystem = namesystem;
+@@ -321,13 +350,13 @@ public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+     this.maxCorruptFilesReturned = conf.getInt(
+       DFSConfigKeys.DFS_DEFAULT_MAX_CORRUPT_FILES_RETURNED_KEY,
+       DFSConfigKeys.DFS_DEFAULT_MAX_CORRUPT_FILES_RETURNED);
+-    this.defaultReplication = conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY, 
+-                                          DFSConfigKeys.DFS_REPLICATION_DEFAULT);
++    this.defaultReplication = conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY,
++        DFSConfigKeys.DFS_REPLICATION_DEFAULT);
+ 
+-    final int maxR = conf.getInt(DFSConfigKeys.DFS_REPLICATION_MAX_KEY, 
+-                                 DFSConfigKeys.DFS_REPLICATION_MAX_DEFAULT);
++    final int maxR = conf.getInt(DFSConfigKeys.DFS_REPLICATION_MAX_KEY,
++        DFSConfigKeys.DFS_REPLICATION_MAX_DEFAULT);
+     final int minR = conf.getInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY,
+-                                 DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_DEFAULT);
++        DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_DEFAULT);
+     if (minR <= 0)
+       throw new IOException("Unexpected configuration parameters: "
+           + DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY
+@@ -357,8 +386,8 @@ public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+     this.blocksReplWorkMultiplier = DFSUtil.getReplWorkMultiplier(conf);
+ 
+     this.replicationRecheckInterval = 
+-      conf.getInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_KEY, 
+-                  DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_DEFAULT) * 1000L;
++      conf.getInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_KEY,
++              DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_DEFAULT) * 1000L;
+ 
+     this.storageInfoDefragmentInterval =
+       conf.getLong(
+@@ -376,13 +405,32 @@ public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
+     this.encryptDataTransfer =
+         conf.getBoolean(DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_KEY,
+             DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT);
+-    
++
+     this.maxNumBlocksToLog =
+         conf.getLong(DFSConfigKeys.DFS_MAX_NUM_BLOCKS_TO_LOG_KEY,
+             DFSConfigKeys.DFS_MAX_NUM_BLOCKS_TO_LOG_DEFAULT);
+     this.numBlocksPerIteration = conf.getInt(
+         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT,
+         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT_DEFAULT);
++
++    final int minMaintenanceR = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY,
++        DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_DEFAULT);
++
++    if (minMaintenanceR < 0) {
++      throw new IOException("Unexpected configuration parameters: "
++          + DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY
++          + " = " + minMaintenanceR + " < 0");
++    }
++    if (minMaintenanceR > minR) {
++      throw new IOException("Unexpected configuration parameters: "
++          + DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY
++          + " = " + minMaintenanceR + " > "
++          + DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY
++          + " = " + minR);
++    }
++    this.minReplicationToBeInMaintenance = (short)minMaintenanceR;
++
+     this.blockReportLeaseManager = new BlockReportLeaseManager(conf);
+ 
+     LOG.info("defaultReplication         = " + defaultReplication);
+@@ -558,7 +606,7 @@ public void metaSave(PrintWriter out) {
+     // Dump all datanodes
+     getDatanodeManager().datanodeDump(out);
+   }
+-  
++
+   /**
+    * Dump the metadata for the given block in a human-readable
+    * form.
+@@ -587,12 +635,12 @@ private void dumpBlockMeta(Block block, PrintWriter out) {
+       out.print(fileName + ": ");
+     }
+     // l: == live:, d: == decommissioned c: == corrupt e: == excess
+-    out.print(block + ((usableReplicas > 0)? "" : " MISSING") + 
++    out.print(block + ((usableReplicas > 0)? "" : " MISSING") +
+               " (replicas:" +
+               " l: " + numReplicas.liveReplicas() +
+               " d: " + numReplicas.decommissionedAndDecommissioning() +
+               " c: " + numReplicas.corruptReplicas() +
+-              " e: " + numReplicas.excessReplicas() + ") "); 
++              " e: " + numReplicas.excessReplicas() + ") ");
+ 
+     Collection<DatanodeDescriptor> corruptNodes = 
+                                   corruptReplicas.getNodes(block);
+@@ -627,6 +675,14 @@ public boolean checkMinReplication(BlockInfo block) {
+     return (countNodes(block).liveReplicas() >= minReplication);
+   }
+ 
++  public short getMinReplication() {
++    return minReplication;
++  }
++
++  public short getMinReplicationToBeInMaintenance() {
++    return minReplicationToBeInMaintenance;
++  }
++
+   /**
+    * Commit a block of a file
+    * 
+@@ -770,7 +826,7 @@ public LocatedBlock convertLastBlockToUnderConstruction(
+     NumberReplicas replicas = countNodes(ucBlock);
+     neededReplications.remove(ucBlock, replicas.liveReplicas(),
+         replicas.readOnlyReplicas(),
+-        replicas.decommissionedAndDecommissioning(), getReplication(ucBlock));
++        replicas.outOfServiceReplicas(), getReplication(ucBlock));
+     pendingReplications.remove(ucBlock);
+ 
+     // remove this block from the list of pending blocks to be deleted. 
+@@ -877,7 +933,8 @@ private LocatedBlock createLocatedBlock(final BlockInfo blk, final long pos
+     }
+ 
+     // get block locations
+-    final int numCorruptNodes = countNodes(blk).corruptReplicas();
++    NumberReplicas numberReplicas = countNodes(blk);
++    final int numCorruptNodes = numberReplicas.corruptReplicas();
+     final int numCorruptReplicas = corruptReplicas.numCorruptReplicas(blk);
+     if (numCorruptNodes != numCorruptReplicas) {
+       LOG.warn("Inconsistent number of corrupt replicas for "
+@@ -887,19 +944,38 @@ private LocatedBlock createLocatedBlock(final BlockInfo blk, final long pos
+ 
+     final int numNodes = blocksMap.numNodes(blk);
+     final boolean isCorrupt = numCorruptReplicas == numNodes;
+-    final int numMachines = isCorrupt ? numNodes: numNodes - numCorruptReplicas;
+-    final DatanodeStorageInfo[] machines = new DatanodeStorageInfo[numMachines];
++    int numMachines = isCorrupt ? numNodes: numNodes - numCorruptReplicas;
++    numMachines -= numberReplicas.maintenanceNotForReadReplicas();
++    DatanodeStorageInfo[] machines = new DatanodeStorageInfo[numMachines];
+     int j = 0;
+     if (numMachines > 0) {
++      final boolean noCorrupt = (numCorruptReplicas == 0);
+       for(DatanodeStorageInfo storage : blocksMap.getStorages(blk)) {
+-        final DatanodeDescriptor d = storage.getDatanodeDescriptor();
+-        final boolean replicaCorrupt = corruptReplicas.isReplicaCorrupt(blk, d);
+-        if (isCorrupt || (!replicaCorrupt))
+-          machines[j++] = storage;
++        if (storage.getState() != State.FAILED) {
++          final DatanodeDescriptor d = storage.getDatanodeDescriptor();
++          // Don't pick IN_MAINTENANCE or dead ENTERING_MAINTENANCE states.
++          if (d.isInMaintenance()
++              || (d.isEnteringMaintenance() && !d.isAlive())) {
++            continue;
++          }
++          if (noCorrupt) {
++            machines[j++] = storage;
++          } else {
++            final boolean replicaCorrupt = isReplicaCorrupt(blk, d);
++            if (isCorrupt || !replicaCorrupt) {
++              machines[j++] = storage;
++            }
++          }
++        }
+       }
+     }
++
++    if(j < machines.length) {
++      machines = Arrays.copyOf(machines, j);
++    }
++
+     assert j == machines.length :
+-      "isCorrupt: " + isCorrupt + 
++      "isCorrupt: " + isCorrupt +
+       " numMachines: " + numMachines +
+       " numNodes: " + numNodes +
+       " numCorrupt: " + numCorruptNodes +
+@@ -1414,8 +1490,6 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+               continue;
+             }
+ 
+-            requiredReplication = bc.getBlockReplication();
+-
+             // get a source data-node
+             containingNodes = new ArrayList<DatanodeDescriptor>();
+             List<DatanodeStorageInfo> liveReplicaNodes = new ArrayList<DatanodeStorageInfo>();
+@@ -1423,6 +1497,8 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+             srcNode = chooseSourceDatanode(
+                 block, containingNodes, liveReplicaNodes, numReplicas,
+                 priority);
++            requiredReplication = getExpectedLiveRedundancyNum(block, numReplicas);
++
+             if(srcNode == null) { // block can not be replicated from any node
+               LOG.debug("Block " + block + " cannot be repl from any node");
+               continue;
+@@ -1433,17 +1509,14 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+             assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
+ 
+             // do not schedule more if enough replicas is already pending
+-            numEffectiveReplicas = numReplicas.liveReplicas() +
+-                                    pendingReplications.getNumReplicas(block);
+-      
+-            if (numEffectiveReplicas >= requiredReplication) {
+-              if ( (pendingReplications.getNumReplicas(block) > 0) ||
+-                   (isPlacementPolicySatisfied(block)) ) {
+-                neededReplications.remove(block, priority); // remove from neededReplications
+-                blockLog.info("BLOCK* Removing {} from neededReplications as" +
+-                        " it has enough replicas", block);
+-                continue;
+-              }
++            int pendingNum = pendingReplications.getNumReplicas(block);
++            numEffectiveReplicas = numReplicas.liveReplicas() + pendingNum;
++            if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum)) {
++              // remove from neededReplications
++              neededReplications.remove(block, priority);
++              blockLog.info("BLOCK* Removing {} from neededReplications as" +
++                  " it has enough replicas", block);
++              continue;
+             }
+ 
+             if (numReplicas.liveReplicas() < requiredReplication) {
+@@ -1498,22 +1571,19 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+             rw.targets = null;
+             continue;
+           }
+-          requiredReplication = bc.getBlockReplication();
+ 
+           // do not schedule more if enough replicas is already pending
+           NumberReplicas numReplicas = countNodes(block);
+-          numEffectiveReplicas = numReplicas.liveReplicas() +
+-            pendingReplications.getNumReplicas(block);
+-
+-          if (numEffectiveReplicas >= requiredReplication) {
+-            if ( (pendingReplications.getNumReplicas(block) > 0) ||
+-                 (isPlacementPolicySatisfied(block)) ) {
+-              neededReplications.remove(block, priority); // remove from neededReplications
+-              rw.targets = null;
+-              blockLog.info("BLOCK* Removing {} from neededReplications as" +
+-                      " it has enough replicas", block);
+-              continue;
+-            }
++          requiredReplication = getExpectedLiveRedundancyNum(block, numReplicas);
++          int pendingNum = pendingReplications.getNumReplicas(block);
++          numEffectiveReplicas = numReplicas.liveReplicas() + pendingNum;
++          if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum)) {
++            // remove from neededReplications
++            neededReplications.remove(block, priority);
++            rw.targets = null;
++            blockLog.info("BLOCK* Removing {} from neededReplications as" +
++                " it has enough replicas", block);
++            continue;
+           }
+ 
+           if ( (numReplicas.liveReplicas() >= requiredReplication) &&
+@@ -1571,6 +1641,16 @@ int computeReplicationWorkForBlocks(List<List<BlockInfo>> blocksToReplicate) {
+     return scheduledWork;
+   }
+ 
++  // Check if the number of live + pending replicas satisfies
++  // the expected redundancy.
++  boolean hasEnoughEffectiveReplicas(BlockInfo block,
++      NumberReplicas numReplicas, int pendingReplicaNum) {
++    int required = getExpectedLiveRedundancyNum(block, numReplicas);
++    int numEffectiveReplicas = numReplicas.liveReplicas() + pendingReplicaNum;
++    return (numEffectiveReplicas >= required) &&
++        (pendingReplicaNum > 0 || isPlacementPolicySatisfied(block));
++  }
++
+   /** Choose target for WebHDFS redirection. */
+   public DatanodeStorageInfo[] chooseTarget4WebHDFS(String src,
+       DatanodeDescriptor clientnode, Set<Node> excludes, long blocksize) {
+@@ -1688,7 +1768,9 @@ DatanodeDescriptor chooseSourceDatanode(Block block,
+     int decommissioning = 0;
+     int corrupt = 0;
+     int excess = 0;
+-    
++    int maintenanceNotForRead = 0;
++    int maintenanceForRead = 0;
++
+     Collection<DatanodeDescriptor> nodesCorrupt = corruptReplicas.getNodes(block);
+     for(DatanodeStorageInfo storage : blocksMap.getStorages(block)) {
+       final DatanodeDescriptor node = storage.getDatanodeDescriptor();
+@@ -1701,6 +1783,12 @@ else if (node.isDecommissionInProgress()) {
+         decommissioning += countableReplica;
+       } else if (node.isDecommissioned()) {
+         decommissioned += countableReplica;
++      } else if (node.isMaintenance()) {
++        if (node.isInMaintenance() || !node.isAlive()) {
++          maintenanceNotForRead++;
++        } else {
++          maintenanceForRead++;
++        }
+       } else if (excessBlocks != null && excessBlocks.contains(block)) {
+         excess += countableReplica;
+       } else {
+@@ -1715,10 +1803,9 @@ else if (node.isDecommissionInProgress()) {
+       // If so, do not select the node as src node
+       if ((nodesCorrupt != null) && nodesCorrupt.contains(node))
+         continue;
+-      if(priority != UnderReplicatedBlocks.QUEUE_HIGHEST_PRIORITY 
+-          && !node.isDecommissionInProgress() 
+-          && node.getNumberOfBlocksToBeReplicated() >= maxReplicationStreams)
+-      {
++      if(priority != UnderReplicatedBlocks.QUEUE_HIGHEST_PRIORITY
++          && !node.isDecommissionInProgress() && !node.isEnteringMaintenance()
++          && node.getNumberOfBlocksToBeReplicated() >= maxReplicationStreams) {
+         continue; // already reached replication limit
+       }
+       if (node.getNumberOfBlocksToBeReplicated() >= replicationStreamsHardLimit)
+@@ -1731,6 +1818,11 @@ else if (node.isDecommissionInProgress()) {
+       // never use already decommissioned nodes
+       if(node.isDecommissioned())
+         continue;
++      // Don't use dead ENTERING_MAINTENANCE or IN_MAINTENANCE nodes.
++      if((!node.isAlive() && node.isEnteringMaintenance()) ||
++          node.isInMaintenance()) {
++        continue;
++      }
+ 
+       // We got this far, current node is a reasonable choice
+       if (srcNode == null) {
+@@ -1745,7 +1837,7 @@ else if (node.isDecommissionInProgress()) {
+     }
+     if(numReplicas != null)
+       numReplicas.set(live, readonly, decommissioned, decommissioning, corrupt,
+-          excess, 0);
++          excess, 0, maintenanceNotForRead, maintenanceForRead);
+     return srcNode;
+   }
+ 
+@@ -1768,9 +1860,10 @@ private void processPendingReplications() {
+             continue;
+           }
+           NumberReplicas num = countNodes(timedOutItems[i]);
+-          if (isNeededReplication(bi, getReplication(bi), num.liveReplicas())) {
+-            neededReplications.add(bi, num.liveReplicas(), num.readOnlyReplicas(),
+-                num.decommissionedAndDecommissioning(), getReplication(bi));
++          if (isNeededReplication(bi, num)) {
++            neededReplications.add(bi, num.liveReplicas(),
++                num.readOnlyReplicas(), num.outOfServiceReplicas(),
++                getReplication(bi));
+           }
+         }
+       } finally {
+@@ -2675,8 +2768,8 @@ private Block addStoredBlock(final BlockInfo block,
+     // Now check for completion of blocks and safe block count
+     NumberReplicas num = countNodes(storedBlock);
+     int numLiveReplicas = num.liveReplicas();
+-    int numCurrentReplica = numLiveReplicas
+-      + pendingReplications.getNumReplicas(storedBlock);
++    int pendingNum = pendingReplications.getNumReplicas(storedBlock);
++    int numCurrentReplica = numLiveReplicas + pendingNum;
+ 
+     if(storedBlock.getBlockUCState() == BlockUCState.COMMITTED &&
+         numLiveReplicas >= minReplication) {
+@@ -2702,10 +2795,9 @@ private Block addStoredBlock(final BlockInfo block,
+ 
+     // handle underReplication/overReplication
+     short fileReplication = bc.getBlockReplication();
+-    if (!isNeededReplication(storedBlock, fileReplication, numCurrentReplica)) {
++    if (!isNeededReplication(storedBlock, num, pendingNum)) {
+       neededReplications.remove(storedBlock, numCurrentReplica,
+-          num.readOnlyReplicas(),
+-          num.decommissionedAndDecommissioning(), fileReplication);
++          num.readOnlyReplicas(), num.outOfServiceReplicas(), fileReplication);
+     } else {
+       updateNeededReplications(storedBlock, curReplicaDelta, 0);
+     }
+@@ -2936,9 +3028,10 @@ private MisReplicationResult processMisReplicatedBlock(BlockInfo block) {
+     NumberReplicas num = countNodes(block);
+     int numCurrentReplica = num.liveReplicas();
+     // add to under-replicated queue if need to be
+-    if (isNeededReplication(block, expectedReplication, numCurrentReplica)) {
+-      if (neededReplications.add(block, numCurrentReplica, num.readOnlyReplicas(),
+-          num.decommissionedAndDecommissioning(), expectedReplication)) {
++    if (isNeededReplication(block, num)) {
++      if (neededReplications.add(block, numCurrentReplica,
++          num.readOnlyReplicas(), num.outOfServiceReplicas(),
++          expectedReplication)) {
+         return MisReplicationResult.UNDER_REPLICATED;
+       }
+     }
+@@ -2970,7 +3063,11 @@ public void setReplication(final short oldRepl, final short newRepl,
+ 
+     // update needReplication priority queues
+     for(BlockInfo b : blocks) {
+-      updateNeededReplications(b, 0, newRepl-oldRepl);
++      NumberReplicas num = countNodes(b);
++      updateNeededReplications(b, 0, newRepl - oldRepl);
++      if (num.liveReplicas() > newRepl) {
++        processOverReplicatedBlock(b, newRepl, null, null);
++      }
+     }
+       
+     if (oldRepl > newRepl) {
+@@ -3015,7 +3112,7 @@ private void processOverReplicatedBlock(final Block block,
+       LightWeightLinkedSet<Block> excessBlocks = excessReplicateMap.get(cur
+           .getDatanodeUuid());
+       if (excessBlocks == null || !excessBlocks.contains(block)) {
+-        if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()) {
++        if (cur.isInService()) {
+           // exclude corrupt replicas
+           if (corruptNodes == null || !corruptNodes.contains(cur)) {
+             nonExcess.add(storage);
+@@ -3372,6 +3469,8 @@ public NumberReplicas countNodes(Block b) {
+     int corrupt = 0;
+     int excess = 0;
+     int stale = 0;
++    int maintenanceNotForRead = 0;
++    int maintenanceForRead = 0;
+     Collection<DatanodeDescriptor> nodesCorrupt = corruptReplicas.getNodes(b);
+     for(DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+       if (storage.getState() == State.FAILED) {
+@@ -3387,6 +3486,12 @@ public NumberReplicas countNodes(Block b) {
+         decommissioning++;
+       } else if (node.isDecommissioned()) {
+         decommissioned++;
++      } else if (node.isMaintenance()) {
++        if (node.isInMaintenance() || !node.isAlive()) {
++          maintenanceNotForRead++;
++        } else {
++          maintenanceForRead++;
++        }
+       } else {
+         LightWeightLinkedSet<Block> blocksExcess = excessReplicateMap.get(node
+             .getDatanodeUuid());
+@@ -3401,7 +3506,7 @@ public NumberReplicas countNodes(Block b) {
+       }
+     }
+     return new NumberReplicas(live, readonly, decommissioned, decommissioning,
+-        corrupt, excess, stale);
++        corrupt, excess, stale, maintenanceNotForRead, maintenanceForRead);
+   }
+ 
+   /** 
+@@ -3430,11 +3535,11 @@ int countLiveNodes(BlockInfo b) {
+   }
+ 
+   /**
+-   * On stopping decommission, check if the node has excess replicas.
++   * On putting the node in service, check if the node has excess replicas.
+    * If there are any excess replicas, call processOverReplicatedBlock().
+    * Process over replicated blocks only when active NN is out of safe mode.
+    */
+-  void processOverReplicatedBlocksOnReCommission(
++  void processExtraRedundancyBlocksOnInService(
+       final DatanodeDescriptor srcNode) {
+     if (!namesystem.isPopulatingReplQueues()) {
+       return;
+@@ -3458,10 +3563,11 @@ void processOverReplicatedBlocksOnReCommission(
+   }
+ 
+   /**
+-   * Returns whether a node can be safely decommissioned based on its 
+-   * liveness. Dead nodes cannot always be safely decommissioned.
++   * Returns whether a node can be safely decommissioned or in maintenance
++   * based on its liveness. Dead nodes cannot always be safely decommissioned
++   * or in maintenance.
+    */
+-  boolean isNodeHealthyForDecommission(DatanodeDescriptor node) {
++  boolean isNodeHealthyForDecommissionOrMaintenance(DatanodeDescriptor node) {
+     if (!node.checkBlockReportReceived()) {
+       LOG.info("Node {} hasn't sent its first block report.", node);
+       return false;
+@@ -3475,17 +3581,18 @@ boolean isNodeHealthyForDecommission(DatanodeDescriptor node) {
+     if (pendingReplicationBlocksCount == 0 &&
+         underReplicatedBlocksCount == 0) {
+       LOG.info("Node {} is dead and there are no under-replicated" +
+-          " blocks or blocks pending replication. Safe to decommission.", 
+-          node);
++          " blocks or blocks pending replication. Safe to decommission or" +
++          " put in maintenance.", node);
+       return true;
+     }
+ 
+     LOG.warn("Node {} is dead " +
+-        "while decommission is in progress. Cannot be safely " +
+-        "decommissioned since there is risk of reduced " +
+-        "data durability or data loss. Either restart the failed node or" +
+-        " force decommissioning by removing, calling refreshNodes, " +
+-        "then re-adding to the excludes files.", node);
++        "while in {}. Cannot be safely " +
++        "decommissioned or be in maintenance since there is risk of reduced " +
++        "data durability or data loss. Either restart the failed node or " +
++        "force decommissioning or maintenance by removing, calling " +
++        "refreshNodes, then re-adding to the excludes or host config files.",
++        node, node.getAdminState());
+     return false;
+   }
+ 
+@@ -3535,16 +3642,17 @@ private void updateNeededReplications(final BlockInfo block,
+         return;
+       }
+       NumberReplicas repl = countNodes(block);
++      int pendingNum = pendingReplications.getNumReplicas(block);
+       int curExpectedReplicas = getReplication(block);
+-      if (isNeededReplication(block, curExpectedReplicas, repl.liveReplicas())) {
++      if (!hasEnoughEffectiveReplicas(block, repl, pendingNum)) {
+         neededReplications.update(block, repl.liveReplicas(), repl.readOnlyReplicas(),
+-            repl.decommissionedAndDecommissioning(), curExpectedReplicas,
++            repl.outOfServiceReplicas(), curExpectedReplicas,
+             curReplicasDelta, expectedReplicasDelta);
+       } else {
+         int oldReplicas = repl.liveReplicas()-curReplicasDelta;
+         int oldExpectedReplicas = curExpectedReplicas-expectedReplicasDelta;
+         neededReplications.remove(block, oldReplicas, repl.readOnlyReplicas(),
+-            repl.decommissionedAndDecommissioning(), oldExpectedReplicas);
++            repl.outOfServiceReplicas(), oldExpectedReplicas);
+       }
+     } finally {
+       namesystem.writeUnlock();
+@@ -3561,17 +3669,18 @@ public void checkReplication(BlockCollection bc) {
+     final short expected = bc.getBlockReplication();
+     for (BlockInfo block : bc.getBlocks()) {
+       final NumberReplicas n = countNodes(block);
+-      if (isNeededReplication(block, expected, n.liveReplicas())) {
++      final int pending = pendingReplications.getNumReplicas(block);
++      if (!hasEnoughEffectiveReplicas(block, n, pending)) {
+         neededReplications.add(block, n.liveReplicas(),
+             n.readOnlyReplicas(),
+-            n.decommissionedAndDecommissioning(), expected);
++            n.outOfServiceReplicas(), expected);
+       } else if (n.liveReplicas() > expected) {
+         processOverReplicatedBlock(block, expected, null, null);
+       }
+     }
+   }
+ 
+-  /** 
++  /**
+    * @return 0 if the block is not found;
+    *         otherwise, return the replication factor of the block.
+    */
+@@ -3580,7 +3689,6 @@ private int getReplication(Block block) {
+     return bc == null? 0: bc.getBlockReplication();
+   }
+ 
+-
+   /**
+    * Get blocks to invalidate for <i>nodeId</i>
+    * in {@link #invalidateBlocks}.
+@@ -3629,6 +3737,8 @@ boolean isPlacementPolicySatisfied(Block b) {
+         .getNodes(b);
+     for (DatanodeStorageInfo storage : blocksMap.getStorages(b)) {
+       final DatanodeDescriptor cur = storage.getDatanodeDescriptor();
++      // Nodes under maintenance should be counted as valid replicas from
++      // rack policy point of view.
+       if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()
+           && ((corruptNodes == null) || !corruptNodes.contains(cur))) {
+         liveNodes.add(cur);
+@@ -3639,21 +3749,38 @@ boolean isPlacementPolicySatisfied(Block b) {
+         getReplication(b)).isPlacementPolicySatisfied();
+   }
+ 
++  boolean isNeededReplicationForMaintenance(BlockInfo storedBlock,
++      NumberReplicas numberReplicas) {
++    return storedBlock.isComplete() && (numberReplicas.liveReplicas() <
++        getMinReplicationToBeInMaintenance() ||
++        !isPlacementPolicySatisfied(storedBlock));
++  }
++
++  boolean isNeededReplication(BlockInfo storedBlock,
++      NumberReplicas numberReplicas) {
++    return isNeededReplication(storedBlock, numberReplicas, 0);
++  }
++
+   /**
+-   * A block needs replication if the number of replicas is less than expected
+-   * or if it does not have enough racks.
++   * A block needs reconstruction if the number of redundancies is less than
++   * expected or if it does not have enough racks.
+    */
+-  boolean isNeededReplication(Block b, int expected, int current) {
+-    BlockInfo blockInfo;
+-    if (b instanceof BlockInfo) {
+-      blockInfo = (BlockInfo) b;
+-    } else {
+-      blockInfo = getStoredBlock(b);
+-    }
+-    return blockInfo.isComplete()
+-        && (current < expected || !isPlacementPolicySatisfied(b));
++ boolean isNeededReplication(BlockInfo storedBlock,
++      NumberReplicas numberReplicas, int pending) {
++    return storedBlock.isComplete() &&
++        !hasEnoughEffectiveReplicas(storedBlock, numberReplicas, pending);
+   }
+-  
++
++  // Exclude maintenance, but make sure it has minimal live replicas
++  // to satisfy the maintenance requirement.
++  public short getExpectedLiveRedundancyNum(BlockInfo block,
++      NumberReplicas numberReplicas) {
++    final short expectedRedundancy = (short) getReplication(block);
++    return (short)Math.max(expectedRedundancy -
++        numberReplicas.maintenanceReplicas(),
++        getMinReplicationToBeInMaintenance());
++  }
++
+   public long getMissingBlocksCount() {
+     // not locking
+     return this.neededReplications.getCorruptBlockSize();
+@@ -3923,8 +4050,7 @@ public void clearQueues() {
+     datanodeManager.clearPendingQueues();
+     postponedMisreplicatedBlocks.clear();
+     postponedMisreplicatedBlocksCount.set(0);
+-  };
+-
++  }
+ 
+   private static class ReplicationWork {
+ 
+@@ -4126,4 +4252,8 @@ void enqueue(Runnable action) throws InterruptedException {
+       }
+     }
+   }
++
++  boolean isReplicaCorrupt(BlockInfo blk, DatanodeDescriptor d) {
++    return corruptReplicas.isReplicaCorrupt(blk, d);
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index cb8aa53..d926048 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -809,8 +809,8 @@ boolean isGoodDatanode(DatanodeDescriptor node,
+                          List<DatanodeStorageInfo> results,
+                          boolean avoidStaleNodes) {
+     // check if the node is (being) decommissioned
+-    if (node.isDecommissionInProgress() || node.isDecommissioned()) {
+-      logNodeIsNotChosen(node, "the node is (being) decommissioned ");
++    if (!node.isInService()) {
++      logNodeIsNotChosen(node, "the node isn't in service.");
+       return false;
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/CacheReplicationMonitor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/CacheReplicationMonitor.java
+index ae3c1db..abca1af 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/CacheReplicationMonitor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/CacheReplicationMonitor.java
+@@ -684,7 +684,7 @@ private void addNewPendingCached(final int neededCached,
+       if (datanode == null) {
+         continue;
+       }
+-      if (datanode.isDecommissioned() || datanode.isDecommissionInProgress()) {
++      if (!datanode.isInService()) {
+         continue;
+       }
+       if (corrupt != null && corrupt.contains(datanode)) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+index d94ab5d..33b0a23 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeDescriptor.java
+@@ -152,8 +152,8 @@ public Type getType() {
+ 
+   // Stores status of decommissioning.
+   // If node is not decommissioning, do not use this object for anything.
+-  public final DecommissioningStatus decommissioningStatus =
+-      new DecommissioningStatus();
++  private final LeavingServiceStatus leavingServiceStatus =
++      new LeavingServiceStatus();
+ 
+   private long curBlockReportId = 0;
+ 
+@@ -297,6 +297,10 @@ public void setNeedKeyUpdate(boolean needKeyUpdate) {
+     this.needKeyUpdate = needKeyUpdate;
+   }
+ 
++  public LeavingServiceStatus getLeavingServiceStatus() {
++    return leavingServiceStatus;
++  }
++
+   @VisibleForTesting
+   public DatanodeStorageInfo getStorageInfo(String storageID) {
+     synchronized (storageMap) {
+@@ -737,51 +741,54 @@ public boolean equals(Object obj) {
+     return (this == obj) || super.equals(obj);
+   }
+ 
+-  /** Decommissioning status */
+-  public class DecommissioningStatus {
++  /** Leaving service status. */
++  public class LeavingServiceStatus {
+     private int underReplicatedBlocks;
+-    private int decommissionOnlyReplicas;
++    private int outOfServiceOnlyReplicas;
+     private int underReplicatedInOpenFiles;
+     private long startTime;
+     
+     synchronized void set(int underRep,
+         int onlyRep, int underConstruction) {
+-      if (!isDecommissionInProgress()) {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
+         return;
+       }
+       underReplicatedBlocks = underRep;
+-      decommissionOnlyReplicas = onlyRep;
++      outOfServiceOnlyReplicas = onlyRep;
+       underReplicatedInOpenFiles = underConstruction;
+     }
+ 
+     /** @return the number of under-replicated blocks */
+     public synchronized int getUnderReplicatedBlocks() {
+-      if (!isDecommissionInProgress()) {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
+         return 0;
+       }
+       return underReplicatedBlocks;
+     }
+-    /** @return the number of decommission-only replicas */
+-    public synchronized int getDecommissionOnlyReplicas() {
+-      if (!isDecommissionInProgress()) {
++    /** @return the number of blocks with out-of-service-only replicas */
++    public synchronized int getOutOfServiceOnlyReplicas() {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
+         return 0;
+       }
+-      return decommissionOnlyReplicas;
++      return outOfServiceOnlyReplicas;
+     }
+     /** @return the number of under-replicated blocks in open files */
+     public synchronized int getUnderReplicatedInOpenFiles() {
+-      if (!isDecommissionInProgress()) {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
+         return 0;
+       }
+       return underReplicatedInOpenFiles;
+     }
+     /** Set start time */
+     public synchronized void setStartTime(long time) {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
++        return;
++      }
+       startTime = time;
+     }
+     /** @return start time */
+     public synchronized long getStartTime() {
+-      if (!isDecommissionInProgress()) {
++      if (!isDecommissionInProgress() && !isEnteringMaintenance()) {
+         return 0;
+       }
+       return startTime;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index 88b03a0..bfa6bd8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -381,8 +381,8 @@ public void sortLocatedBlocks(final String targethost,
+     }
+     
+     Comparator<DatanodeInfo> comparator = avoidStaleDataNodesForRead ?
+-        new DFSUtil.DecomStaleComparator(staleInterval) : 
+-        DFSUtil.DECOM_COMPARATOR;
++        new DFSUtil.ServiceAndStaleComparator(staleInterval) :
++        new DFSUtil.ServiceComparator();
+         
+     for (LocatedBlock b : locatedblocks) {
+       DatanodeInfo[] di = b.getLocations();
+@@ -543,9 +543,20 @@ void datanodeDump(final PrintWriter out) {
+    * @param nodeInfo datanode descriptor.
+    */
+   private void removeDatanode(DatanodeDescriptor nodeInfo) {
++    removeDatanode(nodeInfo, true);
++  }
++
++  /**
++   * Remove a datanode descriptor.
++   * @param nodeInfo datanode descriptor.
++   */
++  private void removeDatanode(DatanodeDescriptor nodeInfo,
++      boolean removeBlocksFromBlocksMap) {
+     assert namesystem.hasWriteLock();
+     heartbeatManager.removeDatanode(nodeInfo);
+-    blockManager.removeBlocksAssociatedTo(nodeInfo);
++    if (removeBlocksFromBlocksMap) {
++      blockManager.removeBlocksAssociatedTo(nodeInfo);
++    }
+     networktopology.remove(nodeInfo);
+     decrementVersionCount(nodeInfo.getSoftwareVersion());
+     blockManager.getBlockReportLeaseManager().unregister(nodeInfo);
+@@ -566,7 +577,7 @@ public void removeDatanode(final DatanodeID node
+     try {
+       final DatanodeDescriptor descriptor = getDatanode(node);
+       if (descriptor != null) {
+-        removeDatanode(descriptor);
++        removeDatanode(descriptor, true);
+       } else {
+         NameNode.stateChangeLog.warn("BLOCK* removeDatanode: "
+                                      + node + " does not exist");
+@@ -577,20 +588,22 @@ public void removeDatanode(final DatanodeID node
+   }
+ 
+   /** Remove a dead datanode. */
+-  void removeDeadDatanode(final DatanodeID nodeID) {
+-      synchronized(datanodeMap) {
+-        DatanodeDescriptor d;
+-        try {
+-          d = getDatanode(nodeID);
+-        } catch(IOException e) {
+-          d = null;
+-        }
+-        if (d != null && isDatanodeDead(d)) {
+-          NameNode.stateChangeLog.info(
+-              "BLOCK* removeDeadDatanode: lost heartbeat from " + d);
+-          removeDatanode(d);
+-        }
++  void removeDeadDatanode(final DatanodeID nodeID,
++      boolean removeBlocksFromBlockMap) {
++    synchronized(datanodeMap) {
++      DatanodeDescriptor d;
++      try {
++        d = getDatanode(nodeID);
++      } catch(IOException e) {
++        d = null;
++      }
++      if (d != null && isDatanodeDead(d)) {
++        NameNode.stateChangeLog.info(
++              "BLOCK* removeDeadDatanode: lost heartbeat from " + d
++                      + ", removeBlocksFromBlockMap " + removeBlocksFromBlockMap);
++        removeDatanode(d, removeBlocksFromBlockMap);
+       }
++    }
+   }
+ 
+   /** Is the datanode dead? */
+@@ -1038,26 +1051,32 @@ private void refreshHostsReader(Configuration conf) throws IOException {
+   }
+   
+   /**
+-   * 1. Added to hosts  --> no further work needed here.
+-   * 2. Removed from hosts --> mark AdminState as decommissioned. 
+-   * 3. Added to exclude --> start decommission.
+-   * 4. Removed from exclude --> stop decommission.
++   * Reload datanode membership and the desired admin operations from
++   * host files. If a node isn't allowed, hostConfigManager.isIncluded returns
++   * false and the node can't be used.
++   * If a node is allowed and the desired admin operation is defined,
++   * it will transition to the desired admin state.
++   * If a node is allowed and upgrade domain is defined,
++   * the upgrade domain will be set on the node.
++   * To use maintenance mode or upgrade domain, set
++   * DFS_NAMENODE_HOSTS_PROVIDER_CLASSNAME_KEY to
++   * CombinedHostFileManager.class.
+    */
+   private void refreshDatanodes() {
+     for(DatanodeDescriptor node : datanodeMap.values()) {
+       // Check if not include.
+       if (!hostConfigManager.isIncluded(node)) {
+-        node.setDisallowed(true); // case 2.
++        node.setDisallowed(true);
+       } else {
+         long maintenanceExpireTimeInMS =
+             hostConfigManager.getMaintenanceExpirationTimeInMS(node);
+         if (node.maintenanceNotExpired(maintenanceExpireTimeInMS)) {
+           decomManager.startMaintenance(node, maintenanceExpireTimeInMS);
+         } else if (hostConfigManager.isExcluded(node)) {
+-          decomManager.startDecommission(node); // case 3.
++          decomManager.startDecommission(node);
+         } else {
+           decomManager.stopMaintenance(node);
+-          decomManager.stopDecommission(node); // case 4.
++          decomManager.stopDecommission(node);
+         }
+       }
+       node.setUpgradeDomain(hostConfigManager.getUpgradeDomain(node));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+index 5a2fbc5..52e93ea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DecommissionManager.java
+@@ -45,7 +45,7 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+-import static org.apache.hadoop.util.Time.now;
++import static org.apache.hadoop.util.Time.monotonicNow;
+ 
+ /**
+  * Manages datanode decommissioning. A background monitor thread 
+@@ -211,7 +211,7 @@ public void startDecommission(DatanodeDescriptor node) {
+         }
+         // Update DN stats maintained by HeartbeatManager
+         hbManager.startDecommission(node);
+-        node.decommissioningStatus.setStartTime(now());
++        node.getLeavingServiceStatus().setStartTime(monotonicNow());
+         pendingNodes.add(node);
+       }
+     } else {
+@@ -232,7 +232,7 @@ public void stopDecommission(DatanodeDescriptor node) {
+       // Over-replicated blocks will be detected and processed when 
+       // the dead node comes back and send in its full block report.
+       if (node.isAlive()) {
+-        blockManager.processOverReplicatedBlocksOnReCommission(node);
++        blockManager.processExtraRedundancyBlocksOnInService(node);
+       }
+       // Remove from tracking in DecommissionManager
+       pendingNodes.remove(node);
+@@ -256,6 +256,16 @@ public void startMaintenance(DatanodeDescriptor node,
+     if (!node.isMaintenance()) {
+       // Update DN stats maintained by HeartbeatManager
+       hbManager.startMaintenance(node);
++      // hbManager.startMaintenance will set dead node to IN_MAINTENANCE.
++      if (node.isEnteringMaintenance()) {
++        for (DatanodeStorageInfo storage : node.getStorageInfos()) {
++          LOG.info("Starting maintenance of {} {} with {} blocks",
++              node, storage, storage.numBlocks());
++        }
++        node.getLeavingServiceStatus().setStartTime(monotonicNow());
++      }
++      // Track the node regardless whether it is ENTERING_MAINTENANCE or
++      // IN_MAINTENANCE to support maintenance expiration.
+       pendingNodes.add(node);
+     } else {
+       LOG.trace("startMaintenance: Node {} in {}, nothing to do." +
+@@ -274,8 +284,34 @@ public void stopMaintenance(DatanodeDescriptor node) {
+       // Update DN stats maintained by HeartbeatManager
+       hbManager.stopMaintenance(node);
+ 
+-      // TODO HDFS-9390 remove replicas from block maps
+-      // or handle over replicated blocks.
++      // extra redundancy blocks will be detected and processed when
++      // the dead node comes back and send in its full block report.
++      if (!node.isAlive()) {
++        // The node became dead when it was in maintenance, at which point
++        // the replicas weren't removed from block maps.
++        // When the node leaves maintenance, the replicas should be removed
++        // from the block maps to trigger the necessary replication to
++        // maintain the safety property of "# of live replicas + maintenance
++        // replicas" >= the expected redundancy.
++        blockManager.removeBlocksAssociatedTo(node);
++      } else {
++        // Even though putting nodes in maintenance node doesn't cause live
++        // replicas to match expected replication factor, it is still possible
++        // to have over replicated when the node leaves maintenance node.
++        // First scenario:
++        // a. Node became dead when it is at AdminStates.NORMAL, thus
++        //    block is replicated so that 3 replicas exist on other nodes.
++        // b. Admins put the dead node into maintenance mode and then
++        //    have the node rejoin the cluster.
++        // c. Take the node out of maintenance mode.
++        // Second scenario:
++        // a. With replication factor 3, set one replica to maintenance node,
++        //    thus block has 1 maintenance replica and 2 live replicas.
++        // b. Change the replication factor to 2. The block will still have
++        //    1 maintenance replica and 2 live replicas.
++        // c. Take the node out of maintenance mode.
++        blockManager.processExtraRedundancyBlocksOnInService(node);
++      }
+ 
+       // Remove from tracking in DecommissionManager
+       pendingNodes.remove(node);
+@@ -291,26 +327,32 @@ private void setDecommissioned(DatanodeDescriptor dn) {
+     LOG.info("Decommissioning complete for node {}", dn);
+   }
+ 
++  private void setInMaintenance(DatanodeDescriptor dn) {
++    dn.setInMaintenance();
++    LOG.info("Node {} has entered maintenance mode.", dn);
++  }
++
+   /**
+    * Checks whether a block is sufficiently replicated for decommissioning.
+    * Full-strength replication is not always necessary, hence "sufficient".
+    * @return true if sufficient, else false.
+    */
+-  private boolean isSufficientlyReplicated(BlockInfo block,
+-      BlockCollection bc,
+-      NumberReplicas numberReplicas) {
+-    final int numExpected = bc.getBlockReplication();
+-    final int numLive = numberReplicas.liveReplicas();
+-    if (!blockManager.isNeededReplication(block, numExpected, numLive)) {
+-      // Block doesn't need replication. Skip.
++  private boolean isSufficientlyReplicated(BlockInfo block, BlockCollection bc,
++      NumberReplicas numberReplicas, boolean isDecommission) {
++    if (blockManager.hasEnoughEffectiveReplicas(block, numberReplicas, 0)) {
++      // Block has enough replica, skip
+       LOG.trace("Block {} does not need replication.", block);
+       return true;
+     }
+ 
++    final int numExpected = blockManager.getExpectedLiveRedundancyNum(block,
++        numberReplicas);
++    final int numLive = numberReplicas.liveReplicas();
++
+     // Block is under-replicated
+-    LOG.trace("Block {} numExpected={}, numLive={}", block, numExpected, 
++    LOG.trace("Block {} numExpected={}, numLive={}", block, numExpected,
+         numLive);
+-    if (numExpected > numLive) {
++    if (isDecommission && numExpected > numLive) {
+       if (bc.isUnderConstruction() && block.equals(bc.getLastBlock())) {
+         // Can decom a UC block as long as there will still be minReplicas
+         if (numLive >= blockManager.minReplication) {
+@@ -348,11 +390,16 @@ private static void logBlockReplicationInfo(Block block, BlockCollection bc,
+         + ", corrupt replicas: " + num.corruptReplicas()
+         + ", decommissioned replicas: " + num.decommissioned()
+         + ", decommissioning replicas: " + num.decommissioning()
++        + ", maintenance replicas: " + num.maintenanceReplicas()
++        + ", live entering maintenance replicas: "
++        + num.liveEnteringMaintenanceReplicas()
+         + ", excess replicas: " + num.excessReplicas()
+         + ", Is Open File: " + bc.isUnderConstruction()
+         + ", Datanodes having this block: " + nodeList + ", Current Datanode: "
+         + srcNode + ", Is current datanode decommissioning: "
+-        + srcNode.isDecommissionInProgress());
++        + srcNode.isDecommissionInProgress() +
++        ", Is current datanode entering maintenance: "
++        + srcNode.isEnteringMaintenance());
+   }
+ 
+   @VisibleForTesting
+@@ -433,7 +480,7 @@ public void run() {
+       // Reset the checked count at beginning of each iteration
+       numBlocksChecked = 0;
+       numNodesChecked = 0;
+-      // Check decom progress
++      // Check decommission or maintenance progress.
+       namesystem.writeLock();
+       try {
+         processPendingNodes();
+@@ -474,15 +521,14 @@ private void check() {
+         final DatanodeDescriptor dn = entry.getKey();
+         AbstractList<BlockInfo> blocks = entry.getValue();
+         boolean fullScan = false;
+-        if (dn.isMaintenance()) {
+-          // TODO HDFS-9390 make sure blocks are minimally replicated
+-          // before transitioning the node to IN_MAINTENANCE state.
+-
++        if (dn.isMaintenance() && dn.maintenanceExpired()) {
+           // If maintenance expires, stop tracking it.
+-          if (dn.maintenanceExpired()) {
+-            stopMaintenance(dn);
+-            toRemove.add(dn);
+-          }
++          stopMaintenance(dn);
++          toRemove.add(dn);
++          continue;
++        }
++        if (dn.isInMaintenance()) {
++          // The dn is IN_MAINTENANCE and the maintenance hasn't expired yet.
+           continue;
+         }
+         if (blocks == null) {
+@@ -497,7 +543,7 @@ private void check() {
+         } else {
+           // This is a known datanode, check if its # of insufficiently 
+           // replicated blocks has dropped to zero and if it can be decommed
+-          LOG.debug("Processing decommission-in-progress node {}", dn);
++          LOG.debug("Processing {} node {}", dn.getAdminState(), dn);
+           pruneSufficientlyReplicated(dn, blocks);
+         }
+         if (blocks.size() == 0) {
+@@ -516,29 +562,31 @@ private void check() {
+           // If the full scan is clean AND the node liveness is okay, 
+           // we can finally mark as decommissioned.
+           final boolean isHealthy =
+-              blockManager.isNodeHealthyForDecommission(dn);
++              blockManager.isNodeHealthyForDecommissionOrMaintenance(dn);
+           if (blocks.size() == 0 && isHealthy) {
+-            setDecommissioned(dn);
+-            toRemove.add(dn);
++            if (dn.isDecommissionInProgress()) {
++              setDecommissioned(dn);
++              toRemove.add(dn);
++            } else if (dn.isEnteringMaintenance()) {
++              // IN_MAINTENANCE node remains in the outOfServiceNodeBlocks to
++              // to track maintenance expiration.
++              setInMaintenance(dn);
++            } else {
++              Preconditions.checkState(false, "Node "
++                  + dn + " is in an invalid state: " + dn.getAdminState());
++            }
+             LOG.debug("Node {} is sufficiently replicated and healthy, "
+-                + "marked as decommissioned.", dn);
++                + "marked as {}.", dn.getAdminState());
+           } else {
+-            if (LOG.isDebugEnabled()) {
+-              StringBuilder b = new StringBuilder("Node {} ");
+-              if (isHealthy) {
+-                b.append("is ");
+-              } else {
+-                b.append("isn't ");
+-              }
+-              b.append("healthy and still needs to replicate {} more blocks," +
+-                  " decommissioning is still in progress.");
+-              LOG.debug(b.toString(), dn, blocks.size());
+-            }
++           LOG.debug("Node {} {} healthy."
++                + " It needs to replicate {} more blocks."
++                + " {} is still in progress.", dn,
++                isHealthy? "is": "isn't", blocks.size(), dn.getAdminState());
+           }
+         } else {
+           LOG.debug("Node {} still has {} blocks to replicate "
+-                  + "before it is a candidate to finish decommissioning.",
+-              dn, blocks.size());
++              + "before it is a candidate to finish {}.",
++              dn, blocks.size(), dn.getAdminState());
+         }
+         iterkey = dn;
+       }
+@@ -557,7 +605,7 @@ private void check() {
+      */
+     private void pruneSufficientlyReplicated(final DatanodeDescriptor datanode,
+         AbstractList<BlockInfo> blocks) {
+-      processBlocksForDecomInternal(datanode, blocks.iterator(), null, true);
++      processBlocksInternal(datanode, blocks.iterator(), null, true);
+     }
+ 
+     /**
+@@ -573,7 +621,7 @@ private void pruneSufficientlyReplicated(final DatanodeDescriptor datanode,
+     private AbstractList<BlockInfo> handleInsufficientlyReplicated(
+         final DatanodeDescriptor datanode) {
+       AbstractList<BlockInfo> insufficient = new ChunkedArrayList<>();
+-      processBlocksForDecomInternal(datanode, datanode.getBlockIterator(),
++      processBlocksInternal(datanode, datanode.getBlockIterator(),
+           insufficient, false);
+       return insufficient;
+     }
+@@ -594,14 +642,14 @@ private void pruneSufficientlyReplicated(final DatanodeDescriptor datanode,
+      * @return true if there are under-replicated blocks in the provided block
+      * iterator, else false.
+      */
+-    private void processBlocksForDecomInternal(
++    private void processBlocksInternal(
+         final DatanodeDescriptor datanode,
+         final Iterator<BlockInfo> it,
+         final List<BlockInfo> insufficientlyReplicated,
+         boolean pruneSufficientlyReplicated) {
+       boolean firstReplicationLog = true;
+       int underReplicatedBlocks = 0;
+-      int decommissionOnlyReplicas = 0;
++      int outOfServiceOnlyReplicas = 0;
+       int underReplicatedInOpenFiles = 0;
+       while (it.hasNext()) {
+         numBlocksChecked++;
+@@ -625,22 +673,25 @@ private void processBlocksForDecomInternal(
+ 
+         // Schedule under-replicated blocks for replication if not already
+         // pending
+-        if (blockManager.isNeededReplication(block, bc.getBlockReplication(),
+-            liveReplicas)) {
++        boolean isDecommission = datanode.isDecommissionInProgress();
++        boolean neededReplication = isDecommission ?
++            blockManager.isNeededReplication(block, num) :
++            blockManager.isNeededReplicationForMaintenance(block, num);
++        if (neededReplication) {
+           if (!blockManager.neededReplications.contains(block) &&
+               blockManager.pendingReplications.getNumReplicas(block) == 0 &&
+               namesystem.isPopulatingReplQueues()) {
+             // Process these blocks only when active NN is out of safe mode.
+             blockManager.neededReplications.add(block,
+                 liveReplicas, num.readOnlyReplicas(),
+-                num.decommissionedAndDecommissioning(),
++                num.outOfServiceReplicas(),
+                 bc.getBlockReplication());
+           }
+         }
+ 
+         // Even if the block is under-replicated, 
+         // it doesn't block decommission if it's sufficiently replicated 
+-        if (isSufficientlyReplicated(block, bc, num)) {
++        if (isSufficientlyReplicated(block, bc, num, isDecommission)) {
+           if (pruneSufficientlyReplicated) {
+             it.remove();
+           }
+@@ -662,14 +713,13 @@ private void processBlocksForDecomInternal(
+         if (bc.isUnderConstruction()) {
+           underReplicatedInOpenFiles++;
+         }
+-        if ((curReplicas == 0) && (num.decommissionedAndDecommissioning() > 0)) {
+-          decommissionOnlyReplicas++;
++        if ((curReplicas == 0) && (num.outOfServiceReplicas() > 0)) {
++          outOfServiceOnlyReplicas++;
+         }
+       }
+ 
+-      datanode.decommissioningStatus.set(underReplicatedBlocks,
+-          decommissionOnlyReplicas,
+-          underReplicatedInOpenFiles);
++      datanode.getLeavingServiceStatus().set(underReplicatedBlocks,
++          outOfServiceOnlyReplicas, underReplicatedInOpenFiles);
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+index 0b5b579..8106063 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+@@ -21,14 +21,10 @@
+ import java.util.List;
+ import java.util.concurrent.TimeUnit;
+ import java.util.Map;
+-import java.util.Set;
+-import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.StorageType;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+ import org.apache.hadoop.hdfs.server.protocol.StorageReport;
+ import org.apache.hadoop.hdfs.server.protocol.VolumeFailureSummary;
+@@ -250,13 +246,19 @@ synchronized void startMaintenance(final DatanodeDescriptor node) {
+     if (!node.isAlive()) {
+       LOG.info("Dead node {} is put in maintenance state immediately.", node);
+       node.setInMaintenance();
+-    } else if (node.isDecommissioned()) {
+-      LOG.info("Decommissioned node " + node + " is put in maintenance state"
+-          + " immediately.");
+-      node.setInMaintenance();
+     } else {
+       stats.subtract(node);
+-      node.startMaintenance();
++      if (node.isDecommissioned()) {
++        LOG.info("Decommissioned node " + node + " is put in maintenance state"
++            + " immediately.");
++        node.setInMaintenance();
++      } else if (blockManager.getMinReplicationToBeInMaintenance() == 0) {
++        LOG.info("MinReplicationToBeInMaintenance is set to zero. " + node +
++            " is put in maintenance state" + " immediately.");
++        node.setInMaintenance();
++      } else {
++        node.startMaintenance();
++      }
+       stats.add(node);
+     }
+   }
+@@ -333,7 +335,7 @@ void heartbeatCheck() {
+     boolean allAlive = false;
+     while (!allAlive) {
+       // locate the first dead node.
+-      DatanodeID dead = null;
++      DatanodeDescriptor dead = null;
+ 
+       // locate the first failed storage that isn't on a dead node.
+       DatanodeStorageInfo failedStorage = null;
+@@ -382,7 +384,7 @@ void heartbeatCheck() {
+         // acquire the fsnamesystem lock, and then remove the dead node.
+         namesystem.writeLock();
+         try {
+-          dm.removeDeadDatanode(dead);
++          dm.removeDeadDatanode(dead, !dead.isMaintenance());
+         } finally {
+           namesystem.writeUnlock();
+         }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
+index 44ae6f6..9d79259 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/NumberReplicas.java
+@@ -32,18 +32,29 @@
+   private int corruptReplicas;
+   private int excessReplicas;
+   private int replicasOnStaleNodes;
++  // We need live ENTERING_MAINTENANCE nodes to continue
++  // to serve read request while it is being transitioned to live
++  // IN_MAINTENANCE if these are the only replicas left.
++  // maintenanceNotForRead == maintenanceReplicas -
++  // Live ENTERING_MAINTENANCE.
++  private int maintenanceNotForRead;
++  // Live ENTERING_MAINTENANCE nodes to serve read requests.
++  private int maintenanceForRead;
+ 
+   NumberReplicas() {
+-    this(0, 0, 0, 0, 0, 0, 0);
++    this(0, 0, 0, 0, 0, 0, 0, 0, 0);
+   }
+ 
+   NumberReplicas(int live, int readonly, int decommissioned,
+-      int decommissioning, int corrupt, int excess, int stale) {
+-    set(live, readonly, decommissioned, decommissioning, corrupt, excess, stale);
++      int decommissioning, int corrupt, int excess, int stale,
++      int maintenanceNotForRead, int maintenanceForRead) {
++    set(live, readonly, decommissioned, decommissioning, corrupt,
++        excess, stale, maintenanceNotForRead, maintenanceForRead);
+   }
+ 
+   void set(int live, int readonly, int decommissioned, int decommissioning,
+-      int corrupt, int excess, int stale) {
++      int corrupt, int excess, int stale, int maintenanceNotForRead,
++      int maintenanceForRead) {
+     liveReplicas = live;
+     readOnlyReplicas = readonly;
+     this.decommissioning = decommissioning;
+@@ -51,6 +62,8 @@ void set(int live, int readonly, int decommissioned, int decommissioning,
+     corruptReplicas = corrupt;
+     excessReplicas = excess;
+     replicasOnStaleNodes = stale;
++    this.maintenanceNotForRead = maintenanceNotForRead;
++    this.maintenanceForRead = maintenanceForRead;
+   }
+ 
+   public int liveReplicas() {
+@@ -112,4 +125,20 @@ public int excessReplicas() {
+   public int replicasOnStaleNodes() {
+     return replicasOnStaleNodes;
+   }
+-} 
++
++  public int maintenanceNotForReadReplicas() {
++    return maintenanceNotForRead;
++  }
++
++  public int maintenanceReplicas() {
++    return maintenanceNotForRead + maintenanceForRead;
++  }
++
++  public int outOfServiceReplicas() {
++    return maintenanceReplicas() + decommissionedAndDecommissioning();
++  }
++
++  public int liveEnteringMaintenanceReplicas() {
++    return maintenanceForRead;
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/StorageTypeStats.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/StorageTypeStats.java
+index 45dcc8d..005e6d5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/StorageTypeStats.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/StorageTypeStats.java
+@@ -81,7 +81,7 @@ void addStorage(final DatanodeStorageInfo info,
+       final DatanodeDescriptor node) {
+     capacityUsed += info.getDfsUsed();
+     blockPoolUsed += info.getBlockPoolUsed();
+-    if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
++    if (node.isInService()) {
+       capacityTotal += info.getCapacity();
+       capacityRemaining += info.getRemaining();
+     } else {
+@@ -90,7 +90,7 @@ void addStorage(final DatanodeStorageInfo info,
+   }
+ 
+   void addNode(final DatanodeDescriptor node) {
+-    if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
++    if (node.isInService()) {
+       nodesInService++;
+     }
+   }
+@@ -99,7 +99,7 @@ void subtractStorage(final DatanodeStorageInfo info,
+       final DatanodeDescriptor node) {
+     capacityUsed -= info.getDfsUsed();
+     blockPoolUsed -= info.getBlockPoolUsed();
+-    if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
++    if (node.isInService()) {
+       capacityTotal -= info.getCapacity();
+       capacityRemaining -= info.getRemaining();
+     } else {
+@@ -108,7 +108,7 @@ void subtractStorage(final DatanodeStorageInfo info,
+   }
+ 
+   void subtractNode(final DatanodeDescriptor node) {
+-    if (!(node.isDecommissionInProgress() || node.isDecommissioned())) {
++    if (node.isInService()) {
+       nodesInService--;
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
+index b3530e8..1e8aa6d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
+@@ -406,7 +406,7 @@ public int compare(DatanodeDescriptor d1,
+               d2.getAdminState().toString());
+           break;
+         case FIELD_DECOMMISSIONED:
+-          ret = DFSUtil.DECOM_COMPARATOR.compare(d1, d2);
++          ret = new DFSUtil.ServiceComparator().compare(d1, d2);
+           break;
+         case FIELD_NAME: 
+           ret = d1.getHostName().compareTo(d2.getHostName());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 2e44a9b..78d2c81 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -7900,11 +7900,12 @@ public String getDecomNodes() {
+           .<String, Object> builder()
+           .put("xferaddr", node.getXferAddr())
+           .put("underReplicatedBlocks",
+-              node.decommissioningStatus.getUnderReplicatedBlocks())
++          node.getLeavingServiceStatus().getUnderReplicatedBlocks())
++           // TODO use another property name for outOfServiceOnlyReplicas.
+           .put("decommissionOnlyReplicas",
+-              node.decommissioningStatus.getDecommissionOnlyReplicas())
++          node.getLeavingServiceStatus().getOutOfServiceOnlyReplicas())
+           .put("underReplicateInOpenFiles",
+-              node.decommissioningStatus.getUnderReplicatedInOpenFiles())
++          node.getLeavingServiceStatus().getUnderReplicatedInOpenFiles())
+           .build();
+       info.put(node.getHostName(), innerinfo);
+     }
+@@ -7964,6 +7965,12 @@ public String getNodeUsage() {
+         new HashMap<String, Map<String,Object>>();
+     final List<DatanodeDescriptor> live = new ArrayList<DatanodeDescriptor>();
+     blockManager.getDatanodeManager().fetchDatanodes(live, null, true);
++    for (Iterator<DatanodeDescriptor> it = live.iterator(); it.hasNext();) {
++      DatanodeDescriptor node = it.next();
++      if (!node.isInService()) {
++        it.remove();
++      }
++    }
+ 
+     if (live.size() > 0) {
+       float totalDfsUsed = 0;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+index 420d6ed..3b8e3d5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+@@ -769,7 +769,7 @@ void generateDecommissioningNodeData(JspWriter out, DatanodeDescriptor d,
+         return;
+       }
+ 
+-      long decommRequestTime = d.decommissioningStatus.getStartTime();
++      long decommRequestTime = d.getLeavingServiceStatus().getStartTime();
+       long timestamp = d.getLastUpdate();
+       long currentTime = Time.now();
+       long hoursSinceDecommStarted = (currentTime - decommRequestTime)/3600000;
+@@ -777,11 +777,11 @@ void generateDecommissioningNodeData(JspWriter out, DatanodeDescriptor d,
+       out.print("<td class=\"lastcontact\"> "
+           + ((currentTime - timestamp) / 1000)
+           + "<td class=\"underreplicatedblocks\">"
+-          + d.decommissioningStatus.getUnderReplicatedBlocks()
++          + d.getLeavingServiceStatus().getUnderReplicatedBlocks()
+           + "<td class=\"blockswithonlydecommissioningreplicas\">"
+-          + d.decommissioningStatus.getDecommissionOnlyReplicas() 
++          + d.getLeavingServiceStatus().getOutOfServiceOnlyReplicas()
+           + "<td class=\"underrepblocksinfilesunderconstruction\">"
+-          + d.decommissioningStatus.getUnderReplicatedInOpenFiles()
++          + d.getLeavingServiceStatus().getUnderReplicatedInOpenFiles()
+           + "<td class=\"timesincedecommissionrequest\">"
+           + hoursSinceDecommStarted + " hrs " + remainderMinutes + " mins"
+           + "\n");
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index e174c80..feba52a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -455,6 +455,13 @@
+ </property>
+ 
+ <property>
++  <name>dfs.namenode.maintenance.replication.min</name>
++  <value>1</value>
++  <description>Minimal live block replication in existence of maintenance mode.
++  </description>
++</property>
++
++<property>
+   <name>dfs.namenode.posix.acl.inheritance.enabled</name>
+   <value>false</value>
+   <description>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/AdminStatesBaseTest.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/AdminStatesBaseTest.java
+index 0698628..a868eb1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/AdminStatesBaseTest.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/AdminStatesBaseTest.java
+@@ -110,17 +110,22 @@ public void teardown() throws IOException {
+     shutdownCluster();
+   }
+ 
+-  protected void writeFile(FileSystem fileSys, Path name, int repl)
++  static public FSDataOutputStream writeIncompleteFile(FileSystem fileSys,
++      Path name, short repl, short numOfBlocks) throws IOException {
++    return writeFile(fileSys, name, repl, numOfBlocks, false);
++  }
++
++  static protected void writeFile(FileSystem fileSys, Path name, int repl)
+       throws IOException {
+     writeFile(fileSys, name, repl, 2);
+   }
+ 
+-  protected void writeFile(FileSystem fileSys, Path name, int repl,
++  static protected void writeFile(FileSystem fileSys, Path name, int repl,
+       int numOfBlocks) throws IOException {
+     writeFile(fileSys, name, repl, numOfBlocks, true);
+   }
+ 
+-  protected FSDataOutputStream writeFile(FileSystem fileSys, Path name,
++  static protected FSDataOutputStream writeFile(FileSystem fileSys, Path name,
+       int repl, int numOfBlocks, boolean completeFile)
+     throws IOException {
+     // create and write a file that contains two blocks of data
+@@ -136,6 +141,7 @@ protected FSDataOutputStream writeFile(FileSystem fileSys, Path name,
+       stm.close();
+       return null;
+     } else {
++      stm.flush();
+       // Do not close stream, return it
+       // so that it is not garbage collected
+       return stm;
+@@ -353,7 +359,7 @@ protected void startSimpleHACluster(int numDatanodes) throws IOException {
+ 
+   protected void shutdownCluster() {
+     if (cluster != null) {
+-      cluster.shutdown();
++      cluster.shutdown(true);
+     }
+   }
+ 
+@@ -362,12 +368,13 @@ protected void refreshNodes(final int nnIndex) throws IOException {
+         refreshNodes(conf);
+   }
+ 
+-  protected DatanodeDescriptor getDatanodeDesriptor(
++  static private DatanodeDescriptor getDatanodeDesriptor(
+       final FSNamesystem ns, final String datanodeUuid) {
+     return ns.getBlockManager().getDatanodeManager().getDatanode(datanodeUuid);
+   }
+ 
+-  protected void cleanupFile(FileSystem fileSys, Path name) throws IOException {
++  static public void cleanupFile(FileSystem fileSys, Path name)
++      throws IOException {
+     assertTrue(fileSys.exists(name));
+     fileSys.delete(name, true);
+     assertTrue(!fileSys.exists(name));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestMaintenanceState.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestMaintenanceState.java
+index 63617ad..c125f45 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestMaintenanceState.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestMaintenanceState.java
+@@ -18,13 +18,19 @@
+ package org.apache.hadoop.hdfs;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.client.HdfsDataInputStream;
+@@ -32,6 +38,8 @@
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo.AdminStates;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStorageInfo;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.util.Time;
+ import org.junit.Test;
+@@ -40,13 +48,23 @@
+  * This class tests node maintenance.
+  */
+ public class TestMaintenanceState extends AdminStatesBaseTest {
+-  public static final Log LOG = LogFactory.getLog(TestMaintenanceState.class);
+-  static private final long EXPIRATION_IN_MS = 500;
++  public static final Logger LOG =
++      LoggerFactory.getLogger(TestMaintenanceState.class);
++  static private final long EXPIRATION_IN_MS = 50;
++  private int minMaintenanceR =
++      DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_DEFAULT;
+ 
+   public TestMaintenanceState() {
+     setUseCombinedHostFileManager();
+   }
+ 
++  void setMinMaintenanceR(int minMaintenanceR) {
++    this.minMaintenanceR = minMaintenanceR;
++    getConf().setInt(
++        DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY,
++        minMaintenanceR);
++  }
++
+   /**
+    * Verify a node can transition from AdminStates.ENTERING_MAINTENANCE to
+    * AdminStates.NORMAL.
+@@ -55,21 +73,25 @@ public TestMaintenanceState() {
+   public void testTakeNodeOutOfEnteringMaintenance() throws Exception {
+     LOG.info("Starting testTakeNodeOutOfEnteringMaintenance");
+     final int replicas = 1;
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 1;
+-    final Path file1 = new Path("/testTakeNodeOutOfEnteringMaintenance.dat");
++    final Path file = new Path("/testTakeNodeOutOfEnteringMaintenance.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 1);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++    writeFile(fileSys, file, replicas, 1);
+ 
+-    DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0,
+         null, Long.MAX_VALUE, null, AdminStates.ENTERING_MAINTENANCE);
+ 
++    // When node is in ENTERING_MAINTENANCE state, it can still serve read
++    // requests
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, null,
++        nodeOutofService));
++
+     putNodeInService(0, nodeOutofService.getDatanodeUuid());
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -80,23 +102,21 @@ public void testTakeNodeOutOfEnteringMaintenance() throws Exception {
+   public void testEnteringMaintenanceExpiration() throws Exception {
+     LOG.info("Starting testEnteringMaintenanceExpiration");
+     final int replicas = 1;
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 1;
+-    final Path file1 = new Path("/testTakeNodeOutOfEnteringMaintenance.dat");
++    final Path file = new Path("/testEnteringMaintenanceExpiration.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 1);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, replicas, 1);
+ 
+-    // expires in 500 milliseconds
+-    DatanodeInfo nodeOutofService = takeNodeOutofService(0, null,
+-        Time.monotonicNow() + EXPIRATION_IN_MS, null,
+-        AdminStates.ENTERING_MAINTENANCE);
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0, null,
++        Long.MAX_VALUE, null, AdminStates.ENTERING_MAINTENANCE);
+ 
+-    waitNodeState(nodeOutofService, AdminStates.NORMAL);
++    // Adjust the expiration.
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(),
++        Time.monotonicNow() + EXPIRATION_IN_MS, null, AdminStates.NORMAL);
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -106,20 +126,18 @@ public void testEnteringMaintenanceExpiration() throws Exception {
+   public void testInvalidExpiration() throws Exception {
+     LOG.info("Starting testInvalidExpiration");
+     final int replicas = 1;
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 1;
+-    final Path file1 = new Path("/testTakeNodeOutOfEnteringMaintenance.dat");
++    final Path file = new Path("/testInvalidExpiration.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 1);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, replicas, 1);
+ 
+     // expiration has to be greater than Time.monotonicNow().
+     takeNodeOutofService(0, null, Time.monotonicNow(), null,
+         AdminStates.NORMAL);
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -129,18 +147,17 @@ public void testInvalidExpiration() throws Exception {
+   @Test(timeout = 360000)
+   public void testPutDeadNodeToMaintenance() throws Exception {
+     LOG.info("Starting testPutDeadNodeToMaintenance");
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 1;
+     final int replicas = 1;
+-    final Path file1 = new Path("/testPutDeadNodeToMaintenance.dat");
++    final Path file = new Path("/testPutDeadNodeToMaintenance.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 1);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    FSNamesystem ns = getCluster().getNamesystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++    writeFile(fileSys, file, replicas, 1);
+ 
+-    MiniDFSCluster.DataNodeProperties dnProp = getCluster().stopDataNode(0);
++    final MiniDFSCluster.DataNodeProperties dnProp =
++        getCluster().stopDataNode(0);
+     DFSTestUtil.waitForDatanodeState(
+         getCluster(), dnProp.datanode.getDatanodeUuid(), false, 20000);
+ 
+@@ -153,7 +170,7 @@ public void testPutDeadNodeToMaintenance() throws Exception {
+     assertEquals(deadInMaintenance + 1, ns.getNumInMaintenanceDeadDataNodes());
+     assertEquals(liveInMaintenance, ns.getNumInMaintenanceLiveDataNodes());
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -164,16 +181,14 @@ public void testPutDeadNodeToMaintenance() throws Exception {
+   @Test(timeout = 360000)
+   public void testPutDeadNodeToMaintenanceWithExpiration() throws Exception {
+     LOG.info("Starting testPutDeadNodeToMaintenanceWithExpiration");
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 1;
+-    final int replicas = 1;
+-    final Path file1 = new Path("/testPutDeadNodeToMaintenance.dat");
++    final Path file =
++        new Path("/testPutDeadNodeToMaintenanceWithExpiration.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 1);
+ 
+     FileSystem fileSys = getCluster().getFileSystem(0);
+     FSNamesystem ns = getCluster().getNamesystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    writeFile(fileSys, file, 1, 1);
+ 
+     MiniDFSCluster.DataNodeProperties dnProp = getCluster().stopDataNode(0);
+     DFSTestUtil.waitForDatanodeState(
+@@ -184,16 +199,17 @@ public void testPutDeadNodeToMaintenanceWithExpiration() throws Exception {
+ 
+     DatanodeInfo nodeOutofService = takeNodeOutofService(0,
+         dnProp.datanode.getDatanodeUuid(),
+-        Time.monotonicNow() + EXPIRATION_IN_MS, null,
+-        AdminStates.IN_MAINTENANCE);
++        Long.MAX_VALUE, null, AdminStates.IN_MAINTENANCE);
+ 
+-    waitNodeState(nodeOutofService, AdminStates.NORMAL);
++    // Adjust the expiration.
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(),
++        Time.monotonicNow() + EXPIRATION_IN_MS, null, AdminStates.NORMAL);
+ 
+     // no change
+     assertEquals(deadInMaintenance, ns.getNumInMaintenanceDeadDataNodes());
+     assertEquals(liveInMaintenance, ns.getNumInMaintenanceLiveDataNodes());
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -202,15 +218,12 @@ public void testPutDeadNodeToMaintenanceWithExpiration() throws Exception {
+   @Test(timeout = 360000)
+   public void testTransitionFromDecommissioned() throws IOException {
+     LOG.info("Starting testTransitionFromDecommissioned");
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 4;
+-    final int replicas = 3;
+-    final Path file1 = new Path("/testTransitionFromDecommissioned.dat");
++    final Path file = new Path("/testTransitionFromDecommissioned.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 4);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, 3, 1);
+ 
+     DatanodeInfo nodeOutofService = takeNodeOutofService(0, null, 0, null,
+         AdminStates.DECOMMISSIONED);
+@@ -218,7 +231,7 @@ public void testTransitionFromDecommissioned() throws IOException {
+     takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(), Long.MAX_VALUE,
+         null, AdminStates.IN_MAINTENANCE);
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+@@ -228,34 +241,33 @@ public void testTransitionFromDecommissioned() throws IOException {
+   @Test(timeout = 360000)
+   public void testTransitionFromDecommissionedAndExpired() throws IOException {
+     LOG.info("Starting testTransitionFromDecommissionedAndExpired");
+-    final int numNamenodes = 1;
+-    final int numDatanodes = 4;
+-    final int replicas = 3;
+-    final Path file1 = new Path("/testTransitionFromDecommissioned.dat");
++    final Path file =
++        new Path("/testTransitionFromDecommissionedAndExpired.dat");
+ 
+-    startCluster(numNamenodes, numDatanodes);
++    startCluster(1, 4);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, 3, 1);
+ 
+-    DatanodeInfo nodeOutofService = takeNodeOutofService(0, null, 0, null,
+-        AdminStates.DECOMMISSIONED);
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0, null, 0,
++        null, AdminStates.DECOMMISSIONED);
+ 
+     takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(),
+-        Time.monotonicNow() + EXPIRATION_IN_MS, null,
+-        AdminStates.IN_MAINTENANCE);
++        Long.MAX_VALUE, null, AdminStates.IN_MAINTENANCE);
+ 
+-    waitNodeState(nodeOutofService, AdminStates.NORMAL);
++    // Adjust the expiration.
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(),
++        Time.monotonicNow() + EXPIRATION_IN_MS, null, AdminStates.NORMAL);
+ 
+-    cleanupFile(fileSys, file1);
++    cleanupFile(fileSys, file);
+   }
+ 
+   /**
+    * When a node is put to maintenance, it first transitions to
+    * AdminStates.ENTERING_MAINTENANCE. It makes sure all blocks have minimal
+    * replication before it can be transitioned to AdminStates.IN_MAINTENANCE.
+-   * If node becomes dead when it is in AdminStates.ENTERING_MAINTENANCE, admin
+-   * state should stay in AdminStates.ENTERING_MAINTENANCE state.
++   * If node becomes dead when it is in AdminStates.ENTERING_MAINTENANCE, it
++   * should stay in AdminStates.ENTERING_MAINTENANCE state.
+    */
+   @Test(timeout = 360000)
+   public void testNodeDeadWhenInEnteringMaintenance() throws Exception {
+@@ -263,16 +275,16 @@ public void testNodeDeadWhenInEnteringMaintenance() throws Exception {
+     final int numNamenodes = 1;
+     final int numDatanodes = 1;
+     final int replicas = 1;
+-    final Path file1 = new Path("/testNodeDeadWhenInEnteringMaintenance.dat");
++    final Path file = new Path("/testNodeDeadWhenInEnteringMaintenance.dat");
+ 
+     startCluster(numNamenodes, numDatanodes);
+ 
+-    FileSystem fileSys = getCluster().getFileSystem(0);
+-    FSNamesystem ns = getCluster().getNamesystem(0);
+-    writeFile(fileSys, file1, replicas, 1);
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++    writeFile(fileSys, file, replicas, 1);
+ 
+     DatanodeInfo nodeOutofService = takeNodeOutofService(0,
+-        getFirstBlockFirstReplicaUuid(fileSys, file1), Long.MAX_VALUE, null,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE, null,
+         AdminStates.ENTERING_MAINTENANCE);
+     assertEquals(1, ns.getNumEnteringMaintenanceDataNodes());
+ 
+@@ -281,30 +293,627 @@ public void testNodeDeadWhenInEnteringMaintenance() throws Exception {
+     DFSTestUtil.waitForDatanodeState(
+         getCluster(), nodeOutofService.getDatanodeUuid(), false, 20000);
+     DFSClient client = getDfsClient(0);
+-    assertEquals("maintenance node shouldn't be alive", numDatanodes - 1,
++    assertEquals("maintenance node shouldn't be live", numDatanodes - 1,
+         client.datanodeReport(DatanodeReportType.LIVE).length);
++    assertEquals(1, ns.getNumEnteringMaintenanceDataNodes());
+ 
+     getCluster().restartDataNode(dnProp, true);
+     getCluster().waitActive();
+     waitNodeState(nodeOutofService, AdminStates.ENTERING_MAINTENANCE);
+     assertEquals(1, ns.getNumEnteringMaintenanceDataNodes());
++    assertEquals("maintenance node should be live", numDatanodes,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * When a node is put to maintenance, it first transitions to
++   * AdminStates.ENTERING_MAINTENANCE. It makes sure all blocks have
++   * been properly replicated before it can be transitioned to
++   * AdminStates.IN_MAINTENANCE. The expected replication count takes
++   * DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY and
++   * its file's replication factor into account.
++   */
++  @Test(timeout = 360000)
++  public void testExpectedReplications() throws IOException {
++    LOG.info("Starting testExpectedReplications");
++    testExpectedReplication(1);
++    testExpectedReplication(2);
++    testExpectedReplication(3);
++    testExpectedReplication(4);
++  }
++
++  private void testExpectedReplication(int replicationFactor)
++      throws IOException {
++    testExpectedReplication(replicationFactor,
++        Math.max(replicationFactor - 1, this.minMaintenanceR));
++  }
++
++  private void testExpectedReplication(int replicationFactor,
++      int expectedReplicasInRead) throws IOException {
++    startCluster(1, 5);
++
++    final Path file = new Path("/testExpectedReplication.dat");
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, replicationFactor, 1);
++
++    DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE,
++        null, AdminStates.IN_MAINTENANCE);
++
++    // The block should be replicated to another datanode to meet
++    // expected replication count.
++    assertNull(checkWithRetry(ns, fileSys, file, expectedReplicasInRead,
++        nodeOutofService));
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * Verify a node can transition directly to AdminStates.IN_MAINTENANCE when
++   * DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY is set to zero.
++   */
++  @Test(timeout = 360000)
++  public void testZeroMinMaintenanceReplication() throws Exception {
++    LOG.info("Starting testZeroMinMaintenanceReplication");
++    setMinMaintenanceR(0);
++    startCluster(1, 1);
++
++    final Path file = new Path("/testZeroMinMaintenanceReplication.dat");
++    final int replicas = 1;
++
++    FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, replicas, 1);
++
++    takeNodeOutofService(0, null, Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * Verify a node can transition directly to AdminStates.IN_MAINTENANCE when
++   * DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY is set to zero. Then later
++   * transition to NORMAL after maintenance expiration.
++   */
++  @Test(timeout = 360000)
++  public void testZeroMinMaintenanceReplicationWithExpiration()
++      throws Exception {
++    LOG.info("Starting testZeroMinMaintenanceReplicationWithExpiration");
++    setMinMaintenanceR(0);
++    startCluster(1, 1);
++
++    final Path file =
++        new Path("/testZeroMinMaintenanceReplicationWithExpiration.dat");
++
++    FileSystem fileSys = getCluster().getFileSystem(0);
++    writeFile(fileSys, file, 1, 1);
++
++    DatanodeInfo nodeOutofService = takeNodeOutofService(0, null,
++        Long.MAX_VALUE, null, AdminStates.IN_MAINTENANCE);
++
++    // Adjust the expiration.
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(),
++        Time.monotonicNow() + EXPIRATION_IN_MS, null, AdminStates.NORMAL);
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * Transition from IN_MAINTENANCE to DECOMMISSIONED.
++   */
++  @Test(timeout = 360000)
++  public void testTransitionToDecommission() throws IOException {
++    LOG.info("Starting testTransitionToDecommission");
++    final int numNamenodes = 1;
++    final int numDatanodes = 4;
++    startCluster(numNamenodes, numDatanodes);
++
++    final Path file = new Path("testTransitionToDecommission.dat");
++    final int replicas = 3;
++
++    FileSystem fileSys = getCluster().getFileSystem(0);
++    FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, replicas, 1);
++
++    DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    DFSClient client = getDfsClient(0);
++    assertEquals("All datanodes must be alive", numDatanodes,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    // test 1, verify the replica in IN_MAINTENANCE state isn't in LocatedBlock
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(), 0, null,
++        AdminStates.DECOMMISSIONED);
++
++    // test 2 after decommission has completed, the replication count is
++    // replicas + 1 which includes the decommissioned node.
++    assertNull(checkWithRetry(ns, fileSys, file, replicas + 1, null));
++
++    // test 3, put the node in service, replication count should restore.
++    putNodeInService(0, nodeOutofService.getDatanodeUuid());
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, null));
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * Transition from decommissioning state to maintenance state.
++   */
++  @Test(timeout = 360000)
++  public void testTransitionFromDecommissioning() throws IOException {
++    LOG.info("Starting testTransitionFromDecommissioning");
++    startCluster(1, 3);
++
++    final Path file = new Path("/testTransitionFromDecommissioning.dat");
++    final int replicas = 3;
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, replicas);
++
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0, null, 0,
++        null, AdminStates.DECOMMISSION_INPROGRESS);
++
++    takeNodeOutofService(0, nodeOutofService.getDatanodeUuid(), Long.MAX_VALUE,
++        null, AdminStates.IN_MAINTENANCE);
++
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    cleanupFile(fileSys, file);
++  }
++
++
++  /**
++   * First put a node in maintenance, then put a different node
++   * in decommission. Make sure decommission process take
++   * maintenance replica into account.
++   */
++  @Test(timeout = 360000)
++  public void testDecommissionDifferentNodeAfterMaintenances()
++      throws Exception {
++    testDecommissionDifferentNodeAfterMaintenance(2);
++    testDecommissionDifferentNodeAfterMaintenance(3);
++    testDecommissionDifferentNodeAfterMaintenance(4);
++  }
++
++  private void testDecommissionDifferentNodeAfterMaintenance(int repl)
++      throws Exception {
++    startCluster(1, 5);
++
++    final Path file =
++        new Path("/testDecommissionDifferentNodeAfterMaintenance.dat");
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, repl, 1);
++    final DatanodeInfo[] nodes = getFirstBlockReplicasDatanodeInfos(fileSys,
++        file);
++    String maintenanceDNUuid = nodes[0].getDatanodeUuid();
++    String decommissionDNUuid = nodes[1].getDatanodeUuid();
++    DatanodeInfo maintenanceDN = takeNodeOutofService(0, maintenanceDNUuid,
++        Long.MAX_VALUE, null, null, AdminStates.IN_MAINTENANCE);
+ 
+-    cleanupFile(fileSys, file1);
++    Map<DatanodeInfo, Long> maintenanceNodes = new HashMap<>();
++    maintenanceNodes.put(nodes[0], Long.MAX_VALUE);
++    takeNodeOutofService(0, decommissionDNUuid, 0, null, maintenanceNodes,
++        AdminStates.DECOMMISSIONED);
++    // Out of the replicas returned, one is the decommissioned node.
++    assertNull(checkWithRetry(ns, fileSys, file, repl, maintenanceDN));
++
++    putNodeInService(0, maintenanceDN);
++    assertNull(checkWithRetry(ns, fileSys, file, repl + 1, null));
++
++    cleanupFile(fileSys, file);
++  }
++
++
++  @Test(timeout = 360000)
++  public void testChangeReplicationFactors() throws IOException {
++    // Prior to any change, there is 1 maintenance node and 2 live nodes.
++
++    // Replication factor is adjusted from 3 to 4.
++    // After the change, given 1 maintenance + 2 live is less than the
++    // newFactor, one live nodes will be added.
++    testChangeReplicationFactor(3, 4, 3);
++
++    // Replication factor is adjusted from 3 to 2.
++    // After the change, given 2 live nodes is the same as the newFactor,
++    // no live nodes will be invalidated.
++    testChangeReplicationFactor(3, 2, 2);
++
++    // Replication factor is adjusted from 3 to 1.
++    // After the change, given 2 live nodes is greater than the newFactor,
++    // one live nodes will be invalidated.
++    testChangeReplicationFactor(3, 1, 1);
++  }
++
++  /**
++   * After the change of replication factor, # of live replicas <=
++   * the new replication factor.
++   */
++  private void testChangeReplicationFactor(int oldFactor, int newFactor,
++      int expectedLiveReplicas) throws IOException {
++    LOG.info("Starting testChangeReplicationFactor {} {} {}",
++        oldFactor, newFactor, expectedLiveReplicas);
++    startCluster(1, 5);
++
++    final Path file = new Path("/testChangeReplicationFactor.dat");
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, oldFactor, 1);
++
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    // Verify that the nodeOutofService remains in blocksMap and
++    // # of live replicas For read operation is expected.
++    assertNull(checkWithRetry(ns, fileSys, file, oldFactor - 1,
++        nodeOutofService));
++
++    final DFSClient client = getDfsClient(0);
++    client.setReplication(file.toString(), (short)newFactor);
++
++    // Verify that the nodeOutofService remains in blocksMap and
++    // # of live replicas for read operation.
++    assertNull(checkWithRetry(ns, fileSys, file, expectedLiveReplicas,
++        nodeOutofService));
++
++    putNodeInService(0, nodeOutofService.getDatanodeUuid());
++    assertNull(checkWithRetry(ns, fileSys, file, newFactor, null));
++
++    cleanupFile(fileSys, file);
++  }
++
++
++  /**
++   * Verify the following scenario.
++   * a. Put a live node to maintenance => 1 maintenance, 2 live.
++   * b. The maintenance node becomes dead => block map still has 1 maintenance,
++   *    2 live.
++   * c. Take the node out of maintenance => NN should schedule the replication
++   *    and end up with 3 live.
++   */
++  @Test(timeout = 360000)
++  public void testTakeDeadNodeOutOfMaintenance() throws Exception {
++    LOG.info("Starting testTakeDeadNodeOutOfMaintenance");
++    final int numNamenodes = 1;
++    final int numDatanodes = 4;
++    startCluster(numNamenodes, numDatanodes);
++
++    final Path file = new Path("/testTakeDeadNodeOutOfMaintenance.dat");
++    final int replicas = 3;
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    final FSNamesystem ns = getCluster().getNamesystem(0);
++    writeFile(fileSys, file, replicas, 1);
++
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    final DFSClient client = getDfsClient(0);
++    assertEquals("All datanodes must be alive", numDatanodes,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    getCluster().stopDataNode(nodeOutofService.getXferAddr());
++    DFSTestUtil.waitForDatanodeState(
++        getCluster(), nodeOutofService.getDatanodeUuid(), false, 20000);
++    assertEquals("maintenance node shouldn't be alive", numDatanodes - 1,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    // Dead maintenance node's blocks should remain in block map.
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    // When dead maintenance mode is transitioned to out of maintenance mode,
++    // its blocks should be removed from block map.
++    // This will then trigger replication to restore the live replicas back
++    // to replication factor.
++    putNodeInService(0, nodeOutofService.getDatanodeUuid());
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, nodeOutofService,
++        null));
++
++    cleanupFile(fileSys, file);
+   }
+ 
+-  static protected String getFirstBlockFirstReplicaUuid(FileSystem fileSys,
++
++  /**
++   * Verify the following scenario.
++   * a. Put a live node to maintenance => 1 maintenance, 2 live.
++   * b. The maintenance node becomes dead => block map still has 1 maintenance,
++   *    2 live.
++   * c. Restart nn => block map only has 2 live => restore the 3 live.
++   * d. Restart the maintenance dn => 1 maintenance, 3 live.
++   * e. Take the node out of maintenance => over replication => 3 live.
++   */
++  @Test(timeout = 360000)
++  public void testWithNNAndDNRestart() throws Exception {
++    LOG.info("Starting testWithNNAndDNRestart");
++    final int numNamenodes = 1;
++    final int numDatanodes = 4;
++    startCluster(numNamenodes, numDatanodes);
++
++    final Path file = new Path("/testWithNNAndDNRestart.dat");
++    final int replicas = 3;
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    FSNamesystem ns = getCluster().getNamesystem(0);
++    writeFile(fileSys, file, replicas, 1);
++
++    DatanodeInfo nodeOutofService = takeNodeOutofService(0,
++        getFirstBlockFirstReplicaUuid(fileSys, file), Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    DFSClient client = getDfsClient(0);
++    assertEquals("All datanodes must be alive", numDatanodes,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    MiniDFSCluster.DataNodeProperties dnProp =
++        getCluster().stopDataNode(nodeOutofService.getXferAddr());
++    DFSTestUtil.waitForDatanodeState(
++        getCluster(), nodeOutofService.getDatanodeUuid(), false, 20000);
++    assertEquals("maintenance node shouldn't be alive", numDatanodes - 1,
++        client.datanodeReport(DatanodeReportType.LIVE).length);
++
++    // Dead maintenance node's blocks should remain in block map.
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService));
++
++    // restart nn, nn will restore 3 live replicas given it doesn't
++    // know the maintenance node has the replica.
++    getCluster().restartNameNode(0);
++    ns = getCluster().getNamesystem(0);
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, null));
++
++    // restart dn, nn has 1 maintenance replica and 3 live replicas.
++    getCluster().restartDataNode(dnProp, true);
++    getCluster().waitActive();
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, nodeOutofService));
++
++    // Put the node in service, a redundant replica should be removed.
++    putNodeInService(0, nodeOutofService.getDatanodeUuid());
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, null));
++
++    cleanupFile(fileSys, file);
++  }
++
++
++  /**
++   * Machine under maintenance state won't be chosen for new block allocation.
++   */
++  @Test(timeout = 3600000)
++  public void testWriteAfterMaintenance() throws IOException {
++    LOG.info("Starting testWriteAfterMaintenance");
++    startCluster(1, 3);
++
++    final Path file = new Path("/testWriteAfterMaintenance.dat");
++    int replicas = 3;
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    FSNamesystem ns = getCluster().getNamesystem(0);
++
++    final DatanodeInfo nodeOutofService = takeNodeOutofService(0, null,
++        Long.MAX_VALUE, null, AdminStates.IN_MAINTENANCE);
++
++    writeFile(fileSys, file, replicas, 2);
++
++    // Verify nodeOutofService wasn't chosen for write operation.
++    assertNull(checkWithRetry(ns, fileSys, file, replicas - 1,
++        nodeOutofService, null));
++
++    // Put the node back to service, live replicas should be restored.
++    putNodeInService(0, nodeOutofService.getDatanodeUuid());
++    assertNull(checkWithRetry(ns, fileSys, file, replicas, null));
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * A node has blocks under construction when it is put to maintenance.
++   * Given there are minReplication replicas somewhere else,
++   * it can be transitioned to AdminStates.IN_MAINTENANCE.
++   */
++  @Test(timeout = 360000)
++  public void testEnterMaintenanceWhenFileOpen() throws Exception {
++    LOG.info("Starting testEnterMaintenanceWhenFileOpen");
++    startCluster(1, 3);
++
++    final Path file = new Path("/testEnterMaintenanceWhenFileOpen.dat");
++
++    final FileSystem fileSys = getCluster().getFileSystem(0);
++    writeIncompleteFile(fileSys, file, (short)3, (short)2);
++
++    takeNodeOutofService(0, null, Long.MAX_VALUE, null,
++        AdminStates.IN_MAINTENANCE);
++
++    cleanupFile(fileSys, file);
++  }
++
++  /**
++   * Machine under maintenance state won't be chosen for invalidation.
++   */
++  @Test(timeout = 360000)
++  public void testInvalidation() throws IOException {
++    LOG.info("Starting testInvalidation");
++    int numNamenodes = 1;
++    int numDatanodes = 3;
++    startCluster(numNamenodes, numDatanodes);
++
++    Path file = new Path("/testInvalidation.dat");
++    int replicas = 3;
++
++    FileSystem fileSys = getCluster().getFileSystem(0);
++    FSNamesystem ns = getCluster().getNamesystem(0);
++
++    writeFile(fileSys, file, replicas);
++
++    DatanodeInfo nodeOutofService = takeNodeOutofService(0, null,
++        Long.MAX_VALUE, null, AdminStates.IN_MAINTENANCE);
++
++    DFSClient client = getDfsClient(0);
++    client.setReplication(file.toString(), (short) 1);
++
++    // Verify the nodeOutofService remains in blocksMap.
++    assertNull(checkWithRetry(ns, fileSys, file, 1, nodeOutofService));
++
++    // Restart NN and verify the nodeOutofService remains in blocksMap.
++    getCluster().restartNameNode(0);
++    ns = getCluster().getNamesystem(0);
++    assertNull(checkWithRetry(ns, fileSys, file, 1, nodeOutofService));
++
++    cleanupFile(fileSys, file);
++  }
++
++  static String getFirstBlockFirstReplicaUuid(FileSystem fileSys,
+       Path name) throws IOException {
++    DatanodeInfo[] nodes = getFirstBlockReplicasDatanodeInfos(fileSys, name);
++    if (nodes != null && nodes.length != 0) {
++      return nodes[0].getDatanodeUuid();
++    } else {
++      return null;
++    }
++  }
++
++  /*
++  * Verify that the number of replicas are as expected for each block in
++  * the given file.
++  *
++  * @return - null if no failure found, else an error message string.
++  */
++  static String checkFile(FSNamesystem ns, FileSystem fileSys,
++      Path name, int repl, DatanodeInfo expectedExcludedNode,
++      DatanodeInfo expectedMaintenanceNode) throws IOException {
+     // need a raw stream
+     assertTrue("Not HDFS:"+fileSys.getUri(),
+         fileSys instanceof DistributedFileSystem);
+     HdfsDataInputStream dis = (HdfsDataInputStream)fileSys.open(name);
++    BlockManager bm = ns.getBlockManager();
+     Collection<LocatedBlock> dinfo = dis.getAllBlocks();
++    String output;
+     for (LocatedBlock blk : dinfo) { // for each block
+       DatanodeInfo[] nodes = blk.getLocations();
+-      if (nodes.length > 0) {
+-        return nodes[0].getDatanodeUuid();
++      for (int j = 0; j < nodes.length; j++) { // for each replica
++        if (expectedExcludedNode != null &&
++            nodes[j].equals(expectedExcludedNode)) {
++          //excluded node must not be in LocatedBlock.
++          output = "For block " + blk.getBlock() + " replica on " +
++              nodes[j] + " found in LocatedBlock.";
++          LOG.info(output);
++          return output;
++        } else {
++          if (nodes[j].isInMaintenance()) {
++            //IN_MAINTENANCE node must not be in LocatedBlock.
++            output = "For block " + blk.getBlock() + " replica on " +
++                nodes[j] + " which is in maintenance state.";
++            LOG.info(output);
++            return output;
++          }
++        }
++      }
++      if (repl != nodes.length) {
++        output = "Wrong number of replicas for block " + blk.getBlock() +
++            ": expected " + repl + ", got " + nodes.length + " ,";
++        for (int j = 0; j < nodes.length; j++) { // for each replica
++          output += nodes[j] + ",";
++        }
++        output += "pending block # " + ns.getPendingReplicationBlocks() + " ,";
++        output += "under replicated # " + ns.getUnderReplicatedBlocks() + " ,";
++        if (expectedExcludedNode != null) {
++          output += "excluded node " + expectedExcludedNode;
++        }
++
++        LOG.info(output);
++        return output;
++      }
++
++      // Verify it has the expected maintenance node
++      Iterator<DatanodeStorageInfo> storageInfoIter =
++          bm.getStorages(blk.getBlock().getLocalBlock()).iterator();
++      List<DatanodeInfo> maintenanceNodes = new ArrayList<>();
++      while (storageInfoIter.hasNext()) {
++        DatanodeInfo node = storageInfoIter.next().getDatanodeDescriptor();
++        if (node.isMaintenance()) {
++          maintenanceNodes.add(node);
++        }
++      }
++
++      if (expectedMaintenanceNode != null) {
++        if (!maintenanceNodes.contains(expectedMaintenanceNode)) {
++          output = "No maintenance replica on " + expectedMaintenanceNode;
++          LOG.info(output);
++          return output;
++        }
++      } else {
++        if (maintenanceNodes.size() != 0) {
++          output = "Has maintenance replica(s)";
++          LOG.info(output);
++          return output;
++        }
+       }
+     }
+     return null;
+   }
++
++  static String checkWithRetry(FSNamesystem ns, FileSystem fileSys,
++      Path name, int repl, DatanodeInfo inMaintenanceNode)
++          throws IOException {
++    return checkWithRetry(ns, fileSys, name, repl, inMaintenanceNode,
++        inMaintenanceNode);
++  }
++
++  static String checkWithRetry(FSNamesystem ns, FileSystem fileSys,
++      Path name, int repl, DatanodeInfo excludedNode,
++      DatanodeInfo underMaintenanceNode) throws IOException {
++    int tries = 0;
++    String output = null;
++    while (tries++ < 200) {
++      try {
++        Thread.sleep(100);
++        output = checkFile(ns, fileSys, name, repl, excludedNode,
++            underMaintenanceNode);
++        if (output == null) {
++          break;
++        }
++      } catch (InterruptedException ie) {
++      }
++    }
++    return output;
++  }
++
++  static private DatanodeInfo[] getFirstBlockReplicasDatanodeInfos(
++      FileSystem fileSys, Path name) throws IOException {
++    // need a raw stream
++    assertTrue("Not HDFS:"+fileSys.getUri(),
++        fileSys instanceof DistributedFileSystem);
++    HdfsDataInputStream dis = (HdfsDataInputStream)fileSys.open(name);
++    Collection<LocatedBlock> dinfo = dis.getAllBlocks();
++    if (dinfo.iterator().hasNext()) { // for the first block
++      return dinfo.iterator().next().getLocations();
++    } else {
++      return null;
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+index 7bae3bb..106a140 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+@@ -28,6 +28,7 @@
+ import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.verify;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -65,7 +66,9 @@
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+ import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor.BlockTargetPair;
++import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.InternalDataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.datanode.FinalizedReplica;
+ import org.apache.hadoop.hdfs.server.datanode.ReplicaBeingWritten;
+@@ -77,6 +80,7 @@
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
+ import org.apache.hadoop.hdfs.server.protocol.StorageReceivedDeletedBlocks;
++import org.apache.hadoop.hdfs.server.protocol.StorageReport;
+ import org.apache.hadoop.io.EnumSetWritable;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.ipc.RemoteException;
+@@ -400,9 +404,9 @@ private void doTestSingleRackClusterIsSufficientlyReplicated(int testIndex,
+       List<DatanodeDescriptor> origNodes)
+       throws Exception {
+     assertEquals(0, bm.numOfUnderReplicatedBlocks());
+-    addBlockOnNodes(testIndex, origNodes);
++    BlockInfo block = addBlockOnNodes(testIndex, origNodes);
+     bm.processMisReplicatedBlocks();
+-    assertEquals(0, bm.numOfUnderReplicatedBlocks());
++    assertFalse(bm.isNeededReplication(block, bm.countNodes(block)));
+   }
+ 
+   @Test(timeout = 60000)
+@@ -445,9 +449,7 @@ public void testNeededReplicationWhileAppending() throws IOException {
+         namenode.updatePipeline(clientName, oldBlock, newBlock,
+             oldLoactedBlock.getLocations(), oldLoactedBlock.getStorageIDs());
+         BlockInfo bi = bm.getStoredBlock(newBlock.getLocalBlock());
+-        assertFalse(
+-            bm.isNeededReplication(bi, oldLoactedBlock.getLocations().length,
+-                bm.countLiveNodes(bi)));
++        assertFalse(bm.isNeededReplication(bi, bm.countNodes(bi)));
+       } finally {
+         IOUtils.closeStream(out);
+       }
+@@ -1147,4 +1149,79 @@ public void run() {
+       cluster.shutdown();
+     }
+   }
++
++  @Test
++  public void testBlockManagerMachinesArray() throws Exception {
++    final Configuration conf = new HdfsConfiguration();
++    final MiniDFSCluster cluster =
++            new MiniDFSCluster.Builder(conf).numDataNodes(4).build();
++    cluster.waitActive();
++    BlockManager blockManager = cluster.getNamesystem().getBlockManager();
++    FileSystem fs = cluster.getFileSystem();
++    final Path filePath = new Path("/tmp.txt");
++    final long fileLen = 1L;
++    DFSTestUtil.createFile(fs, filePath, fileLen, (short) 3, 1L);
++    ArrayList<DataNode> datanodes = cluster.getDataNodes();
++    assertEquals(datanodes.size(), 4);
++    FSNamesystem ns = cluster.getNamesystem();
++    // get the block
++    final String bpid = cluster.getNamesystem().getBlockPoolId();
++    File storageDir = cluster.getInstanceStorageDir(0, 0);
++    File dataDir = MiniDFSCluster.getFinalizedDir(storageDir, bpid);
++    assertTrue("Data directory does not exist", dataDir.exists());
++    BlockInfo blockInfo = blockManager.blocksMap.getBlocks().iterator().next();
++    ExtendedBlock blk = new ExtendedBlock(bpid, blockInfo.getBlockId(),
++            blockInfo.getNumBytes(), blockInfo.getGenerationStamp());
++    DatanodeDescriptor failedStorageDataNode =
++            blockManager.getStoredBlock(blockInfo).getDatanode(0);
++    DatanodeDescriptor corruptStorageDataNode =
++            blockManager.getStoredBlock(blockInfo).getDatanode(1);
++
++    ArrayList<StorageReport> reports = new ArrayList<StorageReport>();
++    for(int i=0; i<failedStorageDataNode.getStorageInfos().length; i++) {
++      DatanodeStorageInfo storageInfo = failedStorageDataNode
++              .getStorageInfos()[i];
++      DatanodeStorage dns = new DatanodeStorage(
++              failedStorageDataNode.getStorageInfos()[i].getStorageID(),
++              DatanodeStorage.State.FAILED,
++              failedStorageDataNode.getStorageInfos()[i].getStorageType());
++      while(storageInfo.getBlockIterator().hasNext()) {
++        BlockInfo blockInfo1 = storageInfo.getBlockIterator().next();
++        if(blockInfo1.equals(blockInfo)) {
++          StorageReport report = new StorageReport(
++                  dns, true, storageInfo.getCapacity(),
++                  storageInfo.getDfsUsed(), storageInfo.getRemaining(),
++                  storageInfo.getBlockPoolUsed(), 0L);
++          reports.add(report);
++          break;
++        }
++      }
++    }
++    failedStorageDataNode.updateHeartbeat(reports.toArray(StorageReport
++            .EMPTY_ARRAY), 0L, 0L, 0, 0, null);
++    ns.writeLock();
++    DatanodeStorageInfo corruptStorageInfo= null;
++    for(int i=0; i<corruptStorageDataNode.getStorageInfos().length; i++) {
++      corruptStorageInfo = corruptStorageDataNode.getStorageInfos()[i];
++      while(corruptStorageInfo.getBlockIterator().hasNext()) {
++        BlockInfo blockInfo1 = corruptStorageInfo.getBlockIterator().next();
++        if (blockInfo1.equals(blockInfo)) {
++          break;
++        }
++      }
++    }
++    blockManager.findAndMarkBlockAsCorrupt(blk, corruptStorageDataNode,
++            corruptStorageInfo.getStorageID(),
++            CorruptReplicasMap.Reason.ANY.toString());
++    ns.writeUnlock();
++    BlockInfo[] blockInfos = new BlockInfo[] {blockInfo};
++    ns.readLock();
++    LocatedBlocks locatedBlocks =
++            blockManager.createLocatedBlocks(blockInfos, 3L, false, 0L, 3L,
++                    false, false, null);
++    assertTrue("Located Blocks should exclude corrupt" +
++                    "replicas and failed storages",
++            locatedBlocks.getLocatedBlocks().size() == 1);
++    ns.readUnlock();
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDecommissioningStatus.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDecommissioningStatus.java
+index 5443c9c..8bf0bc7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDecommissioningStatus.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestDecommissioningStatus.java
+@@ -38,6 +38,7 @@
+ import org.apache.hadoop.fs.LocatedFileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.RemoteIterator;
++import org.apache.hadoop.hdfs.AdminStatesBaseTest;
+ import org.apache.hadoop.hdfs.DFSClient;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+@@ -152,25 +153,7 @@ private void writeFile(FileSystem fileSys, Path name, short repl)
+     stm.write(buffer);
+     stm.close();
+   }
+- 
+-  private FSDataOutputStream writeIncompleteFile(FileSystem fileSys, Path name,
+-      short repl) throws IOException {
+-    // create and write a file that contains three blocks of data
+-    FSDataOutputStream stm = fileSys.create(name, true, fileSys.getConf()
+-        .getInt(CommonConfigurationKeys.IO_FILE_BUFFER_SIZE_KEY, 4096), repl,
+-        blockSize);
+-    byte[] buffer = new byte[fileSize];
+-    Random rand = new Random(seed);
+-    rand.nextBytes(buffer);
+-    stm.write(buffer);
+-    // need to make sure that we actually write out both file blocks
+-    // (see FSOutputSummer#flush)
+-    stm.flush();
+-    // Do not close stream, return it
+-    // so that it is not garbage collected
+-    return stm;
+-  }
+-  
++
+   static private void cleanupFile(FileSystem fileSys, Path name)
+       throws IOException {
+     assertTrue(fileSys.exists(name));
+@@ -181,20 +164,20 @@ static private void cleanupFile(FileSystem fileSys, Path name)
+   /*
+    * Decommissions the node at the given index
+    */
+-  private String decommissionNode(FSNamesystem namesystem, DFSClient client,
+-      FileSystem localFileSys, int nodeIndex) throws IOException {
++ private String decommissionNode(DFSClient client,
++      int nodeIndex) throws IOException {
+     DatanodeInfo[] info = client.datanodeReport(DatanodeReportType.LIVE);
+ 
+     String nodename = info[nodeIndex].getXferAddr();
+-    decommissionNode(namesystem, localFileSys, nodename);
++    decommissionNode(nodename);
+     return nodename;
+   }
+ 
+   /*
+    * Decommissions the node by name
+    */
+-  private void decommissionNode(FSNamesystem namesystem,
+-      FileSystem localFileSys, String dnName) throws IOException {
++  private void decommissionNode(String dnName)
++      throws IOException {
+     System.out.println("Decommissioning node: " + dnName);
+ 
+     // write nodename into the exclude file.
+@@ -208,14 +191,14 @@ private void checkDecommissionStatus(DatanodeDescriptor decommNode,
+       int expectedUnderRepInOpenFiles) {
+     assertEquals("Unexpected num under-replicated blocks",
+         expectedUnderRep,
+-        decommNode.decommissioningStatus.getUnderReplicatedBlocks());
++        decommNode.getLeavingServiceStatus().getUnderReplicatedBlocks());
+     assertEquals("Unexpected number of decom-only replicas",
+         expectedDecommissionOnly,
+-        decommNode.decommissioningStatus.getDecommissionOnlyReplicas());
++        decommNode.getLeavingServiceStatus().getOutOfServiceOnlyReplicas());
+     assertEquals(
+         "Unexpected number of replicas in under-replicated open files",
+         expectedUnderRepInOpenFiles,
+-        decommNode.decommissioningStatus.getUnderReplicatedInOpenFiles());
++        decommNode.getLeavingServiceStatus().getUnderReplicatedInOpenFiles());
+   }
+ 
+   private void checkDFSAdminDecommissionStatus(
+@@ -284,7 +267,8 @@ public void testDecommissionStatus() throws Exception {
+     writeFile(fileSys, file1, replicas);
+ 
+     Path file2 = new Path("decommission1.dat");
+-    FSDataOutputStream st1 = writeIncompleteFile(fileSys, file2, replicas);
++    FSDataOutputStream st1 = AdminStatesBaseTest.writeIncompleteFile(fileSys,
++        file2, replicas, (short)(fileSize / blockSize));
+     for (DataNode d: cluster.getDataNodes()) {
+       DataNodeTestUtils.triggerBlockReport(d);
+     }
+@@ -292,7 +276,7 @@ public void testDecommissionStatus() throws Exception {
+     FSNamesystem fsn = cluster.getNamesystem();
+     final DatanodeManager dm = fsn.getBlockManager().getDatanodeManager();
+     for (int iteration = 0; iteration < numDatanodes; iteration++) {
+-      String downnode = decommissionNode(fsn, client, localFileSys, iteration);
++      String downnode = decommissionNode(client, iteration);
+       dm.refreshNodes(conf);
+       decommissionedNodes.add(downnode);
+       BlockManagerTestUtil.recheckDecommissionState(dm);
+@@ -323,8 +307,8 @@ public void testDecommissionStatus() throws Exception {
+     writeConfigFile(localFileSys, excludeFile, null);
+     dm.refreshNodes(conf);
+     st1.close();
+-    cleanupFile(fileSys, file1);
+-    cleanupFile(fileSys, file2);
++    AdminStatesBaseTest.cleanupFile(fileSys, file1);
++    AdminStatesBaseTest.cleanupFile(fileSys, file2);
+   }
+ 
+   /**
+@@ -350,7 +334,7 @@ public void testDecommissionStatusAfterDNRestart() throws Exception {
+     // Decommission the DN.
+     FSNamesystem fsn = cluster.getNamesystem();
+     final DatanodeManager dm = fsn.getBlockManager().getDatanodeManager();
+-    decommissionNode(fsn, localFileSys, dnName);
++    decommissionNode(dnName);
+     dm.refreshNodes(conf);
+ 
+     // Stop the DN when decommission is in progress.
+@@ -385,7 +369,7 @@ public void testDecommissionStatusAfterDNRestart() throws Exception {
+     
+     // Delete the under-replicated file, which should let the 
+     // DECOMMISSION_IN_PROGRESS node become DECOMMISSIONED
+-    cleanupFile(fileSys, f);
++    AdminStatesBaseTest.cleanupFile(fileSys, f);
+     BlockManagerTestUtil.recheckDecommissionState(dm);
+     assertTrue("the node should be decommissioned",
+         dead.get(0).isDecommissioned());
+@@ -418,7 +402,7 @@ public void testDecommissionDeadDN() throws Exception {
+     FSNamesystem fsn = cluster.getNamesystem();
+     final DatanodeManager dm = fsn.getBlockManager().getDatanodeManager();
+     DatanodeDescriptor dnDescriptor = dm.getDatanode(dnID);
+-    decommissionNode(fsn, localFileSys, dnName);
++    decommissionNode(dnName);
+     dm.refreshNodes(conf);
+     BlockManagerTestUtil.recheckDecommissionState(dm);
+     assertTrue(dnDescriptor.isDecommissioned());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+index 82bc0b4..1e4ea79 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNamenodeCapacityReport.java
+@@ -191,9 +191,15 @@ public void testVolumeSize() throws Exception {
+   private static final float EPSILON = 0.0001f;
+   @Test
+   public void testXceiverCount() throws Exception {
++    testXceiverCountInternal(0);
++    testXceiverCountInternal(1);
++  }
++
++  public void testXceiverCountInternal(int minMaintenanceR) throws Exception {
+     Configuration conf = new HdfsConfiguration();
+     // retry one time, if close fails
+-    conf.setInt(DFS_CLIENT_BLOCK_WRITE_LOCATEFOLLOWINGBLOCK_RETRIES_KEY, 1);
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY,
++        minMaintenanceR);
+     MiniDFSCluster cluster = null;
+ 
+     final int nodes = 8;
+@@ -216,28 +222,25 @@ public void testXceiverCount() throws Exception {
+       int expectedTotalLoad = nodes;  // xceiver server adds 1 to load
+       int expectedInServiceNodes = nodes;
+       int expectedInServiceLoad = nodes;
+-      assertEquals(nodes, namesystem.getNumLiveDataNodes());
+-      assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
+-      assertEquals(expectedTotalLoad, namesystem.getTotalLoad());
+-      assertEquals((double)expectedInServiceLoad/expectedInServiceLoad,
+-          namesystem.getInServiceXceiverAverage(), EPSILON);
+-      
+-      // shutdown half the nodes and force a heartbeat check to ensure
+-      // counts are accurate
++
++      checkClusterHealth(nodes, namesystem, expectedTotalLoad,
++          expectedInServiceNodes, expectedInServiceLoad);
++
++      // Shutdown half the nodes followed by admin operations on those nodes.
++      // Ensure counts are accurate.
+       for (int i=0; i < nodes/2; i++) {
+         DataNode dn = datanodes.get(i);
+         DatanodeDescriptor dnd = dnm.getDatanode(dn.getDatanodeId());
+         dn.shutdown();
+         dnd.setLastUpdate(0L);
+         BlockManagerTestUtil.checkHeartbeat(namesystem.getBlockManager());
+-        //Verify decommission of dead node won't impact nodesInService metrics.
+-        dnm.getDecomManager().startDecommission(dnd);
++        //Admin operations on dead nodes won't impact nodesInService metrics.
++        startDecommissionOrMaintenance(dnm, dnd, (i % 2 == 0));
+         expectedInServiceNodes--;
+         assertEquals(expectedInServiceNodes, namesystem.getNumLiveDataNodes());
+-        assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
+-        //Verify recommission of dead node won't impact nodesInService metrics.
+-        dnm.getDecomManager().stopDecommission(dnd);
+-        assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
++        assertEquals(expectedInServiceNodes, getNumDNInService(namesystem));
++        stopDecommissionOrMaintenance(dnm, dnd, (i % 2 == 0));
++        assertEquals(expectedInServiceNodes, getNumDNInService(namesystem));
+       }
+ 
+       // restart the nodes to verify that counts are correct after
+@@ -247,12 +250,10 @@ public void testXceiverCount() throws Exception {
+       datanodes = cluster.getDataNodes();
+       expectedInServiceNodes = nodes;
+       assertEquals(nodes, datanodes.size());
+-      assertEquals(nodes, namesystem.getNumLiveDataNodes());
+-      assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
+-      assertEquals(expectedTotalLoad, namesystem.getTotalLoad());
+-      assertEquals((double)expectedInServiceLoad/expectedInServiceLoad,
+-          namesystem.getInServiceXceiverAverage(), EPSILON);
+-      
++
++     checkClusterHealth(nodes, namesystem, expectedTotalLoad,
++          expectedInServiceNodes, expectedInServiceLoad);
++
+       // create streams and hsync to force datastreamers to start
+       DFSOutputStream[] streams = new DFSOutputStream[fileCount];
+       for (int i=0; i < fileCount; i++) {
+@@ -267,40 +268,34 @@ public void testXceiverCount() throws Exception {
+       }
+       // force nodes to send load update
+       triggerHeartbeats(datanodes);
+-      assertEquals(nodes, namesystem.getNumLiveDataNodes());
+-      assertEquals(expectedInServiceNodes,
+-          namesystem.getNumDatanodesInService());
+-      assertEquals(expectedTotalLoad, namesystem.getTotalLoad());
+-      assertEquals((double)expectedInServiceLoad/expectedInServiceNodes,
+-          namesystem.getInServiceXceiverAverage(), EPSILON);
+-
+-      // decomm a few nodes, substract their load from the expected load,
+-      // trigger heartbeat to force load update
++
++      checkClusterHealth(nodes, namesystem, expectedTotalLoad,
++          expectedInServiceNodes, expectedInServiceLoad);
++
++      // admin operations on a few nodes, substract their load from the
++      // expected load, trigger heartbeat to force load update.
+       for (int i=0; i < fileRepl; i++) {
+         expectedInServiceNodes--;
+         DatanodeDescriptor dnd =
+             dnm.getDatanode(datanodes.get(i).getDatanodeId());
+         expectedInServiceLoad -= dnd.getXceiverCount();
+-        dnm.getDecomManager().startDecommission(dnd);
++        startDecommissionOrMaintenance(dnm, dnd, (i % 2 == 0));
+         DataNodeTestUtils.triggerHeartbeat(datanodes.get(i));
+         Thread.sleep(100);
+-        assertEquals(nodes, namesystem.getNumLiveDataNodes());
+-        assertEquals(expectedInServiceNodes,
+-            namesystem.getNumDatanodesInService());
+-        assertEquals(expectedTotalLoad, namesystem.getTotalLoad());
+-        assertEquals((double)expectedInServiceLoad/expectedInServiceNodes,
+-            namesystem.getInServiceXceiverAverage(), EPSILON);
++
++        checkClusterHealth(nodes, namesystem, expectedTotalLoad,
++            expectedInServiceNodes, expectedInServiceLoad);
+       }
+-      
++
+       // check expected load while closing each stream.  recalc expected
+       // load based on whether the nodes in the pipeline are decomm
+       for (int i=0; i < fileCount; i++) {
+-        int decomm = 0;
++        int adminOps = 0;
+         for (DatanodeInfo dni : streams[i].getPipeline()) {
+           DatanodeDescriptor dnd = dnm.getDatanode(dni);
+           expectedTotalLoad -= 2;
+-          if (dnd.isDecommissionInProgress() || dnd.isDecommissioned()) {
+-            decomm++;
++          if (!dnd.isInService()) {
++            adminOps++;
+           } else {
+             expectedInServiceLoad -= 2;
+           }
+@@ -311,21 +306,17 @@ public void testXceiverCount() throws Exception {
+           // nodes will go decommissioned even if there's a UC block whose
+           // other locations are decommissioned too.  we'll ignore that
+           // bug for now
+-          if (decomm < fileRepl) {
++          if (adminOps < fileRepl) {
+             throw ioe;
+           }
+         }
+         triggerHeartbeats(datanodes);
+         // verify node count and loads 
+-        assertEquals(nodes, namesystem.getNumLiveDataNodes());
+-        assertEquals(expectedInServiceNodes,
+-            namesystem.getNumDatanodesInService());
+-        assertEquals(expectedTotalLoad, namesystem.getTotalLoad());
+-        assertEquals((double)expectedInServiceLoad/expectedInServiceNodes,
+-            namesystem.getInServiceXceiverAverage(), EPSILON);
++        checkClusterHealth(nodes, namesystem, expectedTotalLoad,
++            expectedInServiceNodes, expectedInServiceLoad);
+       }
+ 
+-      // shutdown each node, verify node counts based on decomm state
++      // shutdown each node, verify node counts based on admin state
+       for (int i=0; i < nodes; i++) {
+         DataNode dn = datanodes.get(i);
+         dn.shutdown();
+@@ -338,14 +329,12 @@ public void testXceiverCount() throws Exception {
+         if (i >= fileRepl) {
+           expectedInServiceNodes--;
+         }
+-        assertEquals(expectedInServiceNodes, namesystem.getNumDatanodesInService());
+-        
++        assertEquals(expectedInServiceNodes, getNumDNInService(namesystem));
+         // live nodes always report load of 1.  no nodes is load 0
+         double expectedXceiverAvg = (i == nodes-1) ? 0.0 : 1.0;
+         assertEquals((double)expectedXceiverAvg,
+             namesystem.getInServiceXceiverAverage(), EPSILON);
+       }
+-      
+       // final sanity check
+       assertEquals(0, namesystem.getNumLiveDataNodes());
+       assertEquals(0, namesystem.getNumDatanodesInService());
+@@ -357,7 +346,49 @@ public void testXceiverCount() throws Exception {
+       }
+     }
+   }
+-  
++
++  private void startDecommissionOrMaintenance(DatanodeManager dnm,
++      DatanodeDescriptor dnd, boolean decomm) {
++    if (decomm) {
++      dnm.getDecomManager().startDecommission(dnd);
++    } else {
++      dnm.getDecomManager().startMaintenance(dnd, Long.MAX_VALUE);
++    }
++  }
++
++  private void stopDecommissionOrMaintenance(DatanodeManager dnm,
++      DatanodeDescriptor dnd, boolean decomm) {
++    if (decomm) {
++      dnm.getDecomManager().stopDecommission(dnd);
++    } else {
++      dnm.getDecomManager().stopMaintenance(dnd);
++    }
++  }
++
++  private static void checkClusterHealth(
++    int numOfLiveNodes,
++    FSNamesystem namesystem, double expectedTotalLoad,
++    int expectedInServiceNodes, double expectedInServiceLoad) {
++
++    assertEquals(numOfLiveNodes, namesystem.getNumLiveDataNodes());
++    assertEquals(expectedInServiceNodes, getNumDNInService(namesystem));
++    assertEquals(expectedTotalLoad, namesystem.getTotalLoad(), EPSILON);
++    if (expectedInServiceNodes != 0) {
++      assertEquals(expectedInServiceLoad / expectedInServiceNodes,
++        getInServiceXceiverAverage(namesystem), EPSILON);
++    } else {
++      assertEquals(0.0, getInServiceXceiverAverage(namesystem), EPSILON);
++    }
++  }
++
++  private static int getNumDNInService(FSNamesystem fsn) {
++    return fsn.getNumDatanodesInService();
++  }
++
++  private static double getInServiceXceiverAverage(FSNamesystem fsn) {
++    return fsn.getInServiceXceiverAverage();
++  }
++
+   private void triggerHeartbeats(List<DataNode> datanodes)
+       throws IOException, InterruptedException {
+     for (DataNode dn : datanodes) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/HostsFileWriter.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/HostsFileWriter.java
+index 89b2778..ee44309 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/HostsFileWriter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/HostsFileWriter.java
+@@ -53,6 +53,7 @@ public void initialize(Configuration conf, String dir) throws IOException {
+     localFileSys = FileSystem.getLocal(conf);
+     Path workingDir = new Path(MiniDFSCluster.getBaseDirectory());
+     this.fullDir = new Path(workingDir, dir);
++    cleanup(); // In case there is some left over from previous run.
+     assertTrue(localFileSys.mkdirs(this.fullDir));
+ 
+     if (conf.getClass(
+-- 
+1.7.9.5
+
