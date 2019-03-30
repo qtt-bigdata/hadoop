@@ -150,15 +150,7 @@ import org.apache.hadoop.hdfs.server.protocol.StorageReport;
 import org.apache.hadoop.hdfs.server.protocol.VolumeFailureSummary;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.Text;
-import org.apache.hadoop.ipc.ProtobufRpcEngine;
-import org.apache.hadoop.ipc.RPC;
-import org.apache.hadoop.ipc.RetriableException;
-import org.apache.hadoop.ipc.RetryCache;
-import org.apache.hadoop.ipc.Server;
-import org.apache.hadoop.ipc.StandbyException;
-import org.apache.hadoop.ipc.WritableRpcEngine;
-import org.apache.hadoop.ipc.RefreshRegistry;
-import org.apache.hadoop.ipc.RefreshResponse;
+import org.apache.hadoop.ipc.*;
 import org.apache.hadoop.net.Node;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.Groups;
@@ -498,6 +490,10 @@ class NameNodeRpcServer implements NamenodeProtocols {
     }
     checkNNStartup();
     namesystem.checkSuperuserPrivilege();
+    if(namesystem.checkStandyGetblocks()){
+        throw new ActiveDenyOfServiceException("Operation category getBlocks " +
+                "is not supported in state Active.");
+    }
     return namesystem.getBlockManager().getBlocks(datanode, size);
   }
 

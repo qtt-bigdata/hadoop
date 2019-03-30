@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.ipc.RemoteException;
+import org.apache.hadoop.ipc.ActiveDenyOfServiceException;
 import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.StandbyException;
 import org.apache.hadoop.net.ConnectTimeoutException;
@@ -614,7 +615,9 @@ public class RetryPolicies {
           e instanceof UnknownHostException ||
           e instanceof StandbyException ||
           e instanceof ConnectTimeoutException ||
-          isWrappedStandbyException(e)) {
+          e instanceof ActiveDenyOfServiceException ||
+          isWrappedStandbyException(e) ||
+          isWrappedActiveDenyOfServiceException(e)) {
         return new RetryAction(RetryAction.RetryDecision.FAILOVER_AND_RETRY,
             getFailoverOrRetrySleepTime(failovers));
       } else if (e instanceof RetriableException
@@ -669,7 +672,16 @@ public class RetryPolicies {
         StandbyException.class);
     return unwrapped instanceof StandbyException;
   }
-  
+
+  private static boolean isWrappedActiveDenyOfServiceException(Exception e) {
+    if (!(e instanceof RemoteException)) {
+      return false;
+    }
+    Exception unwrapped = ((RemoteException)e).unwrapRemoteException(
+            ActiveDenyOfServiceException.class);
+    return unwrapped instanceof ActiveDenyOfServiceException;
+  }
+
   static RetriableException getWrappedRetriableException(Exception e) {
     if (!(e instanceof RemoteException)) {
       return null;

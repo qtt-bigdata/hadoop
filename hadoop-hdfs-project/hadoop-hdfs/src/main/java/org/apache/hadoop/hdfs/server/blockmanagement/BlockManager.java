@@ -23,6 +23,7 @@ import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileEncryptionInfo;
+import org.apache.hadoop.ha.HAServiceProtocol;
 import org.apache.hadoop.hdfs.*;
 import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs.BlockReportReplica;
@@ -1147,12 +1148,11 @@ public class BlockManager implements BlockStatsMXBean {
    * @param datanode on which blocks are located
    * @param size total size of blocks
    */
-  public BlocksWithLocations getBlocks(DatanodeID datanode, long size
-      ) throws IOException {
-    namesystem.checkOperation(OperationCategory.READ);
+  public BlocksWithLocations getBlocks(DatanodeID datanode, long size) throws IOException {
+    namesystem.checkOperation(OperationCategory.UNCHECKED);
     namesystem.readLock();
     try {
-      namesystem.checkOperation(OperationCategory.READ);
+      namesystem.checkOperation(OperationCategory.UNCHECKED);
       return getBlocksWithLocations(datanode, size);  
     } finally {
       namesystem.readUnlock();
