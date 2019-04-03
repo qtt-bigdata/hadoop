@@ -184,6 +184,8 @@ public class TestGetBlocks {
     final Random r = new Random();
 
     CONF.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, DEFAULT_BLOCK_SIZE);
+    CONF.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,
+            DEFAULT_BLOCK_SIZE);
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(CONF).numDataNodes(
         REPLICATION_FACTOR).build();
     try {
@@ -194,7 +196,8 @@ public class TestGetBlocks {
       FSDataOutputStream out = fs.create(new Path("/tmp.txt"),
           REPLICATION_FACTOR);
       byte[] data = new byte[1024];
-      long fileLen = 2 * DEFAULT_BLOCK_SIZE;
+      //第三个块将被getblocks忽略,看不到
+      long fileLen = 2 * DEFAULT_BLOCK_SIZE + 1;
       long bytesToWrite = fileLen;
       while (bytesToWrite > 0) {
         r.nextBytes(data);
@@ -214,7 +217,7 @@ public class TestGetBlocks {
             CONF);
         locatedBlocks = dfsclient.getNamenode()
             .getBlockLocations("/tmp.txt", 0, fileLen).getLocatedBlocks();
-        assertEquals(2, locatedBlocks.size());
+        assertEquals(3, locatedBlocks.size());
         notWritten = false;
         for (int i = 0; i < 2; i++) {
           dataNodes = locatedBlocks.get(i).getLocations();

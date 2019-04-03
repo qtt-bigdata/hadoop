@@ -275,6 +275,15 @@ public class BlockManager implements BlockStatsMXBean {
    * processed again after aquiring lock again.
    */
   private int numBlocksPerIteration;
+
+
+  /**
+   * Minimum size that a block can be sent to Balancer through getBlocks.
+   * And after HDFS-8824, the small blocks are unused anyway, so there's no
+   * point to send them to balancer.
+   */
+  private long getBlocksMinBlockSize = -1;
+
   /**
    * Progress of the Replication queues initialisation.
    */
@@ -386,6 +395,10 @@ public class BlockManager implements BlockStatsMXBean {
     this.numBlocksPerIteration = conf.getInt(
         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT,
         DFSConfigKeys.DFS_BLOCK_MISREPLICATION_PROCESSING_LIMIT_DEFAULT);
+
+    this.getBlocksMinBlockSize = conf.getLongBytes(
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_DEFAULT);
 
     final int minMaintenanceR = conf.getInt(
         DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY,
@@ -1186,6 +1199,9 @@ public class BlockManager implements BlockStatsMXBean {
     while(totalSize<size && iter.hasNext()) {
       curBlock = iter.next();
       if(!curBlock.isComplete())  continue;
+      if (curBlock.getNumBytes() < getBlocksMinBlockSize) {
+        continue;
+      }
       totalSize += addBlock(curBlock, results);
     }
     if(totalSize<size) {
@@ -1193,6 +1209,9 @@ public class BlockManager implements BlockStatsMXBean {
       for(int i=0; i<startBlock&&totalSize<size; i++) {
         curBlock = iter.next();
         if(!curBlock.isComplete())  continue;
+        if (curBlock.getNumBytes() < getBlocksMinBlockSize) {
+          continue;
+        }
         totalSize += addBlock(curBlock, results);
       }
     }
