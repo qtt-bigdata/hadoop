@@ -285,6 +285,7 @@ import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.hdfs.util.LightWeightHashSet;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.ipc.ActiveDenyOfServiceException;
 import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.RetryCache;
 import org.apache.hadoop.ipc.RetryCache.CacheEntry;
@@ -613,6 +614,13 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
 
   private final TopConf topConf;
   private TopMetrics topMetrics;
+
+  /**
+   * If set balancerShouldRequestStandby true, Balancer will getBlocks from
+   * Standby only and it can reduce the performance impact of Active,
+   * especially in a busy cluster.
+   */
+  private boolean balancerShouldRequestStandby = false;
 
   /**
    * Notify that loading of this FSDirectory is complete, and
@@ -1001,6 +1009,9 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
           DFSConfigKeys.DFS_NAMENODE_LIST_OPENFILES_NUM_RESPONSES +
               " must be a positive integer."
       );
+      this.balancerShouldRequestStandby = conf.getBoolean(
+              DFSConfigKeys.DFS_HA_BALANCER_REQUEST_STANDBY_KEY,
+              DFSConfigKeys.DFS_HA_BALANCER_REQUEST_STANDBY_DEFAULT);
     } catch(IOException e) {
       LOG.error(getClass().getSimpleName() + " initialization failed.", e);
       close();
@@ -6838,6 +6849,11 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
       FSPermissionChecker pc = getPermissionChecker();
       pc.checkSuperuserPrivilege();
     }
+  }
+
+  public boolean checkStandyGetblocks(){
+    return balancerShouldRequestStandby && haEnabled && haContext != null
+            && haContext.getState().getServiceState() == HAServiceState.ACTIVE;
   }
 
   /**

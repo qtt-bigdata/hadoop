@@ -266,10 +266,16 @@ public class Balancer {
     final int maxNoMoveInterval = conf.getInt(
         DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_KEY,
         DFSConfigKeys.DFS_BALANCER_MAX_NO_MOVE_INTERVAL_DEFAULT);
+    final long getBlocksSize = getLong(conf,
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_SIZE_KEY,
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_SIZE_DEFAULT);
+    final long getBlocksMinBlockSize = getLong(conf,
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,
+            DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_DEFAULT);
     this.nnc = theblockpool;
     this.dispatcher = new Dispatcher(theblockpool, p.includedNodes,
         p.excludedNodes, movedWinWidth, moverThreads, dispatcherThreads,
-        maxConcurrentMovesPerNode, blockMoveTimeout, maxNoMoveInterval, conf);
+        maxConcurrentMovesPerNode, blockMoveTimeout, maxNoMoveInterval, getBlocksSize, getBlocksMinBlockSize, conf);
 
     this.threshold = p.threshold;
     this.policy = p.policy;

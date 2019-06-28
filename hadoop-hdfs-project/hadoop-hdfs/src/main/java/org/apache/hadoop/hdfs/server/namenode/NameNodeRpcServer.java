@@ -156,6 +156,7 @@ import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.RetryCache;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.ipc.StandbyException;
+import org.apache.hadoop.ipc.ActiveDenyOfServiceException;
 import org.apache.hadoop.ipc.WritableRpcEngine;
 import org.apache.hadoop.ipc.RefreshRegistry;
 import org.apache.hadoop.ipc.RefreshResponse;
@@ -498,6 +499,10 @@ class NameNodeRpcServer implements NamenodeProtocols {
     }
     checkNNStartup();
     namesystem.checkSuperuserPrivilege();
+    if(namesystem.checkStandyGetblocks()){
+        throw new ActiveDenyOfServiceException("Operation category getBlocks " +
+                "is not supported in state Active.");
+    }
     return namesystem.getBlockManager().getBlocks(datanode, size);
   }
 
